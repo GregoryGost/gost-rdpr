@@ -39,8 +39,7 @@ Arguments / Environments
 ## RouterOS
 
 ```shell
-/container/add remote-image=gregorygost/gost-rdpr:latest interface=LAN-Veth1 envlist=rdpr-envs hostname=gost-rdpr mounts=rdpr-db
-root-dir=docker/gost-rdpr logging=yes comment=GOST-RDPR
+/container/add remote-image=gregorygost/gost-rdpr:latest interface=LAN-VEth1 envlist=rdpr-envs hostname=gost-rdpr mounts=rdpr-db root-dir=container/gost-rdpr logging=yes comment=GOST-RDPR start-on-boot=yes
 ```
 
 ### Windows

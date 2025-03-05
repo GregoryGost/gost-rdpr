@@ -54,6 +54,7 @@ def getIpWithoutPrefix(ip_pref: str) -> str:
 def getIpVersion(ip: str):
   # print(f'Run getIpVersion helper for ip: {ip}')
   try:
+    ip.strip()
     return ip_network(ip).version
   except ValueError:
     # if not ip addr format

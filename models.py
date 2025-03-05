@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field, model_validator, computed_field
 from typing import Annotated, Self
+from datetime import datetime
 
 from utils import checkIpVersion
 
@@ -42,6 +43,31 @@ class LimitOffsetQuery(BaseModel):
     description='Offset quantity to start sampling from',
     examples=[10]
   )] = 0
+  start_date: Annotated[str | None, Field(
+    title='Start date',
+    description='Date from which you want to start sampling',
+    examples=['%Y-%m-%d %H:%M:%S', '2024-10-01 15:00:00'],
+    min_length=19,
+    max_length=19
+  )] = None
+  end_date: Annotated[str | None, Field(
+    title='End date',
+    description='Date from which you want to end sampling',
+    examples=['%Y-%m-%d %H:%M:%S', '2024-10-01 15:00:00'],
+    min_length=19,
+    max_length=19
+  )] = None
+
+  @model_validator(mode='after')
+  def start_date_and_end_date_validator(self: Self) -> Self:
+    if (self.start_date != None and self.end_date == None) or (self.start_date == None and self.end_date != None):
+      raise ValueError('The second parameter of sampling under date is not set')
+    if self.start_date != None and self.end_date != None:
+      startUnixDt = int(datetime.strptime(self.start_date, '%Y-%m-%d %H:%M:%S').timestamp())
+      endUnixDt = int(datetime.strptime(self.end_date, '%Y-%m-%d %H:%M:%S').timestamp())
+      if startUnixDt >= endUnixDt:
+        raise ValueError('The start date must be less than the end date')
+    return self
 
 ####################################################
 # Data models
@@ -167,11 +193,14 @@ class IpsQuery(LimitOffsetQuery):
 
 class IpsElementResp(BaseModel):
   id: int
-  domain: str | None = None
-  ros_comment: str | None = None
   type: int
   addr: str
   created_at: int | float
+  ip_list_id: int | None = None
+  ip_list_name: str | None = None
+  domain_id: int | None = None
+  domain: str | None = None
+  ros_comment: str | None = None
 
 class IpsPayloadResp(DnsPayloadResp):
   payload: list[IpsElementResp] = []
@@ -291,7 +320,7 @@ class DomainsListsPostElement(BaseModel):
   )]
   url: Annotated[str, Field(
     ...,
-    title='Router OS comment for addr-list and route',
+    title='Link to file with domain lists',
     min_length=5,
     examples=['https://somedomain.som/path/path/path/voice.txt']
   )]
@@ -301,6 +330,45 @@ class DomainsListsPostElement(BaseModel):
   )] = None
 
 class DomainsListsPostElementResp(BaseModel):
+  name: str
+  id: int | None = None
+  error: str | None = None
+
+#
+# IP ADDRESS LISTS
+#
+
+class IpAddrListsElementResp(BaseModel):
+  id: int
+  name: str
+  url: str
+  description: str
+  hash: str | None = None
+  created_at: int | float
+  updated_at: int | float | None = None
+
+class IpAddrListsPayloadResp(DnsPayloadResp):
+  payload: list[IpAddrListsElementResp] = []
+
+class IpAddrListsPostElement(BaseModel):
+  name: Annotated[str, Field(
+    ...,
+    title='IP address list name',
+    min_length=3,
+    examples=['goog.json']
+  )]
+  url: Annotated[str, Field(
+    ...,
+    title='Link to file with IP address lists',
+    min_length=5,
+    examples=['https://somedomain.som/path/path/path/goog.json']
+  )]
+  description: Annotated[str | None, Field(
+    title='Description for record',
+    min_length=3
+  )] = None
+
+class IpAddrListsPostElementResp(BaseModel):
   name: str
   id: int | None = None
   error: str | None = None
@@ -361,4 +429,10 @@ class DomainListsCommandQuery(BaseModel):
   forced: Annotated[bool, Field(
     title='Force reload domains lists',
     description='Force reload domains lists'
+  )] = False
+
+class IpAddrListsCommandQuery(BaseModel):
+  forced: Annotated[bool, Field(
+    title='Force reload IP address lists',
+    description='Force reload IP address lists'
   )] = False

@@ -2,6 +2,12 @@ import os
 import time
 import base64
 import logging
+import requests
+import urllib3
+import re
+import asyncio
+import uvicorn
+import sqlite3 as db
 from datetime import datetime
 from dns.resolver import Resolver
 from dns.exception import DNSException
@@ -9,26 +15,23 @@ from dns.message import QueryMessage, make_query, from_wire
 from dns.rrset import RRset
 from dns.rdatatype import RdataType, A, AAAA, CNAME
 from dns.rdata import Rdata
-import sqlite3 as db
 from librouteros import connect as rosConnect
 from librouteros.login import plain
 from librouteros.api import Api, ReplyDict
 from librouteros.query import Key
-import requests
-import urllib3
-import re
 from itertools import chain
 from typing import Any, Annotated
-from fastapi import FastAPI, BackgroundTasks, status, Query, Path, Body
+from fastapi import FastAPI, BackgroundTasks, status, Query, Path, Body, Request
 from fastapi.responses import JSONResponse
-import asyncio
-import uvicorn
+from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
 from prometheus_fastapi_instrumentator import Instrumentator
 from contextlib import asynccontextmanager
 from threading import Thread, current_thread
 from queue import Queue, Empty
 from multiprocessing.pool import ThreadPool
 from itertools import product
+from urllib.parse import unquote
 
 ########################################################################################################################
 # IMPORT HELPER FUNCTIONS
@@ -48,6 +51,7 @@ from models import RosConfigPayloadResp, RosConfigElementResp, RosConfigConnElem
 from models import DomainsListsPayloadResp, DomainsListsElementResp, DomainsListsPostElement, DomainsListsPostElementResp
 from models import JobsLimitOffsetQuery, JobsPayloadResp, JobsElementResp
 from models import CommandStatusResp, RoSCommandQuery, DomainListsCommandQuery
+from models import IpAddrListsPayloadResp, IpAddrListsElementResp, IpAddrListsPostElementResp, IpAddrListsPostElement, IpAddrListsCommandQuery
 
 from rdtypes import DomainResult
 
@@ -63,8 +67,8 @@ DEF_RESOLVE_DOMAINS_BATCH_SIZE = 50
 DEF_DB_FLUSH_BATCH_SIZE = 1000
 DEF_THREADS_COUNT = getDefCpus() # getDefCpus()
 DEF_QUEUE_SIZE = 100
-DEF_DB_EMPTY_ITER = 200
 DEF_RESOLVE_EMPTY_ITER = 100
+DEF_DB_EMPTY_ITER = DEF_RESOLVE_EMPTY_ITER + 50
 
 SQLITE_FILE = 'rdpr-db.sqlite'
 SQLITE_BASE_DIR = 'db'
@@ -77,6 +81,11 @@ IP_RECORDS_TABLE_NAME = 'ip_records'
 IPS_LISTS_TABLE_NAME = 'ip_lists'
 JOB_TABLE_NAME = 'jobs'
 #
+JOBNAME_RESOLVE_DOMAINS = 'resolveDomains'
+JOBNAME_IP_ADDR_LISTS_LOAD = 'ipAddrListsLoad'
+JOBNAME_DOMAINS_LISTS_LOAD = 'domainsListsLoad'
+JOBNAME_ROUTEROS_UPDATE = 'routerOsUpdate'
+#
 REQ_TIMEOUT = (20, 30)
 DB_TIMEOUT = 30.0 # default in lib sqlite3 = 5.0
 ROS_TIMEOUT = 30
@@ -87,12 +96,14 @@ HEADERS = {
 }
 IP_NOT_ALLOWED = ['127.0.0.1', '0.0.0.0', '0.0.0.0/0', '::', '::/0']
 DOMAIN_PATTERN = re.compile(r'(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.){1,}(?:[a-zA-Z]{2,6}|xn--[a-z0-9]+)')
+IP_ALL_PATTERN = re.compile(r'(\b((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(/([0-9]|[1-2][0-9]|3[0-2]))?\b)|(\b(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|::([0-9a-fA-F]{1,4}:){1,5}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,2}|::([0-9a-fA-F]{1,4}:){1,3}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,2}|::([0-9a-fA-F]{1,4}:){1,2}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,4}:[0-9a-fA-F]{1,4}|::([0-9a-fA-F]{1,4}:){1,1}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}:[0-9a-fA-F]{1,4}|::[0-9a-fA-F]{1,4}|::(:[0-9a-fA-F]{1,4}){1,7})(/([0-9]|[1-9][0-9]|1[0-1][0-9]|12[0-8]))?\b)')
 #
 DNS_SERVERS_TAG = 'DNS Servers'
 DOMAINS_TAG = 'Domains'
 IPS_TAG = 'IP address'
 ROS_CONFIGS_TAG = 'RoS Configs'
 DOMAINS_LISTS_TAG = 'Domains Lists'
+IPS_LISTS_TAG = 'IP Address Lists'
 COMMANDS_TAG = 'Commands'
 JOBS_TAG = 'Jobs'
 #
@@ -126,6 +137,9 @@ DEBUG = True if IS_PRODUCTION == False else False
 # BASE MODULES
 ########################################################################################################################
 
+if SSL_CHECK_ENABLE == False:
+  urllib3.disable_warnings(category=urllib3.exceptions.InsecureRequestWarning)
+
 tagsMetadata = [
   {
     'name': 'Home',
@@ -142,6 +156,10 @@ tagsMetadata = [
   {
     'name': DOMAINS_TAG,
     'description': 'Methods for domain names that are then resolved to IP addresses as A(IPv4), AAAA(IPv6), NS, CNAME records'
+  },
+  {
+    'name': IPS_LISTS_TAG,
+    'description': 'Methods for managing IP address lists. Links to IP address lists from which the IP addresses themselves will be obtained directly. They can be either just IP addresses or addresses with summarization'
   },
   {
     'name': IPS_TAG,
@@ -163,7 +181,7 @@ tagsMetadata = [
 
 logging.basicConfig(
   level=logging.ERROR,
-  format='[%(asctime)s.%(msecs)03d] %(levelname)s :  %(message)s',
+  format='[%(asctime)s.%(msecs)03d] %(levelname)s : %(message)s',
   datefmt='%Y-%m-%d %H:%M:%S'
 )
 logging.getLogger('requests').setLevel(logging.WARNING)
@@ -192,8 +210,13 @@ app = FastAPI(
 )
 instrumentator = Instrumentator().instrument(app)
 
-if SSL_CHECK_ENABLE == False:
-  urllib3.disable_warnings(category=urllib3.exceptions.InsecureRequestWarning)
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(req: Request, exc: RequestValidationError) -> JSONResponse:
+  body = await req.body()
+  bodyStr = body.decode('utf-8')
+  bodyStr = re.sub(r'\s+', ' ', bodyStr).strip()
+  logger.error(f'RequestValidationError={str(exc)} : URL={unquote(req.url.__str__())} : Request={bodyStr}')
+  return JSONResponse(content=jsonable_encoder(exc.errors()), status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
 
 ########################################################################################################################
 # APP HELPER FUNCTIONS
@@ -847,6 +870,64 @@ def downloadDomainsList(domains_list_id: int, name: str, url: str, hash: str | N
   except Exception as err:
     raise err
 
+# Download IP address list
+def downloadIpAddrList(ip_addr_list_id: int, name: str, url: str, hash: str | None, forced: bool) -> str | None:
+  logger.debug(f'RUN - downloadIpAddrList for ip_addr_list_id={ip_addr_list_id}, name={name}, url={url}, hash={hash}')
+  connection = None
+  ipsAddrInsert: list[tuple[int, str, int]] = []
+  try:
+    # download file
+    fileResponse = requests.get(url=url, verify=SSL_CHECK_ENABLE, headers=HEADERS, timeout=REQ_TIMEOUT, allow_redirects=True, stream=True)
+    if not fileResponse.ok:
+      raise Exception(f'Error code [{fileResponse.status_code}] while trying to upload a file on URL "{url}"')
+    # decode content
+    fileData = fileResponse.content.decode('utf-8')
+    fileHash = getHash(fileData)
+    if hash != None and fileHash == hash and forced == False:
+      logger.info(f'IP address list [{ip_addr_list_id}][{name}] hash is not modify. Skip it ...')
+      return None
+    # get all domains from context
+    fileIpsAddr: set[str] = set()
+    for line in fileResponse.iter_lines():
+      if line:
+        decodedLine = line.decode('utf-8')
+        foundIps: list[tuple[str, str]] = [(element[0], element[6]) for element in IP_ALL_PATTERN.findall(decodedLine)]
+        fileIpsAddr.update([entry[0] for entry in foundIps if entry[0] != None and entry[0] != '']) #ipv4
+        fileIpsAddr.update([entry[1] for entry in foundIps if entry[1] != None and entry[1] != '']) #ipv6
+    logger.debug(f'ips address count in file "{name}" = {len(fileIpsAddr)}')
+    if len(fileIpsAddr) > 0:
+      for ip in fileIpsAddr:
+        ip = ip.strip()
+        ipVersion = getIpVersion(ip)
+        if ipVersion != False:
+          ipsAddrInsert.append((ip_addr_list_id, ip, ipVersion))
+      try:
+        connection = db.connect(database=SQLITE_DB, timeout=DB_TIMEOUT)
+        cursor = connection.cursor()
+        cursor.execute(f"SELECT id, ip_address FROM '{IP_RECORDS_TABLE_NAME}' WHERE ip_list_id = ?", (ip_addr_list_id, ))
+        currentIpsAddr: list[tuple[int, str]] = cursor.fetchall()
+        logger.debug(f'current IP address size "{name}" = {len(currentIpsAddr)}')
+        if len(currentIpsAddr) > 0:
+          ipsAddrInsertOnly: set[str] = {entry[1] for entry in ipsAddrInsert}
+          ipsAddrDelete: list[tuple[int]] = [(entry[0], ) for entry in currentIpsAddr if entry[1] not in ipsAddrInsertOnly]
+          logger.debug(f'remove IP address count "{name}" = {len(ipsAddrDelete)}')
+          if len(ipsAddrDelete) > 0:
+            cursor.executemany(f"DELETE FROM '{IP_RECORDS_TABLE_NAME}' WHERE id = ?;", ipsAddrDelete)
+        cursor.executemany(f"INSERT OR IGNORE INTO '{IP_RECORDS_TABLE_NAME}' (ip_list_id, ip_address, addr_type, domain_id) VALUES (?,?,?,-1);", ipsAddrInsert)
+        cursor.execute(f"UPDATE '{IPS_LISTS_TABLE_NAME}' SET hash = '{fileHash}', updated_at = CURRENT_TIMESTAMP WHERE id = {ip_addr_list_id};")
+        connection.commit()
+        cursor.close()
+        connection.close()
+        return fileHash
+      except db.Error as err:
+        if connection: connection.rollback()
+        logger.error(f'downloadIpAddrList db.Error [{name}] - {err}')
+      finally:
+        if connection: connection.close()
+    return None
+  except Exception as err:
+    raise err
+
 # Background Task func for download domains lists
 # Select only what has not been processed for N time
 def backgroundTask_DomainsListsLoad(forced: bool):
@@ -860,21 +941,58 @@ def backgroundTask_DomainsListsLoad(forced: bool):
       ;""")
     domainsListsAll = cursor.fetchall()
     logger.info(f'domains lists count for load - {len(domainsListsAll)}')
-    cursor.execute(f"INSERT INTO '{JOB_TABLE_NAME}' (name) VALUES ('domainsListsLoad');")
+    cursor.execute(f"INSERT INTO '{JOB_TABLE_NAME}' (name) VALUES ('{JOBNAME_DOMAINS_LISTS_LOAD}');")
     connection.commit()
     for domainsList in domainsListsAll:
       id = domainsList[0]
       name = domainsList[1]
       url = domainsList[2]
       hash = domainsList[3]
-      downloadDomainsList(id, name, url, hash, forced)
-    cursor.execute(f"UPDATE '{JOB_TABLE_NAME}' SET end_at = CURRENT_TIMESTAMP WHERE name = 'domainsListsLoad' AND end_at IS NULL;")
+      try:
+        downloadDomainsList(id, name, url, hash, forced)
+      except Exception as err:
+        logger.error(f"[{err.__class__.__name__}] : Failed to process the list '{name}' of domains. Error => {err}")
+        continue
+    cursor.execute(f"UPDATE '{JOB_TABLE_NAME}' SET end_at = CURRENT_TIMESTAMP WHERE name = '{JOBNAME_DOMAINS_LISTS_LOAD}' AND end_at IS NULL;")
     connection.commit()
     cursor.close()
     connection.close()
     logger.info(f'backgroundTask_DomainsListsLoad - DONE')
   except Exception as err:
     logger.error(f'[{err.__class__.__name__}] : backgroundTask_DomainsListsLoad :: {err}')
+
+# Background Task func for download IP address lists
+# Select only what has not been processed for N time
+def backgroundTask_IpAddrListsLoad(forced: bool):
+  logger.info(f'backgroundTask_IpAddrListsLoad - START')
+  try:
+    connection = db.connect(database=SQLITE_DB, timeout=DB_TIMEOUT)
+    cursor = connection.cursor()
+    cursor.execute(f"""
+        SELECT id, name, url, hash
+        FROM '{IPS_LISTS_TABLE_NAME}'
+      ;""")
+    ipsAddrListsAll = cursor.fetchall()
+    logger.info(f'ip address lists count for load - {len(ipsAddrListsAll)}')
+    cursor.execute(f"INSERT INTO '{JOB_TABLE_NAME}' (name) VALUES ('{JOBNAME_IP_ADDR_LISTS_LOAD}');")
+    connection.commit()
+    for ipAddrList in ipsAddrListsAll:
+      id = ipAddrList[0]
+      name = ipAddrList[1]
+      url = ipAddrList[2]
+      hash = ipAddrList[3]
+      try:
+        downloadIpAddrList(id, name, url, hash, forced)
+      except Exception as err:
+        logger.error(f"[{err.__class__.__name__}] : Failed to process the list '{name}' of IP addresses. Error => {err}")
+        continue
+    cursor.execute(f"UPDATE '{JOB_TABLE_NAME}' SET end_at = CURRENT_TIMESTAMP WHERE name = '{JOBNAME_IP_ADDR_LISTS_LOAD}' AND end_at IS NULL;")
+    connection.commit()
+    cursor.close()
+    connection.close()
+    logger.info(f'backgroundTask_IpAddrListsLoad - DONE')
+  except Exception as err:
+    logger.error(f'[{err.__class__.__name__}] : backgroundTask_IpAddrListsLoad :: {err}')
 
 # Many Threaded Queue reader for processing domains
 # batch_offset - protection against simultaneous writing to the database of several streams
@@ -1031,14 +1149,14 @@ def backgroundTask_resolveDomains(domains_queue: Queue):
     #
     if len(domains) > 0:
       logger.info(f'backgroundTask_resolveDomains : domains count for resolve={len(domains)} Start job ...')
-      cursor.execute(f"INSERT INTO '{JOB_TABLE_NAME}' (name) VALUES ('resolveDomains');")
+      cursor.execute(f"INSERT INTO '{JOB_TABLE_NAME}' (name) VALUES ('{JOBNAME_RESOLVE_DOMAINS}');")
       connection.commit()
       for domain in domains:
         while domains_queue.full():
           time.sleep(0.1)
         logger.debug(f'backgroundTask_resolveDomains : insert domain[{domain[1]}] to queue. queue-size={domains_queue.qsize()}')
         domains_queue.put(domain)
-      cursor.execute(f"UPDATE '{JOB_TABLE_NAME}' SET end_at = CURRENT_TIMESTAMP WHERE name = 'resolveDomains' AND end_at IS NULL;")
+      cursor.execute(f"UPDATE '{JOB_TABLE_NAME}' SET end_at = CURRENT_TIMESTAMP WHERE name = '{JOBNAME_RESOLVE_DOMAINS}' AND end_at IS NULL;")
       connection.commit()
     else:
       logger.info(f'backgroundTask_resolveDomains : no domains for job. skip it ...')
@@ -1058,7 +1176,7 @@ def backgroundTask_routerOsUpdate(addr_type: int | None):
     rosConfigs: list[tuple[str, str, str, str]] = cursor.fetchall()
     if len(rosConfigs) > 0:
       logger.info(f'backgroundTask_routerOsUpdate : routeros configs count={len(rosConfigs)} Start job ...')
-      cursor.execute(f"INSERT INTO '{JOB_TABLE_NAME}' (name) VALUES ('routerOsUpdate');")
+      cursor.execute(f"INSERT INTO '{JOB_TABLE_NAME}' (name) VALUES ('{JOBNAME_ROUTEROS_UPDATE}');")
       connection.commit()
       if addr_type != None:
         whereSql = f' WHERE ir.addr_type = {addr_type}'
@@ -1081,7 +1199,7 @@ def backgroundTask_routerOsUpdate(addr_type: int | None):
           rosUpdate(host, user, userPass, bgpListName, ipAddressSetAll)
         except Exception as err:
           continue
-      cursor.execute(f"UPDATE '{JOB_TABLE_NAME}' SET end_at = CURRENT_TIMESTAMP WHERE name = 'routerOsUpdate' AND end_at IS NULL;")
+      cursor.execute(f"UPDATE '{JOB_TABLE_NAME}' SET end_at = CURRENT_TIMESTAMP WHERE name = '{JOBNAME_ROUTEROS_UPDATE}' AND end_at IS NULL;")
       connection.commit()
     connection.close()
     logger.info(f'backgroundTask_routerOsUpdate - DONE')
@@ -1188,7 +1306,7 @@ async def get_all_dns(query: Annotated[DnsQuery, Query()]):
       ))
     returnData.count = len(returnData.payload)
     returnData.total = dnsSize
-    return JSONResponse(returnData.model_dump(mode='json', exclude_none=True), status.HTTP_200_OK)
+    return JSONResponse(returnData.model_dump(mode='json'), status.HTTP_200_OK)
   except Exception as err:
     return errorResp(err)
 
@@ -1226,7 +1344,7 @@ async def get_dns_on_id(id: Annotated[int, Path(gt=0, title='DNS record ID')]):
       description=dns[3],
       created_at=getTimestamp(dns[4])
     )
-    return JSONResponse(content=dnsElement.model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
+    return JSONResponse(content=dnsElement.model_dump(mode='json'), status_code=status.HTTP_200_OK)
   except Exception as err:
     return errorResp(err)
 
@@ -1389,7 +1507,7 @@ async def get_all_domains_lists(query: Annotated[LimitOffsetQuery, Query()]):
       ))
     returnData.count = len(returnData.payload)
     returnData.total = domainsListsSize
-    return JSONResponse(content=returnData.model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
+    return JSONResponse(content=returnData.model_dump(mode='json'), status_code=status.HTTP_200_OK)
   except Exception as err:
     return errorResp(err)
 
@@ -1397,8 +1515,8 @@ async def get_all_domains_lists(query: Annotated[LimitOffsetQuery, Query()]):
 @app.get(
     tags=[DOMAINS_LISTS_TAG],
     path='/domains/lists/{id}',
-    name='Get all Domains lists',
-    description='Displays all Domains lists records',
+    name='Get once Domains list',
+    description='Displays once Domains list record info',
     response_model=DomainsListsElementResp,
     responses={
       status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp},
@@ -1429,7 +1547,7 @@ async def get_domains_list_on_id(id: Annotated[int, Path(gt=0, title='Domains li
       created_at=getTimestamp(domainsList[5]),
       updated_at=getTimestamp(domainsList[6]) if domainsList[6] != None else None
     )
-    return JSONResponse(content=domainsListElement.model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
+    return JSONResponse(content=domainsListElement.model_dump(mode='json'), status_code=status.HTTP_200_OK)
   except Exception as err:
     return errorResp(err)
 
@@ -1598,7 +1716,7 @@ async def get_all_domains(query: Annotated[DomainsQuery, Query()]):
     returnData.count = len(returnData.payload)
     returnData.total = domainsSize
     connection.close()
-    return JSONResponse(content=returnData.model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
+    return JSONResponse(content=returnData.model_dump(mode='json'), status_code=status.HTTP_200_OK)
   except Exception as err:
     return errorResp(err)
 
@@ -1650,7 +1768,7 @@ async def get_domain_on_id(id: Annotated[int, Path(gt=0, title='Domain record ID
       ips_v4=ipAddrV4 if len(ipAddrV4) > 0 else None,
       ips_v6=ipAddrV6 if len(ipAddrV6) > 0 else None
     )
-    return JSONResponse(content=returnData.model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
+    return JSONResponse(content=returnData.model_dump(mode='json'), status_code=status.HTTP_200_OK)
   except Exception as err:
     return errorResp(err)
 
@@ -1766,8 +1884,199 @@ async def domain_remove(id: Annotated[int, Path(gt=0, title='Domain record ID')]
     return errorResp(err)
 
 #
-# TODO IP ADDRESSES LISTS
+# IP ADDRESSES LISTS
 #
+
+ipsListsPostBodyExamples = [
+  [
+    {
+      'name': 'ips-list',
+      'url': 'https://somedomain.som/path/path/path/some-ips-list'
+    },
+    {
+      'name': 'ips-list-2',
+      'url': 'https://somedomain.som/path/path/path/some-ips-list-2.txt',
+      'description': 'Description for some ips address list'
+    }
+  ]
+]
+
+# Get all IP address lists
+@app.get(
+    tags=[IPS_LISTS_TAG],
+    path='/ips/lists',
+    name='Get all IP address lists',
+    description='Displays all IP address lists records',
+    response_model=IpAddrListsPayloadResp,
+    responses={
+      status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
+    }
+  )
+async def get_all_ips_addr_lists(query: Annotated[LimitOffsetQuery, Query()]):
+  logger.debug(f'Call API route: GET /ips/lists')
+  try:
+    returnData: IpAddrListsPayloadResp = IpAddrListsPayloadResp(
+      limit=query.limit,
+      offset=query.offset
+    )
+    connection = db.connect(database=SQLITE_DB, timeout=DB_TIMEOUT)
+    cursor = connection.cursor()
+    cursor.execute(f"SELECT COUNT(id) FROM '{IPS_LISTS_TABLE_NAME}';")
+    ipsListsSize = cursor.fetchone()[0]
+    cursor.execute(f"""
+      SELECT id, name, url, description, hash, created_at, updated_at
+      FROM '{IPS_LISTS_TABLE_NAME}'
+      LIMIT ? OFFSET ?;
+    """, (query.limit, query.offset))
+    ipsListsAll = cursor.fetchall()
+    for ipsList in ipsListsAll:
+      returnData.payload.append(IpAddrListsElementResp(
+        id=ipsList[0],
+        name=ipsList[1],
+        url=ipsList[2],
+        description=ipsList[3],
+        hash=ipsList[4],
+        created_at=getTimestamp(ipsList[5]),
+        updated_at=getTimestamp(ipsList[6]) if ipsList[6] != None else None
+      ))
+    returnData.count = len(returnData.payload)
+    returnData.total = ipsListsSize
+    return JSONResponse(content=returnData.model_dump(mode='json'), status_code=status.HTTP_200_OK)
+  except Exception as err:
+    return errorResp(err)
+
+# Get IP address list info on ID
+@app.get(
+    tags=[IPS_LISTS_TAG],
+    path='/ips/lists/{id}',
+    name='Get once IP address list',
+    description='Displays once IP address list record on ID',
+    response_model=IpAddrListsElementResp,
+    responses={
+      status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp},
+      status.HTTP_404_NOT_FOUND: {'model': NotFoundResp}
+    }
+  )
+async def get_ip_addr_list_on_id(id: Annotated[int, Path(gt=0, title='IP address list record ID')]):
+  logger.debug(f'Call API route: GET /ips/lists/{id}')
+  try:
+    connection = db.connect(database=SQLITE_DB, timeout=DB_TIMEOUT)
+    cursor = connection.cursor()
+    cursor.execute(f"""
+      SELECT id, name, url, description, hash, created_at, updated_at
+      FROM '{IPS_LISTS_TABLE_NAME}'
+      WHERE id = ?;
+    """, (id, ))
+    ipsAddrList = cursor.fetchone()
+    connection.close()
+    if ipsAddrList == None:
+      ipsAddrListNotFound: NotFoundResp = NotFoundResp(reason=f"ID '{id}' not found")
+      return JSONResponse(content=ipsAddrListNotFound.model_dump(mode='json', exclude_none=True), status_code=status.HTTP_404_NOT_FOUND)
+    ipsAddrListElement: IpAddrListsElementResp = IpAddrListsElementResp(
+      id=ipsAddrList[0],
+      name=ipsAddrList[1],
+      url=ipsAddrList[2],
+      description=ipsAddrList[3],
+      hash=ipsAddrList[4],
+      created_at=getTimestamp(ipsAddrList[5]),
+      updated_at=getTimestamp(ipsAddrList[6]) if ipsAddrList[6] != None else None
+    )
+    return JSONResponse(content=ipsAddrListElement.model_dump(mode='json'), status_code=status.HTTP_200_OK)
+  except Exception as err:
+    return errorResp(err)
+
+# Add new IP address lists
+@app.post(
+    tags=[IPS_LISTS_TAG],
+    path='/ips/lists',
+    name='Add new IP address lists',
+    description='Add new IP address lists URL for download',
+    status_code=status.HTTP_200_OK,
+    response_model=list[IpAddrListsPostElementResp],
+    responses={
+      status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp},
+      status.HTTP_400_BAD_REQUEST: {'model': NoDataResp}
+    }
+  )
+async def ips_addr_lists_add(data: Annotated[list[IpAddrListsPostElement], Body(examples=domainsListsPostBodyExamples)]):
+  logger.debug(f'Call API route: POST /ips/lists')
+  try:
+    if (len(data) < 1):
+      return JSONResponse(NoDataResp().model_dump(mode='json', exclude_none=True), status.HTTP_400_BAD_REQUEST)
+    returnData: list[dict[str, Any]] = list()
+    connection = db.connect(database=SQLITE_DB, timeout=DB_TIMEOUT)
+    cursor = connection.cursor()
+    for ipsAddrListItem in data:
+      try:
+        cursor.execute(f"INSERT INTO '{IPS_LISTS_TABLE_NAME}' (name, url, description) VALUES (?,?,?);",
+          (ipsAddrListItem.name, ipsAddrListItem.url, ipsAddrListItem.description))
+        ipsAddrListId = cursor.lastrowid
+        if (ipsAddrListId == None or ipsAddrListId < 1):
+          raise Exception(f"Error get domainsListId for '{ipsAddrListItem.name}'. Result: {ipsAddrListId}")
+        returnData.append(IpAddrListsPostElementResp(name=ipsAddrListItem.name, id=ipsAddrListId).model_dump(mode='json', exclude_none=True))
+      except Exception as err:
+        returnData.append(IpAddrListsPostElementResp(name=ipsAddrListItem.name, error=str(err)).model_dump(mode='json', exclude_none=True))
+    connection.commit()
+    connection.close()
+    return JSONResponse(content=returnData, status_code=status.HTTP_200_OK)
+  except Exception as err:
+    return errorResp(err)
+
+# Clear All IP address lists
+# WARN. DANGER ZONE !!!
+@app.delete(
+    tags=[IPS_LISTS_TAG],
+    path='/internal/ips/lists/all',
+    name='Delete all IP address lists records',
+    description='Delete all IP address lists records',
+    response_model=OkStatusResp,
+    responses={
+      status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
+    }
+  )
+async def ips_addr_lists_remove_all():
+  logger.debug(f'Call API route: DELETE /internal/ips/lists/all')
+  try:
+    connection = db.connect(database=SQLITE_DB, timeout=DB_TIMEOUT)
+    cursor = connection.cursor()
+    # not delete default dns
+    cursor.execute(f"DELETE FROM '{IPS_LISTS_TABLE_NAME}';")
+    countResult = cursor.execute('SELECT changes();')
+    count = countResult.fetchone()[0]
+    connection.commit()
+    connection.close()
+    returnData: IpsDeleteResp = IpsDeleteResp(count=count)
+    return JSONResponse(content=returnData.model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
+  except Exception as err:
+    return errorResp(err)
+
+# Delete once IP address list
+@app.delete(
+    tags=[IPS_LISTS_TAG],
+    path='/ips/lists/{id}',
+    name='Delete once IP address list',
+    description='Delete once IP address list record',
+    response_model=OkStatusResp,
+    responses={
+      status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
+    }
+  )
+async def ip_addr_list_remove(id: Annotated[int, Path(gt=0, title='IP address list record ID')]):
+  logger.debug(f'Call API route: DELETE /ips/lists/{id}')
+  try:
+    connection = db.connect(database=SQLITE_DB, timeout=DB_TIMEOUT)
+    cursor = connection.cursor()
+    cursor.execute(f"""
+      DELETE FROM '{IPS_LISTS_TABLE_NAME}'
+      WHERE id = ?;
+    """, (id, ))
+    countResult = cursor.execute('SELECT changes();')
+    countDelete = countResult.fetchone()[0]
+    connection.commit()
+    connection.close()
+    return JSONResponse(OkStatusResp(count=countDelete).model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
+  except Exception as err:
+    return errorResp(err)
 
 #
 # IP ADDRESSES
@@ -1786,23 +2095,38 @@ async def domain_remove(id: Annotated[int, Path(gt=0, title='Domain record ID')]
   )
 async def get_all_ips(query: Annotated[IpsQuery, Query()]):
   logger.debug(f'Call API route: GET /ips')
-  addrTypeSql = ''
+  whereSql = ''
   try:
     returnData: IpsPayloadResp = IpsPayloadResp(
       limit=query.limit,
       offset=query.offset
     )
-    if query.type != None:
-      addrTypeSql = f'WHERE ir.addr_type = {query.type}'
+    if query.type != None and query.start_date == None and query.end_date == None:
+      whereSql = f"WHERE ir.addr_type = {query.type}"
+    elif query.type == None and query.start_date != None and query.end_date != None:
+      whereSql = f"WHERE unixepoch(ir.created_at) >= unixepoch('{query.start_date}') AND unixepoch(ir.created_at) < unixepoch('{query.end_date}')"
+    elif query.type != None and query.start_date != None and query.end_date != None:
+      whereSql = f"WHERE ir.addr_type = {query.type} AND unixepoch(ir.created_at) >= unixepoch('{query.start_date}') AND unixepoch(ir.created_at) < unixepoch('{query.end_date}')"
     connection = db.connect(database=SQLITE_DB, timeout=DB_TIMEOUT)
     cursor = connection.cursor()
-    cursor.execute(f"SELECT COUNT(id) FROM '{IP_RECORDS_TABLE_NAME}' AS ir {addrTypeSql};")
+    cursor.execute(f"SELECT COUNT(id) FROM '{IP_RECORDS_TABLE_NAME}' AS ir {whereSql};")
     ipsSize = cursor.fetchone()[0]
     cursor.execute(f"""
-      SELECT d.name, d.ros_comment, ir.addr_type, ir.ip_address, ir.ros_comment, ir.created_at, ir.id 
+      SELECT
+        d.name,
+        d.ros_comment,
+        ir.addr_type,
+        ir.ip_address,
+        ir.ros_comment,
+        ir.created_at,
+        ir.id,
+        ir.ip_list_id,
+        ipl.name,
+        ir.domain_id
       FROM '{IP_RECORDS_TABLE_NAME}' AS ir
       LEFT JOIN '{DOMAINS_TABLE_NAME}' AS d ON d.id = ir.domain_id
-      {addrTypeSql}
+      LEFT JOIN '{IPS_LISTS_TABLE_NAME}' AS ipl ON ipl.id = ir.ip_list_id
+      {whereSql}
       LIMIT ? OFFSET ?;
     """, (query.limit, query.offset))
     ips = cursor.fetchall()
@@ -1816,15 +2140,18 @@ async def get_all_ips(query: Annotated[IpsQuery, Query()]):
       returnData.payload.append(IpsElementResp(
         id=ip[6],
         domain=ip[0],
+        domain_id=ip[9],
         ros_comment=rosComment,
         type=ip[2],
         addr=ip[3],
-        created_at=getTimestamp(ip[5])
+        created_at=getTimestamp(ip[5]),
+        ip_list_id=ip[7],
+        ip_list_name=ip[8]
       ))
     returnData.count = len(returnData.payload)
     returnData.total = ipsSize
     connection.close()
-    return JSONResponse(content=returnData.model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
+    return JSONResponse(content=returnData.model_dump(mode='json'), status_code=status.HTTP_200_OK)
   except Exception as err:
     return errorResp(err)
 
@@ -1846,9 +2173,18 @@ async def get_ip_addr(id: Annotated[int, Path(gt=0, title='IP address record ID'
     connection = db.connect(database=SQLITE_DB, timeout=DB_TIMEOUT)
     cursor = connection.cursor()
     cursor.execute(f"""
-      SELECT d.name, ir.addr_type, ir.ip_address, ir.ros_comment, ir.created_at 
+      SELECT
+        d.name,
+        ir.addr_type,
+        ir.ip_address,
+        ir.ros_comment,
+        ir.created_at,
+        ir.ip_list_id,
+        ipl.name,
+        ir.domain_id 
       FROM '{IP_RECORDS_TABLE_NAME}' AS ir
       LEFT JOIN '{DOMAINS_TABLE_NAME}' AS d ON d.id = ir.domain_id
+      LEFT JOIN '{IPS_LISTS_TABLE_NAME}' AS ipl ON ipl.id = ir.ip_list_id
       WHERE ir.id = ?;""", (id, ))
     ip = cursor.fetchone()
     if ip == None:
@@ -1858,12 +2194,15 @@ async def get_ip_addr(id: Annotated[int, Path(gt=0, title='IP address record ID'
     returnData: IpsElementResp = IpsElementResp(
       id=id,
       domain=ip[0],
+      domain_id=ip[7],
       ros_comment=ip[3],
       type=ip[1],
       addr=ip[2],
-      created_at=getTimestamp(ip[4])
+      created_at=getTimestamp(ip[4]),
+      ip_list_id=ip[5],
+      ip_list_name=ip[6]
     )
-    return JSONResponse(content=returnData.model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
+    return JSONResponse(content=returnData.model_dump(mode='json'), status_code=status.HTTP_200_OK)
   except Exception as err:
     return errorResp(err)
 
@@ -2026,7 +2365,7 @@ async def get_all_ros_configs(query: Annotated[LimitOffsetQuery, Query()]):
       ))
     returnData.count = len(returnData.payload)
     returnData.total = rosConfigsSize
-    return JSONResponse(content=returnData.model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
+    return JSONResponse(content=returnData.model_dump(mode='json'), status_code=status.HTTP_200_OK)
   except Exception as err:
     return errorResp(err)
 
@@ -2076,7 +2415,7 @@ async def ros_get_and_check_config(id: Annotated[int, Path(gt=0, title='ROS conf
       created_at=getTimestamp(rosConfig[6]),
       connect_result=rosConnectResult
     )
-    return JSONResponse(content=returnData.model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
+    return JSONResponse(content=returnData.model_dump(mode='json'), status_code=status.HTTP_200_OK)
   except Exception as err:
     return errorResp(err)
 
@@ -2192,7 +2531,7 @@ async def resolve_domains(background_tasks: BackgroundTasks):
   try:
     connection = db.connect(database=SQLITE_DB, timeout=DB_TIMEOUT)
     cursor = connection.cursor()
-    cursor.execute(f"SELECT COUNT(job_id) FROM '{JOB_TABLE_NAME}' WHERE name = 'resolveDomains' AND end_at IS NULL;")
+    cursor.execute(f"SELECT COUNT(job_id) FROM '{JOB_TABLE_NAME}' WHERE name = '{JOBNAME_RESOLVE_DOMAINS}' AND end_at IS NULL;")
     jobCount = cursor.fetchone()[0]
     connection.close()
     if jobCount == 0:
@@ -2208,13 +2547,13 @@ async def resolve_domains(background_tasks: BackgroundTasks):
       t.start()
       background_tasks.add_task(backgroundTask_resolveDomains, domainsQueue)
       return JSONResponse(CommandStatusResp(
-          status=f'Run background task resolve domains',
+          status=f"Run background task 'resolve_domains' and job '{JOBNAME_RESOLVE_DOMAINS}'",
           threads=threads,
           threads_count = len(threads)
         ).model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
     else:
       return JSONResponse(CommandStatusResp(
-          status=f'Job resolveDomains is maybe Run now',
+          status=f"Job '{JOBNAME_RESOLVE_DOMAINS}' is maybe Run now",
           jobs=jobCount
         ).model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
   except Exception as err:
@@ -2236,17 +2575,17 @@ async def routeros_update(query: Annotated[RoSCommandQuery, Query()], background
   try:
     connection = db.connect(database=SQLITE_DB, timeout=DB_TIMEOUT)
     cursor = connection.cursor()
-    cursor.execute(f"SELECT COUNT(job_id) FROM '{JOB_TABLE_NAME}' WHERE name = 'routerOsUpdate' AND end_at IS NULL;")
+    cursor.execute(f"SELECT COUNT(job_id) FROM '{JOB_TABLE_NAME}' WHERE name = '{JOBNAME_ROUTEROS_UPDATE}' AND end_at IS NULL;")
     jobCount = cursor.fetchone()[0]
     connection.close()
     if jobCount == 0:
       background_tasks.add_task(backgroundTask_routerOsUpdate, query.type)
       return JSONResponse(CommandStatusResp(
-          status=f'Run background task routeros_update'
+          status=f"Run background task 'routeros_update' and job '{JOBNAME_ROUTEROS_UPDATE}'"
         ).model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
     else:
       return JSONResponse(CommandStatusResp(
-          status=f'Job routerOsUpdate is maybe Run now',
+          status=f"Job '{JOBNAME_ROUTEROS_UPDATE}' is maybe Run now",
           jobs=jobCount
         ).model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
   except Exception as err:
@@ -2265,21 +2604,54 @@ async def routeros_update(query: Annotated[RoSCommandQuery, Query()], background
     }
   )
 async def domains_lists_load(query: Annotated[DomainListsCommandQuery, Query()], background_tasks: BackgroundTasks):
-  logger.debug(f'Call API route: POST /domains/lists/load')
+  logger.debug(f'Call API route: POST /commands/domains/lists/load')
   try:
     connection = db.connect(database=SQLITE_DB, timeout=DB_TIMEOUT)
     cursor = connection.cursor()
-    cursor.execute(f"SELECT COUNT(job_id) FROM '{JOB_TABLE_NAME}' WHERE name = 'domainsListsLoad' AND end_at IS NULL;")
+    cursor.execute(f"SELECT COUNT(job_id) FROM '{JOB_TABLE_NAME}' WHERE name = '{JOBNAME_DOMAINS_LISTS_LOAD}' AND end_at IS NULL;")
     jobCount = cursor.fetchone()[0]
     connection.close()
     if jobCount == 0 or query.forced == True:
       background_tasks.add_task(backgroundTask_DomainsListsLoad, query.forced)
       return JSONResponse(CommandStatusResp(
-        status=f'Run background task domains_lists_load'
+        status=f"Run background task 'domains_lists_load' and job '{JOBNAME_DOMAINS_LISTS_LOAD}'"
       ).model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
     else:
       return JSONResponse(CommandStatusResp(
-        status=f'Job domainsListsLoad is maybe Run now',
+        status=f"Job '{JOBNAME_DOMAINS_LISTS_LOAD}' is maybe Run now",
+        jobs=jobCount
+      ).model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
+  except Exception as err:
+    return errorResp(err)
+
+# Download IP address lists
+# Insert found IPs in DB
+@app.post(
+    tags=[COMMANDS_TAG],
+    path='/commands/ips/lists/load',
+    name='Download IP address lists',
+    description='Start background task for download IP address lists if hash files changed',
+    response_model=CommandStatusResp,
+    responses={
+      status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
+    }
+  )
+async def ips_addr_lists_load(query: Annotated[IpAddrListsCommandQuery, Query()], background_tasks: BackgroundTasks):
+  logger.debug(f'Call API route: POST /commands/ips/lists/load')
+  try:
+    connection = db.connect(database=SQLITE_DB, timeout=DB_TIMEOUT)
+    cursor = connection.cursor()
+    cursor.execute(f"SELECT COUNT(job_id) FROM '{JOB_TABLE_NAME}' WHERE name = '{JOBNAME_IP_ADDR_LISTS_LOAD}' AND end_at IS NULL;")
+    jobCount = cursor.fetchone()[0]
+    connection.close()
+    if jobCount == 0 or query.forced == True:
+      background_tasks.add_task(backgroundTask_IpAddrListsLoad, query.forced)
+      return JSONResponse(CommandStatusResp(
+        status=f"Run background task 'ips_addr_lists_load' and job '{JOBNAME_IP_ADDR_LISTS_LOAD}'"
+      ).model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
+    else:
+      return JSONResponse(CommandStatusResp(
+        status=f"Job '{JOBNAME_IP_ADDR_LISTS_LOAD}' is maybe Run now",
         jobs=jobCount
       ).model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
   except Exception as err:
@@ -2331,7 +2703,7 @@ async def get_jobs(query: Annotated[JobsLimitOffsetQuery, Query()]):
       ))
     returnData.count = len(returnData.payload)
     returnData.total = jobsTotalSize
-    return JSONResponse(content=returnData.model_dump(mode='json', exclude_none=True), status_code=status.HTTP_200_OK)
+    return JSONResponse(content=returnData.model_dump(mode='json'), status_code=status.HTTP_200_OK)
   except Exception as err:
     return errorResp(err)
 
