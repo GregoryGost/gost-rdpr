@@ -1,13 +1,16 @@
 # GOST RDPR (Resolve Domain Per Record)
 
+Docker HUB - <https://hub.docker.com/r/gregorygost/gost-rdpr>
+
 A utility for working with Mikrotik RouterOS and BGP protocol for announcing IP addresses.
 
 The utility provides parsing of domain names into IP addresses, processing of domain lists and their subsequent parsing,
 processing of individual IP addresses and summarized IP groups. Updates firewall address list and routing table.
 
-Lib:
+Docker support OS/ARCH:
 
-- librouteros: <https://librouteros.readthedocs.io/en/3.4.1/connect.html>
+- linux/amd64
+- linux/arm64
 
 ## URLS
 
@@ -32,63 +35,23 @@ Arguments / Environments
 - `THREADS_COUNT` - Maximum number of threads. Only slicing is used to process bundles creates threads greater than the
   set limit. Default = cpu=(cpus - 1) if cpus > 3 || cpu=1
 - `QUEUE_SIZE` - Domains queue and DB queue size. Default: `100`
-- `RESOLVE_DOMAINS_BATCH_SIZE` - Default: `50`
-- `DB_EMPTY_ITER`
-- `RESOLVE_EMPTY_ITER`
+- `RESOLVE_DOMAINS_BATCH_SIZE` - Bundle size for one-time processing of domains. Generates a threadsPool with requests
+  for domain resolving. Default: `50`
+- `RESOLVE_EMPTY_ITER` - How many iterations to wait before finally dropping the batch into the queue. Default: `100`
+- `DB_EMPTY_ITER` - How many iterations to wait before the final dropping of the batch into the database. Default:
+  `RESOLVE_EMPTY_ITER + 50`
 
 ## RouterOS
 
 ```shell
-/container/add remote-image=gregorygost/gost-rdpr:latest interface=LAN-VEth1 envlist=rdpr-envs hostname=gost-rdpr mounts=rdpr-db root-dir=container/gost-rdpr logging=yes comment=GOST-RDPR start-on-boot=yes
-```
-
-### Windows
-
-View envs
-
-```powershell
-ls env:
-
-$value = $env:HOST
-Write-Host $value
-```
-
-Set permanent envs
-
-```powershell
-[System.Environment]::SetEnvironmentVariable('HOST', '0.0.0.0')
-[System.Environment]::SetEnvironmentVariable('IS_PRODUCTION', 'False')
-[System.Environment]::SetEnvironmentVariable('LOG_LEVEL', 'debug')
-```
-
-## Build docker images
-
-Build docker image for RouterOS CHR and Arm device
-
-```shell
-docker buildx create --driver=docker-container --name build-container
-docker buildx use build-container
-# Build for amd64(x86_64) and arm64 without arguments
-docker buildx build --no-cache --platform linux/amd64,linux/arm64 --output=type=docker --push -t gregorygost/gost-rdpr .
-# Build for amd64(x86_64) and arm64 with arguments
-docker buildx build --no-cache --platform linux/amd64,linux/arm64 --output=type=docker \
---build-arg IS_PRODUCTION='False' --build-arg HOST='0.0.0.0' --build-arg LOG_LEVEL='info' --push \
--t gregorygost/gost-rdpr .
-
-# run docker after build
-docker run -d -p 8080:4000 -e LOG_LEVEL='debug' --memory=1024m --cpus="1" --restart unless-stopped gregorygost/gost-rdpr
-```
-
-Try it open on <http://127.0.0.1:8080/docs>
-
-Save docker image after build. In windows for gzip use 7zip application
-
-```shell
-docker images
-docker save -o gost-rdpr.tar gregorygost/gost-rdpr
+/container
+add remote-image=gregorygost/gost-rdpr:latest interface=LAN-VEth1 envlist=rdpr-envs hostname=gost-rdpr mounts=rdpr-db \
+root-dir=container/gost-rdpr logging=yes comment=GOST-RDPR start-on-boot=yes
 ```
 
 ## Contrib
+
+Python version >= `3.13.0`
 
 Create virtual env
 
@@ -137,4 +100,30 @@ Freeze requirements
 
 ```shell
 pip freeze > requirements.txt
+```
+
+### TODO
+
+- JOB - check if IP addresses are included in a wider mask (summarization)
+- Refactor to OOP Class implement and application arch
+- Distributed storage of route files FastAPI
+- WEB UI (extended project/docker - VueJS-3)
+
+### Build docker images
+
+Build docker image for RouterOS CHR x86_64 and ARM64 device
+
+```shell
+docker buildx create --driver=docker-container --name build-container
+docker buildx use build-container
+# Build for amd64(x86_64) and arm64 without arguments
+docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push -t gregorygost/gost-rdpr .
+# Build for amd64(x86_64) and arm64 with arguments
+docker buildx build --no-cache --platform linux/amd64,linux/arm64 --build-arg IS_PRODUCTION='False' \
+--build-arg HOST='0.0.0.0' --build-arg LOG_LEVEL='info' --push -t gregorygost/gost-rdpr .
+```
+
+```shell
+# run docker after build
+docker run -d -p 8080:4000 -e LOG_LEVEL='debug' --memory=1024m --cpus="1" --restart unless-stopped gregorygost/gost-rdpr
 ```
