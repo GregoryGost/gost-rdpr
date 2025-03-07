@@ -119,7 +119,7 @@ LOGGER_LEVEL = {
 # ENVIRONMENTS
 ########################################################################################################################
 
-IS_PRODUCTION = True if os.environ.get('IS_PRODUCTION') != None and os.environ.get('IS_PRODUCTION') == 'True' else False
+IS_PRODUCTION = False if os.environ.get('IS_PRODUCTION') != None and os.environ.get('IS_PRODUCTION') == 'False' else True
 HOST = str(os.environ.get('HOST')) if os.environ.get('HOST') != None and os.environ.get('HOST') != '' else DEF_HOST
 PORT = int(os.environ['PORT']) if os.environ.get('PORT') != None and os.environ.get('PORT') != '' else DEF_PORT
 LOG_LEVEL = str(os.environ.get('LOG_LEVEL')) if os.environ.get('LOG_LEVEL') != None and os.environ.get('LOG_LEVEL') != '' else DEF_LOG_LEVEL
@@ -134,7 +134,7 @@ RESOLVE_EMPTY_ITER = int(os.environ['RESOLVE_EMPTY_ITER']) if os.environ.get('RE
 DEBUG = True if IS_PRODUCTION == False else False
 
 ########################################################################################################################
-# BASE MODULES
+# BASE INIT
 ########################################################################################################################
 
 if SSL_CHECK_ENABLE == False:
