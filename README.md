@@ -29,9 +29,8 @@ Arguments / Environments
 - `LOG_LEVEL` - Logging level for app (not requests ib). Default: `error`
 - `DOMAINS_UPDATE_INTERVAL` - The interval since the date the domains was last processed. Do not take recently processed
   ones. Default: `172800` - 2 days
-- `DB_FLUSH_BATCH_SIZE` - Maximum size of the number of processed domains to be written to the database. It is more
-  efficient to write in batches. It is also important to realize that while the list is not written to the database, it
-  is placed in the container memory. Default: `1000`
+- `DB_FLUSH_BATCH_SIZE` - Maximum size of the number of processed IP addresses that will be written to the database at
+  one time. It is more efficient to write in batches. Default: `1000`
 - `THREADS_COUNT` - Maximum number of threads. Only slicing is used to process bundles creates threads greater than the
   set limit. Default: `1` OR `cpus > 3 cpu=(cpus - 1)`
 - `QUEUE_SIZE` - Domains queue and DB queue size. Default: `100`
