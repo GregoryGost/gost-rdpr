@@ -87,11 +87,11 @@ class DnsQuery(LimitOffsetQuery):
 class DnsPostElement(BaseModel):
   server: Annotated[str | None, Field(
     title='IPv4, IPv6 DNS server address',
-    min_length=5
+    min_length=3
   )] = None
   doh_server: Annotated[str | None, Field(
     title='DoH server HTTP address',
-    min_length=5
+    min_length=3
   )] = None
   description: Annotated[str | None, Field(
     title='Some description for DNS server',
@@ -152,7 +152,7 @@ class DomainsPostElement(BaseModel):
   domain: Annotated[str, Field(
     ...,
     title='Domain name',
-    min_length=5,
+    min_length=3,
     examples=['google.com']
   )]
   ros_comment: Annotated[str | None, Field(
@@ -267,7 +267,7 @@ class RosConfigsPostElement(BaseModel):
   host: Annotated[str, Field(
     ...,
     title='RouterOS IP or domain address',
-    min_length=5
+    min_length=3
   )]
   user: Annotated[str, Field(
     ...,
@@ -283,7 +283,7 @@ class RosConfigsPostElement(BaseModel):
     ...,
     title='BGP list name',
     description='BGP list name. Used for the list in the Firewall address list and routing table naming',
-    min_length=5
+    min_length=3
   )]
   description: Annotated[str | None, Field(
     title='Description for record',
