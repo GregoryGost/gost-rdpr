@@ -153,3 +153,18 @@ docker buildx build --no-cache --platform linux/amd64,linux/arm64 --build-arg IS
 # run docker after build
 docker run -d -p 8080:4000 -e LOG_LEVEL='debug' --memory=1024m --cpus="1" --restart unless-stopped gregorygost/gost-rdpr
 ```
+
+## Licensing
+
+All source materials for the project are distributed under the [GPL v3](./LICENSE "License Description") license. You
+can use the project in any form, including for commercial activities, but it is worth remembering that the author of the
+project does not provide any guarantees for the performance of the executable files, and also does not bear any
+responsibility for claims or damage caused.
+
+This application uses external modules. The authors of these modules are (or are not) responsible for the quality and
+stability of their work. See the licenses of these modules. External modules are listed in the dependencies file of the
+package.json.
+
+## About
+
+GregoryGost - <https://gregory-gost.ru>
