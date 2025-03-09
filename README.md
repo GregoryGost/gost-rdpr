@@ -163,7 +163,7 @@ responsibility for claims or damage caused.
 
 This application uses external modules. The authors of these modules are (or are not) responsible for the quality and
 stability of their work. See the licenses of these modules. External modules are listed in the dependencies file of the
-package.json.
+requirements.txt.
 
 ## About
 
