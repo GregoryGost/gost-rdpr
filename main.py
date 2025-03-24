@@ -8,6 +8,7 @@ import re
 import asyncio
 import uvicorn
 import sqlite3 as db
+import traceback
 from datetime import datetime
 from dns.resolver import Resolver
 from dns.exception import DNSException
@@ -61,7 +62,7 @@ from rdtypes import DomainResult
 
 DEF_PORT = 4000
 DEF_HOST = '0.0.0.0'
-DEF_LOG_LEVEL = 'error' # error
+DEF_LOG_LEVEL = 'trace' # error
 DEF_DOMAINS_UPDATE_INTERVAL = 172800 # 2 days
 DEF_RESOLVE_DOMAINS_BATCH_SIZE = 50
 DEF_DB_FLUSH_BATCH_SIZE = 1000
@@ -662,7 +663,7 @@ def rosUpdate(host: str, user: str, user_pass: str, bgp_list_name: str, ip_addre
         roTableDisabledKey == False, # type: ignore
         roTableNameKey == bgp_list_name # type: ignore
       ))
-    logger.info(f'rosUpdate[{host}] : routing table : {routingTableQuery[0]['name']}')
+    logger.info(f'rosUpdate[{host}] : routing table : {routingTableQuery}')
     if routingTableQuery == None or len(routingTableQuery) < 1:
       routingTablePath = api.path('routing/table')
       routingTablePath.add(**{
@@ -705,6 +706,7 @@ def rosUpdate(host: str, user: str, user_pass: str, bgp_list_name: str, ip_addre
     api.close()
   except Exception as err:
     logger.error(f'[{err.__class__.__name__}] : rosUpdate : {err}')
+    if LOG_LEVEL == 'trace': logger.error(traceback.format_exc())
     if api: api.close()
     raise err
 
@@ -959,6 +961,7 @@ def backgroundTask_DomainsListsLoad(forced: bool):
     connection.close()
     logger.info(f'backgroundTask_DomainsListsLoad - DONE')
   except Exception as err:
+    if LOG_LEVEL == 'trace': logger.error(traceback.format_exc())
     logger.error(f'[{err.__class__.__name__}] : backgroundTask_DomainsListsLoad :: {err}')
 
 # Background Task func for download IP address lists
@@ -992,6 +995,7 @@ def backgroundTask_IpAddrListsLoad(forced: bool):
     connection.close()
     logger.info(f'backgroundTask_IpAddrListsLoad - DONE')
   except Exception as err:
+    if LOG_LEVEL == 'trace': logger.error(traceback.format_exc())
     logger.error(f'[{err.__class__.__name__}] : backgroundTask_IpAddrListsLoad :: {err}')
 
 # Many Threaded Queue reader for processing domains
@@ -1163,6 +1167,7 @@ def backgroundTask_resolveDomains(domains_queue: Queue):
     connection.close()
     logger.info(f'backgroundTask_resolveDomains - DONE')
   except Exception as err:
+    if LOG_LEVEL == 'trace': logger.error(traceback.format_exc())
     logger.error(f'[{err.__class__.__name__}] : backgroundTask_resolveDomains : {err}')
 
 # Background Task func for update RouterOS device
@@ -1204,6 +1209,7 @@ def backgroundTask_routerOsUpdate(addr_type: int | None):
     connection.close()
     logger.info(f'backgroundTask_routerOsUpdate - DONE')
   except Exception as err:
+    if LOG_LEVEL == 'trace': logger.error(traceback.format_exc())
     logger.error(f'[{err.__class__.__name__}] : backgroundTask_routerOsUpdate : {err}')
 
 # MAIN FUNC
@@ -1217,6 +1223,7 @@ async def main():
     logger.info(f'Try run App. cpus={cpus}[{getDefCpus()}] prod={IS_PRODUCTION}, host={HOST}, port={PORT}, log_level={LOG_LEVEL}, debug={DEBUG}')
     await server.serve()
   except Exception as err:
+    if LOG_LEVEL == 'trace': logger.error(traceback.format_exc())
     logger.error(f'[{err.__class__.__name__}] : main : {err}')
 
 ########################################################################################################################
