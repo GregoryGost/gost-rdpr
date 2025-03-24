@@ -62,7 +62,7 @@ from rdtypes import DomainResult
 
 DEF_PORT = 4000
 DEF_HOST = '0.0.0.0'
-DEF_LOG_LEVEL = 'trace' # error
+DEF_LOG_LEVEL = 'error' # error
 DEF_DOMAINS_UPDATE_INTERVAL = 172800 # 2 days
 DEF_RESOLVE_DOMAINS_BATCH_SIZE = 50
 DEF_DB_FLUSH_BATCH_SIZE = 1000
