@@ -303,7 +303,7 @@ class DomainsListsElementResp(BaseModel):
   id: int
   name: str
   url: str
-  description: str
+  description: str | None = None
   hash: str | None = None
   created_at: int | float
   updated_at: int | float | None = None
@@ -342,7 +342,7 @@ class IpAddrListsElementResp(BaseModel):
   id: int
   name: str
   url: str
-  description: str
+  description: str | None = None
   hash: str | None = None
   created_at: int | float
   updated_at: int | float | None = None
