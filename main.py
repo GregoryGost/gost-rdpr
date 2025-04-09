@@ -676,19 +676,27 @@ def rosUpdate(host: str, user: str, user_pass: str, bgp_list_name: str, ip_addre
     # 3. Firewall List
     fwIpAddressAll: list[tuple[str, str]] = rosGetFirewallAddrListAllIps(api, bgp_list_name)
     logger.info(f'rosUpdate[{host}] : firewall-address-list={bgp_list_name} count={len(fwIpAddressAll)}')
+    #
     fwIpAddressRemove: list[tuple[str, str]] = [entry for entry in fwIpAddressAll if entry[1] not in dbIpAddressOnly]
     logger.info(f'rosUpdate[{host}] : firewall-address-list remove count={len(fwIpAddressRemove)}')
+    #
     fwIpAddressOnly: set[str] = {entry[1] for entry in fwIpAddressAll}
     fwIpAddressAdd: list[tuple[str, str, str, str]] = [entry for entry in ip_address_all if entry[0] not in fwIpAddressOnly]
     logger.info(f'rosUpdate[{host}] : firewall-address-list add count={len(fwIpAddressAdd)}')
     #
     # 4. Routing
-    roIpAddressAll: list[tuple[str, str]] = rosGetRoutesAllIps(api, bgp_list_name)
+    roIpAddressAll: list[tuple[str, str, str]] = rosGetRoutesAllIps(api, bgp_list_name) # list[tuple(.id, ip-addr, gateway)]
     logger.info(f'rosUpdate[{host}] : route address routing-table={bgp_list_name} count={len(roIpAddressAll)}')
-    roIpAddressRemove: list[tuple[str, str]] = [entry for entry in roIpAddressAll if entry[1] not in dbIpAddressOnly]
+    #
+    roWrongIpAddressRemove: list[tuple[str, str, str]] = [entry for entry in roIpAddressAll if entry[2] != defaultGateway]
+    roWrongIpAddressOnly: set[str] = {entry[1] for entry in roWrongIpAddressRemove}
+    logger.info(f'rosUpdate[{host}] : wrong gateway route address remove count={len(roWrongIpAddressRemove)}')
+    #
+    roIpAddressRemove: list[tuple[str, str, str]] = [entry for entry in roIpAddressAll if entry[1] not in dbIpAddressOnly and entry[1] in roWrongIpAddressOnly]
     logger.info(f'rosUpdate[{host}] : route address remove count={len(roIpAddressRemove)}')
+    #
     roIpAddressOnly: set[str] = {entry[1] for entry in roIpAddressAll}
-    roIpAddressAdd: list[tuple[str, str, str, str]] = [entry for entry in ip_address_all if entry[0] not in roIpAddressOnly]
+    roIpAddressAdd: list[tuple[str, str, str, str]] = [entry for entry in ip_address_all if entry[0] not in roIpAddressOnly or entry[0] in roWrongIpAddressOnly]
     logger.info(f'rosUpdate[{host}] : route address add count={len(roIpAddressAdd)}')
     #
     # 5. Remove Firewall and Routing
@@ -729,8 +737,8 @@ def rosGetFirewallAddrListAllIps(api: Api, bgp_list_name: str) -> list[tuple[str
     return result
 
 # Get all IP adress from routes
-def rosGetRoutesAllIps(api: Api, bgp_list_name: str) -> list[tuple[str, str]]:
-  result: list[tuple[str, str]] = []
+def rosGetRoutesAllIps(api: Api, bgp_list_name: str) -> list[tuple[str, str, str]]:
+  result: list[tuple[str, str, str]] = []
   disabledKey: Key = Key('disabled')
   routingTableKey: Key = Key('routing-table')
   try:
@@ -743,7 +751,7 @@ def rosGetRoutesAllIps(api: Api, bgp_list_name: str) -> list[tuple[str, str]]:
     # 'target-scope': 10, 'dynamic': False, 'inactive': False, 'active': True, 'static': True, 'disabled': False, 
     # 'comment': 'ae5.pr04.del1.tfbnw.net'}
     if len(roIpAddrQuery) > 1:
-      result = [(roElement['.id'], getIpWithoutPrefix(roElement['dst-address'])) for roElement in roIpAddrQuery]
+      result = [(roElement['.id'], getIpWithoutPrefix(roElement['dst-address']), roElement['gateway']) for roElement in roIpAddrQuery]
     return result
   except Exception:
     return result
@@ -782,7 +790,7 @@ def rosFwAdd(api: Api, bgp_list_name: str, fw_ip_address_list: list[tuple[str, s
     raise err
 
 # Remove IP record from rounting
-def rosRoRemove(api: Api, ro_ip_address_list: list[tuple[str, str]]):
+def rosRoRemove(api: Api, ro_ip_address_list: list[tuple[str, str, str]]):
   try:
     for ipRecord in ro_ip_address_list:
       ipRoutePath = api.path('ip/route')
