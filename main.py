@@ -689,23 +689,26 @@ def rosUpdate(host: str, user: str, user_pass: str, bgp_list_name: str, ip_addre
     logger.info(f'rosUpdate[{host}] : route address routing-table={bgp_list_name} count={len(roIpAddressAll)}')
     #
     roWrongIpAddressRemove: list[tuple[str, str, str]] = [entry for entry in roIpAddressAll if entry[2] != defaultGateway]
-    roWrongIpAddressOnly: set[str] = {entry[1] for entry in roWrongIpAddressRemove}
     logger.info(f'rosUpdate[{host}] : wrong gateway route address remove count={len(roWrongIpAddressRemove)}')
     #
-    roIpAddressRemove: list[tuple[str, str, str]] = [entry for entry in roIpAddressAll if entry[1] not in dbIpAddressOnly and entry[1] in roWrongIpAddressOnly]
+    roIpAddressRemove: list[tuple[str, str, str]] = [entry for entry in roIpAddressAll if entry[1] not in dbIpAddressOnly]
     logger.info(f'rosUpdate[{host}] : route address remove count={len(roIpAddressRemove)}')
     #
     roIpAddressOnly: set[str] = {entry[1] for entry in roIpAddressAll}
-    roIpAddressAdd: list[tuple[str, str, str, str]] = [entry for entry in ip_address_all if entry[0] not in roIpAddressOnly or entry[0] in roWrongIpAddressOnly]
+    roIpAddressAdd: list[tuple[str, str, str, str]] = [entry for entry in ip_address_all if entry[0] not in roIpAddressOnly]
     logger.info(f'rosUpdate[{host}] : route address add count={len(roIpAddressAdd)}')
     #
-    # 5. Remove Firewall and Routing
+    # 5. Change gateway if gateway IP change
+    if len(roWrongIpAddressRemove) > 0:
+      rosRoGatewayChange(api, defaultGateway, roWrongIpAddressRemove)
+    #
+    # 6. Remove Firewall and Routing
     if len(fwIpAddressRemove) > 0:
       rosFwRemove(api, fwIpAddressRemove)
     if len(roIpAddressRemove) > 0:
       rosRoRemove(api, roIpAddressRemove)
     #
-    # 6. Add new to Firewall and Routing
+    # 7. Add new to Firewall and Routing
     if len(fwIpAddressAdd) > 0:
       rosFwAdd(api, bgp_list_name, fwIpAddressAdd)
     if len(roIpAddressAdd) > 0:
@@ -762,7 +765,7 @@ def rosFwRemove(api: Api, fw_ip_address_list: list[tuple[str, str]]):
     for ipRecord in fw_ip_address_list:
       fwAddrListPath = api.path('ip/firewall/address-list')
       fwAddrListPath.remove(ipRecord[0])
-      time.sleep(0.5)
+      time.sleep(0.1)
   except Exception as err:
     raise err
 
@@ -785,7 +788,7 @@ def rosFwAdd(api: Api, bgp_list_name: str, fw_ip_address_list: list[tuple[str, s
         'list': bgp_list_name,
         'comment': ipAddrComment
       })
-      time.sleep(0.5)
+      time.sleep(0.1)
   except Exception as err:
     raise err
 
@@ -795,7 +798,7 @@ def rosRoRemove(api: Api, ro_ip_address_list: list[tuple[str, str, str]]):
     for ipRecord in ro_ip_address_list:
       ipRoutePath = api.path('ip/route')
       ipRoutePath.remove(ipRecord[0])
-      time.sleep(0.5)
+      time.sleep(0.1)
   except Exception as err:
     raise err
 
@@ -819,7 +822,20 @@ def rosRoAdd(api: Api, bgp_list_name: str, default_gateway: str, ro_ip_address_l
         'comment': ipAddrComment,
         'gateway': default_gateway
       })
-      time.sleep(0.5)
+      time.sleep(0.1)
+  except Exception as err:
+    raise err
+  
+# Change default gateway if gateway change
+def rosRoGatewayChange(api: Api, default_gateway: str, ro_wrong_ip_address_list: list[tuple[str, str, str]]):
+  try:
+    ipRoutePath = api.path('ip/route')
+    for ipRecord in ro_wrong_ip_address_list:
+      ipRoutePath.update(**{
+        '.id' : ipRecord[0],
+        'gateway': default_gateway
+      })
+      time.sleep(0.1)
   except Exception as err:
     raise err
 

@@ -140,10 +140,18 @@ pip freeze > requirements.txt
 Build docker image for RouterOS CHR x86_64 and ARM64 device
 
 ```shell
+# first run
 docker buildx create --driver=docker-container --name build-container
+
+# all after first run
 docker buildx use build-container
+
 # Build for amd64(x86_64) and arm64 without arguments
+# PROD
 docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push -t gregorygost/gost-rdpr .
+# DEV
+docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push -t gregorygost/gost-rdpr:dev .
+
 # Build for amd64(x86_64) and arm64 with arguments
 docker buildx build --no-cache --platform linux/amd64,linux/arm64 --build-arg IS_PRODUCTION='False' \
 --build-arg HOST='0.0.0.0' --build-arg LOG_LEVEL='info' --push -t gregorygost/gost-rdpr .
@@ -153,6 +161,10 @@ docker buildx build --no-cache --platform linux/amd64,linux/arm64 --build-arg IS
 # run docker after build
 docker run -d -p 8080:4000 -e LOG_LEVEL='debug' --memory=1024m --cpus="1" --restart unless-stopped gregorygost/gost-rdpr
 ```
+
+## Docs
+
+- <https://librouteros.readthedocs.io/en/3.4.1/>
 
 ## Licensing
 
