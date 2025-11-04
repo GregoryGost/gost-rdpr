@@ -17,3 +17,5 @@
 - Domains black list
 - Support migrations scripts for Database
 - Change ips lists load commands. Now this is a single command for loading all lists, both domains and IP addresses. New `/commands/lists/load`
+- Change path RoS configs. New `/ros`. Old `/ros/config`
+- Jobs methods removed. Jobs table removed from Database

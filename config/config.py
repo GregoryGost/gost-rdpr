@@ -12,7 +12,7 @@ class Settings(BaseSettings):
   root_path: str = Field(default_factory=lambda: normpath(getcwd()))
   root_log_level: str = Field(default='error')
   # FastAPI HTTP (APP) section
-  app_title: str = Field(default='GOST-RDPR (Resolve Domains PaRser)')
+  app_title: str = Field(default='GOST-RDPR (Resolve Domains Per Records)')
   app_summary: str = Field(
     default='A utility for working with Mikrotik RouterOS and BGP protocol for announcing IP addresses'
   )

@@ -1,4 +1,4 @@
-# GOST RDPR (Resolve Domain Per Record)
+# GOST RDPR (Resolve Domains Per Record)
 
 Docker HUB - <https://hub.docker.com/r/gregorygost/gost-rdpr>
 
@@ -30,7 +30,7 @@ Available environment variables
 |---------------|------|---------------|-------------|
 | `ROOT_PATH`   | str  | `normpath(getcwd())` | Path to the application root folder |
 | `ROOT_LOG_LEVEL` | str | `error` | Root level logging |
-| `APP_TITLE` | str | `GOST-RDPR (Resolve Domains PaRser)` | Application name |
+| `APP_TITLE` | str | `GOST-RDPR (Resolve Domains Per Records)` | Application name |
 | `APP_SUMMARY` | str | `A utility for working with Mikrotik RouterOS and BGP protocol for announcing IP addresses` | Description title |
 | `APP_DESCRIPTION` | str | `The utility provides parsing of domain names into IP addresses, processing of domain lists and their subsequent parsing, processing of individual IP addresses and summarized IP groups. Updates firewall address list and routing table` | Detailed description of the application |
 | `APP_DEBUG` | str | `False` | FastAPI application debug level |
