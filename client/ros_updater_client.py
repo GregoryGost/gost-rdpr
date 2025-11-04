@@ -88,9 +88,10 @@ class RosClient:
         table_name_key == config.bgp_list_name # type: ignore
       )
       async for item in routing_table_query:
+        logger.debug(f'Routing table item: {item=}')
         routing_table_id: str = item['.id']
         routing_table_name: str = item['name']
-        routing_table_comment: str = item['comment']
+        routing_table_comment: str | None = item.get('comment')
       if routing_table_id == None: return None
       logger.debug(f'Routing table in {config.host=} : {routing_table_id=}, {routing_table_name=}, {routing_table_comment=}')
       return routing_table_id
@@ -301,7 +302,7 @@ class RosClient:
             logger.info(f'Update RoS config [{config.host}] successfully done')
           except Exception as err:
             # __connect failed may be
-            logger.error(f'Update RoS config [{config.host}] failed: [{err.__class__.__name__}] : {err}')
+            logger.error(f'Update RoS config [{config.host}] failed: [{err.__class__.__name__}] : {err}', exc_info=True)
             continue
           finally:
             await api.close()
