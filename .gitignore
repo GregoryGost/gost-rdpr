@@ -177,7 +177,6 @@ cython_debug/
 .vscode/
 
 # SQLITE DB
-db/
 *.sqlite
 *.sqlite-journal
 
@@ -188,3 +187,6 @@ db/
 # dirs
 images/
 test/
+.old/
+.new/
+db/
