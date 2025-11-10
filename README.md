@@ -1,5 +1,6 @@
 # GOST RDPR (Resolve Domains Per Record)
 
+REPO - <https://github.com/GregoryGost/gost-rdpr>
 Docker HUB - <https://hub.docker.com/r/gregorygost/gost-rdpr>
 
 - `latest` tag
