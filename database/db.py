@@ -20,7 +20,7 @@ from sqlalchemy import (
 )
 from aiosqlite import __version__ as aiosqlite_version
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine, async_sessionmaker, AsyncSession, AsyncConnection
-from sqlalchemy.pool import AsyncAdaptedQueuePool
+from sqlalchemy.pool import NullPool
 from datetime import datetime, timezone
 from time import monotonic
 from threading import Event
@@ -98,20 +98,18 @@ class DataBase:
     logger.debug(f'aiosqlite version="{aiosqlite_version}"')
     logger.debug(f'db_connection="{settings.db_connection}"')
     self.__migrations_path.mkdir(exist_ok=True)
+    # NullPool - for SQLite only !!!
     self.__engine: AsyncEngine = create_async_engine(
       url=settings.db_connection,
-      pool_timeout=settings.db_timeout,
-      pool_size=settings.db_pool_size,
-      max_overflow=settings.db_pool_size_overflow,
-      pool_recycle=settings.db_pool_recycle_sec,
-      pool_pre_ping=True,
-      poolclass=AsyncAdaptedQueuePool
+      connect_args={'timeout': settings.db_timeout},
+      poolclass=NullPool
     )
     self.__engine.dialect.identifier_preparer.initial_quote = ''
     self.__engine.dialect.identifier_preparer.final_quote = ''
     self.__session_factory = async_sessionmaker(
       bind=self.__engine,
-      expire_on_commit=False
+      expire_on_commit=False,
+      autocommit=False
     )
     self.file_loader_client: FileLoaderClient = FileLoaderClient()
     logger.debug(f'{self.__class__.__name__} init ...')
@@ -611,7 +609,7 @@ class DataBase:
       total: int = await DomainsDbo.get_total(db_session=db_session)
       resolved_count: int = await DomainsDbo.get_total_resolved(db_session=db_session)
       if total > 0:
-        domains: Sequence[Row[Tuple[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None]]] = \
+        domains_and_query: Tuple[Sequence[Row[Tuple[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None]]], int] = \
         await DomainsDbo.get_all(
           db_session=db_session,
           limit=limit,
@@ -623,6 +621,8 @@ class DataBase:
           search_text=search_text
         )
         #
+        domains: Sequence[Row[Tuple[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None]]] = domains_and_query[0]
+        query_total: int = domains_and_query[1]
         for domain in domains:
           ip_addr_v4, ip_addr_v6 = await IpRecordsDbo.get_ips_on_domain_id(db_session=db_session, domain_id=domain[0])
           payload.append(DomainElementResp(
@@ -644,7 +644,8 @@ class DataBase:
         limit=limit,
         offset=offset,
         total=total,
-        resolved_count=resolved_count,
+        total_resolved=resolved_count,
+        total_query=query_total,
         count=len(payload),
         duration=monotonic() - before_time,
         payload=payload
@@ -759,7 +760,7 @@ class DataBase:
       # get domains for resolve
       domains_for_resolve: Sequence[Row[Tuple[int, str, int | None, int]]] = await DomainsDbo.get_all_for_resolve(db_session=db_session)
       domains = [DomainResult(id=domain[0], name=domain[1], list_id=domain[2]) for domain in domains_for_resolve]
-      logger.debug(f'Domains for resolve: {domains=}')
+      logger.debug(f'Domains for resolve: {len(domains)}')
       return domains
     except Exception as err:
       logger.error(f'Try get Domains for resolve failed : {err}', exc_info=True)
@@ -788,7 +789,7 @@ class DataBase:
     finally:
       await db_session.close()
 
-  async def put_domains_after_resolve(self: Self, domains: List[DomainResult]) -> None:
+  async def put_domain_after_resolve(self: Self, domain: DomainResult) -> None:
     logger.debug(f'Try send insert ips, delete ips, update domains to Queue ...')
     try:
       while self.db_save_queue.full():
@@ -796,12 +797,12 @@ class DataBase:
         continue
       domains_resolved_element: QueueElementDto = QueueElementDto(
         target=TargetAction.DOMAINS_RESOLVED,
-        elements=domains
+        elements=[domain]
       )
       logger.debug(f'Put domains resolved element {domains_resolved_element=} to Queue')
       self.db_save_queue.put_nowait(item=domains_resolved_element)
     except QueueFull:
-      logger.error(f'Queue is full for try send domains {domains=} to Queue')
+      logger.error(f'Queue is full for try send domains {domain=} to Queue')
     except Exception as err:
       logger.error(f'Unexpected error - Try send domains to Queue : {err}', exc_info=True)
 
@@ -1316,7 +1317,7 @@ class DataBase:
   async def lists_load(self: Self, forced: bool) -> None:
     logger.info(f'Lists load - START {forced=}')
     try:
-      await jobs_cache.set(key=Jobs.LISTS_LOAD, value=True)
+      await jobs_cache.set(Jobs.LISTS_LOAD, True)
       db_session: AsyncSession = await self.__connect()
       domains_lists_total: int = await DomainsListsDbo.get_total(db_session=db_session)
       ips_lists_total: int = await IpsListsDbo.get_total(db_session=db_session)
@@ -1390,8 +1391,8 @@ class DataBase:
       logger.error(f'Try Lists load failed : {err}', exc_info=True)
       await db_session.rollback()
     finally:
-      await jobs_cache.set(key=Jobs.LISTS_LOAD, value=False)
       await db_session.close()
+      await jobs_cache.set(Jobs.LISTS_LOAD, False)
 
   #
 
@@ -1534,13 +1535,13 @@ class DataBase:
       ]
       domains_resolved_update: List[Dict[str, int | bool | datetime]] = [
         {
-          DomainsDbo.id.property.key: domain_result.id,
+          DomainsDbo.id.property.key: domain.id,
           DomainsDbo.resolved.property.key: True,
           DomainsDbo.last_resolved_at.property.key: datetime.now(timezone.utc)
         }
         for queue_element in queue_elements
         if queue_element.target == TargetAction.DOMAINS_RESOLVED
-        for domain_result in queue_element.elements # item = DomainResult
+        for domain in queue_element.elements # item = DomainResult
       ]
       # IPS LISTS
       ips_lists_add: List[Dict[str, str | None]] = [

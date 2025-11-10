@@ -6,9 +6,9 @@ Data: 03.11.2025
 Description: Migrating data from old tables to new ones and deleting old tables
 '''
 
-from sqlalchemy import text
+from sqlalchemy import text, CursorResult, Row
 from sqlalchemy.ext.asyncio import AsyncConnection
-from typing import List
+from typing import List, Sequence
 
 from logger.logger import logger
 
@@ -19,10 +19,23 @@ from models.db.domains_dbo import DomainsDbo
 from models.db.ip_records_dbo import IpRecordsDbo
 from models.db.ros_configs_dbo import RosConfigsDbo
 
-async def upgrade(conn: AsyncConnection):
+async def upgrade(conn: AsyncConnection) -> None:
   logger.debug('Migrating data from old tables to new tables migration_202511031501.py')
   # Using raw SQL for data migration
   try:
+    # Check tables if exists
+    table_exists_result: CursorResult = await conn.execute(text("""
+      SELECT name
+      FROM sqlite_master
+      WHERE
+        type='table'
+        AND name IN ('dns_servers', 'ros_configs', 'domains_lists', 'ip_lists', 'ip_records', 'domains', 'jobs')
+    """))
+    table_exists: Sequence[Row] = table_exists_result.fetchall()
+    if len(table_exists) == 0:
+      logger.debug('MIGRATION "migration_202511031501.py" NOT NEEDED. OLD TABLES NOT FOUND')
+      return
+    #
     await conn.execute(text('PRAGMA foreign_keys=ON'))
     # 1. Transfer DNS servers
     await conn.execute(text(f'''

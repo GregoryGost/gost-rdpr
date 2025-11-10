@@ -59,7 +59,7 @@ class AppServer:
       openapi_tags=self.tags_metadata,
       lifespan=self.__lifespan
     )
-    self.commands_router: CommandsRouter = CommandsRouter()
+    # self.commands_router: CommandsRouter = CommandsRouter()
     logger.debug('AppServer init completed')
 
   @asynccontextmanager
@@ -72,7 +72,7 @@ class AppServer:
     # Init DB
     await db.setup()
     # Domains resolver init
-    await self.commands_router.domains_resolver.setup()
+    # await self.commands_router.domains_resolver.setup()
     #
     yield
     # next RUN AFTER stop FastAPI
@@ -118,7 +118,7 @@ class AppServer:
     app.include_router(IpsListsRouter().get_router())
     app.include_router(IpsRouter().get_router())
     app.include_router(RosConfigsRouter().get_router())
-    app.include_router(self.commands_router.get_router())
+    app.include_router(CommandsRouter().get_router())
 
     # Configurable and running
     config: Config = Config(
