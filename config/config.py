@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     and routing table'''
   )
   app_debug: bool = Field(default=False)
-  app_version: str = Field(default='2.0.0')
+  app_version: str = Field(default='2.0.8')
   app_host: str = Field(default='0.0.0.0')
   app_port: int = Field(default=4000)
   app_log_level: str = Field(default='error')
@@ -33,14 +33,11 @@ class Settings(BaseSettings):
   # DB section
   db_log_level: str = Field(default='error')
   db_timeout: float = Field(default=30.0) # default in lib sqlite3 = 5.0
-  db_pool_size: int = Field(default=5)
-  db_pool_size_overflow: int = Field(default=2)
-  db_pool_recycle_sec: int = Field(default=1800)
   db_base_dir: str = Field(default='db')
   db_file_name: str = Field(default='rdpr-db.sqlite')
   db_table_prefix: str = Field(default='rdpr_')
   db_save_batch_size: int = Field(default=1000) # for while task save to db
-  db_save_batch_timeout: float = Field(default=0.5) # 500 ms // recomend time.monotonic()
+  db_save_batch_timeout: float = Field(default=5.0) # 5 sec // recomend time.monotonic()
   attempts_limit: int = Field(default=5) # files download attempts limit
   # HTTP client Requests section
   req_connection_retries: int = Field(default=3)
@@ -55,16 +52,14 @@ class Settings(BaseSettings):
   # Domains section
   domains_filtered_min_len: int = Field(default=3)
   domains_update_interval: int = Field(default=172800) # default 2 days
-  domains_one_job_resolve_limit: int = Field(default=1000)
-  domain_resolve_semaphore_limit: int = Field(default=100)
+  domain_resolve_semaphore_limit: int = Field(default=60)
   domains_black_list: str = Field(default='')
   # Lists section
   lists_update_interval_sec: int = Field(default=604800) # default 7 days
   # IP address section
   ip_not_allowed: str = Field(default='127.0.0.1, 0.0.0.0, 0.0.0.0/0, ::, ::/0')
   # ROUTEROS section
-  ros_log_level: str = Field(default='error')
-  ros_connect_timeout: int = Field(default=30)
+  ros_rest_api_read_timeout: float = Field(default=59.0) # ROS REST API server timeout = 60s
 
   @computed_field
   @property

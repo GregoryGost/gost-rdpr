@@ -38,7 +38,6 @@ class CommandsRouter(BaseRouter):
       response_model=OkResp,
       responses={
         status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp},
-        status.HTTP_423_LOCKED: {'model': OkResp}
       }
     )
     async def lists_load_command(
@@ -53,7 +52,7 @@ class CommandsRouter(BaseRouter):
         else:
           return JSONResponse(
             OkResp(result=f'Job {Jobs.LISTS_LOAD} is Run').to_dict(),
-            status.HTTP_423_LOCKED
+            status.HTTP_200_OK
           )
         return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
       except Exception as err:
@@ -67,7 +66,6 @@ class CommandsRouter(BaseRouter):
       response_model=OkResp,
       responses={
         status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp},
-        status.HTTP_423_LOCKED: {'model': OkResp}
       }
     )
     async def domains_resolve_command(background_tasks: BackgroundTasks) -> JSONResponse:
@@ -78,8 +76,8 @@ class CommandsRouter(BaseRouter):
           background_tasks.add_task(self.domains_resolver.domains_resolve)
         else:
           return JSONResponse(
-            OkResp(result=f'Job {Jobs.DOMAINS_RESOLVE} is Run').to_dict(),
-            status.HTTP_423_LOCKED
+            OkResp(result=f'Job [{Jobs.DOMAINS_RESOLVE}] is now active').to_dict(),
+            status.HTTP_200_OK
           )
         return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
       except Exception as err:
@@ -93,19 +91,18 @@ class CommandsRouter(BaseRouter):
       response_model=OkResp,
       responses={
         status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp},
-        status.HTTP_423_LOCKED: {'model': OkResp}
       }
     )
     async def ros_update_command(query: Annotated[RosUpdateCommandQueryReq, Query()], background_tasks: BackgroundTasks) -> JSONResponse:
       logger.debug(f'Call API route: POST /commands/ros/update')
       try:
         job_status: bool | None = await jobs_cache.get(Jobs.ROS_UPDATE)
-        if job_status != None and job_status == False:
+        if job_status != True:
           background_tasks.add_task(self.__ros_client.update, query.type)
         else:
           return JSONResponse(
-            OkResp(result=f'Job {Jobs.ROS_UPDATE} is Run').to_dict(),
-            status.HTTP_423_LOCKED
+            OkResp(result=f'Job [{Jobs.ROS_UPDATE}] is now active').to_dict(),
+            status.HTTP_200_OK
           )
         return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
       except Exception as err:

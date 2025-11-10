@@ -18,5 +18,6 @@ class DomainElementResp(Base):
   last_resolved_at_hum: Optional[str] = None
 
 class DomainsPayloadResp(BasePayloadResp):
-  resolved_count: int = 0
+  total_resolved: int = 0
+  total_query: int = 0
   payload: List[DomainElementResp] = []

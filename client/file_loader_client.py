@@ -14,8 +14,7 @@ class FileLoaderClient:
 
   __ips_pattern: Pattern[str] = compile(r'(\b((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(/([0-9]|[1-2][0-9]|3[0-2]))?\b)|(\b(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|::([0-9a-fA-F]{1,4}:){1,5}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,2}|::([0-9a-fA-F]{1,4}:){1,3}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,2}|::([0-9a-fA-F]{1,4}:){1,2}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,4}:[0-9a-fA-F]{1,4}|::([0-9a-fA-F]{1,4}:){1,1}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}:[0-9a-fA-F]{1,4}|::[0-9a-fA-F]{1,4}|::(:[0-9a-fA-F]{1,4}){1,7})(/([0-9]|[1-9][0-9]|1[0-1][0-9]|12[0-8]))?\b)')
   __domains_pattern: Pattern[str] = compile(r'(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.){1,}(?:[a-zA-Z]{2,6}|xn--[a-z0-9]+)')
-
-  client: AsyncClient = HttpClient().client
+  __client: AsyncClient = HttpClient().client
 
   def __init__(self: Self):
     logger.debug(f'{self.__class__.__name__} init ...')
@@ -37,12 +36,12 @@ class FileLoaderClient:
         found_elements: Set[str] = set()
         try:
           # checking if a file exists without downloading its contents
-          head_response: Response = await self.client.head(url=file.url)
+          head_response: Response = await self.__client.head(url=file.url)
           if not head_response.is_success:
             # If the file does not exist, update attempts: + 1
             file.attempts = file.attempts + 1
             continue
-          response: Response = await self.client.get(url=file.url)
+          response: Response = await self.__client.get(url=file.url)
           response.raise_for_status()
           hash: str = self.__get_hash(content=response.content)
           if hash == file.hash: continue # skip if hashes are equal
@@ -70,13 +69,13 @@ class FileLoaderClient:
         found_elements: Set[str] = set()
         try:
           # checking if a file exists without downloading its contents
-          head_response: Response = await self.client.head(url=file.url)
+          head_response: Response = await self.__client.head(url=file.url)
           if not head_response.is_success:
             # If the file does not exist, update attempts: + 1
             file.attempts = file.attempts + 1
             continue
           # If the file exists, we begin processing it line by line
-          response: Response = await self.client.get(url=file.url)
+          response: Response = await self.__client.get(url=file.url)
           response.raise_for_status()
           hash: str = self.__get_hash(content=response.content)
           if hash == file.hash: continue # skip if hashes are equal

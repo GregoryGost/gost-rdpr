@@ -189,4 +189,4 @@ images/
 test/
 .old/
 .new/
-db/
+/db/

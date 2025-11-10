@@ -90,7 +90,7 @@ venv/
 .vscode/
 
 # DB
-db/
+/db/
 
 # Extensions
 *.md
