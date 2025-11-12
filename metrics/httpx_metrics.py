@@ -22,19 +22,19 @@ class HttpxMetrics:
   requests: Counter = Counter(
     name='httpx_requests_total',
     documentation='Total count of requests by method and path',
-    labelnames=['method', 'host', 'path', 'app_name']
+    labelnames=['app_name']
   )
   requests_processing_time: Histogram = Histogram(
     name='httpx_requests_duration_seconds',
     documentation='Histogram of requests processing time by path (in seconds)',
-    labelnames=['method', 'host', 'path', 'app_name']
+    labelnames=['app_name']
   )
   '''REQUESTS'''
 
   responses: Counter = Counter(
     name='httpx_responses_total',
     documentation='Total count of responses by method, path and status codes',
-    labelnames=['method', 'host', 'path', 'status_code', 'app_name']
+    labelnames=['status_code', 'app_name']
   )
   '''RESPONSES'''
 
@@ -57,12 +57,12 @@ class HttpxMetrics:
     status_code: int = response.status_code
     after_time: float = perf_counter()
 
-    self.requests.labels(method=method, host=host, path=path, app_name=self.app_name).inc()
-    self.requests_processing_time.labels(method=method, host=host, path=path, app_name=self.app_name).observe(
+    self.requests.labels(app_name=self.app_name).inc()
+    self.requests_processing_time.labels(app_name=self.app_name).observe(
       amount=after_time - before_time
     )
 
-    self.responses.labels(method=method, host=host, path=path, status_code=status_code, app_name=self.app_name).inc()
+    self.responses.labels(status_code=status_code, app_name=self.app_name).inc()
 
     if status_code >= 400:
       '''
