@@ -3,7 +3,6 @@
 .gitignore
 .gitattributes
 
-
 # CI
 .codeclimate.yml
 .travis.yml
@@ -38,6 +37,8 @@ var/
 *.egg-info/
 .installed.cfg
 *.egg
+.old/
+.new/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -87,3 +88,11 @@ venv/
 
 # VS Code
 .vscode/
+
+# DB
+/db/
+
+# Extensions
+*.md
+.markdownlint.json
+LICENSE
