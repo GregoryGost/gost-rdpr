@@ -1,6 +1,6 @@
 # Changelog / Patch notes
 
-## `04.11.2025` - version **2.0.1**
+## `19.11.2025` - version **2.0.8**
 
 - OOP arch implement
 - SQLAlchemy async ORM for SQLite DB. Insertion, updating, and deletion are now performed in a single queue, since the
