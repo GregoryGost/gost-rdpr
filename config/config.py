@@ -22,10 +22,11 @@ class Settings(BaseSettings):
     and routing table'''
   )
   app_debug: bool = Field(default=False)
-  app_version: str = Field(default='2.0.8')
+  app_version: str = Field(default='2.0.9')
   app_host: str = Field(default='0.0.0.0')
   app_port: int = Field(default=4000)
   app_log_level: str = Field(default='error')
+  app_workers: int = Field(default=0)
   # Queue section
   queue_max_size: int = Field(default=1000)
   queue_get_timeout: float = Field(default=0.1)

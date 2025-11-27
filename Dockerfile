@@ -30,8 +30,8 @@ WORKDIR /app
 # see .dockerignore if you dont want to copy all
 COPY . .
 
-RUN pip install --upgrade pip --no-cache
-RUN pip install -r requirements.txt --no-cache
+RUN pip install --upgrade pip --no-cache && pip install poetry --no-cache
+RUN poetry install
 
 COPY set_root_pw.sh /set_root_pw.sh
 COPY docker-entrypoint.sh /docker-entrypoint.sh

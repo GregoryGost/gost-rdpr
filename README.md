@@ -29,13 +29,14 @@ Available environment variables
 
 | ENV PARAMETER | Type | Default value | Description |
 |---------------|------|---------------|-------------|
+| `APP_WORKERS` | int | `None` | Application gunicorn workers |
 | `ROOT_PATH`   | str  | `normpath(getcwd())` | Path to the application root folder |
 | `ROOT_LOG_LEVEL` | str | `error` | Root level logging |
 | `APP_TITLE` | str | `GOST-RDPR (Resolve Domains Per Records)` | Application name |
 | `APP_SUMMARY` | str | `A utility for working with Mikrotik RouterOS and BGP protocol for announcing IP addresses` | Description title |
 | `APP_DESCRIPTION` | str | `The utility provides parsing of domain names into IP addresses, processing of domain lists and their subsequent parsing, processing of individual IP addresses and summarized IP groups. Updates firewall address list and routing table` | Detailed description of the application |
 | `APP_DEBUG` | str | `False` | FastAPI application debug level |
-| `APP_VERSION` | str | `2.0.0` | Application version |
+| `APP_VERSION` | str | `2.0.9` | Application version |
 | `APP_HOST`    | str  | `0.0.0.0`   | Listen on IP addr. `0.0.0.0` - Listen on all IP addresses |
 | `APP_PORT` | int | `4000` | Listen on TCP/IP specific port |
 | `APP_LOG_LEVEL` | str | `error` | Application level logging |
@@ -122,68 +123,85 @@ set api address=192.168.50.20/24
 
 ## For contrib
 
+!!! GUNICORN NOT WORKING ON WINDOWS !!!
+
 Python version >= `3.14`
+
+How to alt install python 3.14 in WSL Debian 12
+
+```sh
+sudo apt update
+sudo apt install pkg-config build-essential zlib1g-dev libncurses5-dev libgdbm-dev libnss3-dev libssl-dev libreadline-dev libffi-dev libsqlite3-dev -y
+wget https://www.python.org/ftp/python/3.14.0/Python-3.14.0.tgz
+tar -xzvf Python-3.14.0.tgz
+cd Python-3.14.0
+dpkg-architecture --query DEB_BUILD_GNU_TYPE # use in --build next ./configure
+./configure --build="x86_64-linux-gnu" --prefix=/usr/local --enable-optimizations --enable-loadable-sqlite-extensions --enable-option-checking=fatal --enable-shared LDFLAGS="-Wl,-rpath /usr/local/lib" --with-ensurepip
+nproc # if output 20 CPUS use 18
+sudo make -j 18
+sudo make altinstall
+python3.14 -VV
+```
+
+example output
+
+```sh
+Python 3.14.0 (main, Nov 27 2025, 23:09:49) [GCC 12.2.0]
+```
 
 Create virtual env
 
-```shell
-python -m venv .venv
+```sh
 python3.14 -m venv .venv
 ```
 
-Or special python version on Win
-
-```powershell
-& 'C:\Program Files\Python\Python3.14\python.exe' -m venv .venv
-```
-
-Activate venv
-
-```powershell
-.\.venv\Scripts\activate
-```
-
-```shell
+```sh
 source .venv/bin/activate
 ```
 
 Upgrade pip
 
-```shell
+```sh
 python -m pip install --upgrade pip
 ```
 
-Install libs from requirements.txt
+Install libs from lock poetry file
 
-```shell
-pip install -r requirements.txt
+```sh
+poetry install
 ```
 
 or manual install libs
 
-```shell
-pip install fastapi
-pip install SQLAlchemy
-pip install aiosqlite
-pip install dnspython
-pip install uvicorn
-pip install httpx
-pip install pydantic-settings
-pip install opentelemetry-exporter-prometheus
-pip install cashews
+```sh
+pip install poetry
+poetry init
 ```
 
-or upgrade libs (not recomend)
-
 ```shell
-pip list -o
-pip install [package_name] --upgrade
+poetry add "fastapi"
+poetry add "SQLAlchemy"
+poetry add "aiosqlite"
+poetry add "dnspython"
+poetry add "uvicorn"
+poetry add "httpx"
+poetry add "pydantic-settings"
+poetry add "opentelemetry-exporter-prometheus"
+poetry add "cashews"
+poetry add "gunicorn"
 ```
 
-Freeze requirements
+or update
 
-```shell
-pip freeze > requirements.txt
+```sh
+poetry update
+poetry update "fastapi"
+```
+
+Get tree all modules
+
+```sh
+poetry show --tree
 ```
 
 ### TODO

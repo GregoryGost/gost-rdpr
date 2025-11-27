@@ -26,6 +26,7 @@ class ConfigStatic(Base):
   app_host: str
   app_port: int
   app_log_level: str
+  app_workers: int
   # Queue section
   queue_max_size: int
   queue_get_timeout: float

@@ -83,6 +83,7 @@ class HomeRouter(BaseRouter):
           app_host=settings.app_host,
           app_port=settings.app_port,
           app_log_level=settings.app_log_level,
+          app_workers=settings.app_workers,
           queue_max_size=settings.queue_max_size,
           queue_get_timeout=settings.queue_get_timeout,
           queue_sleep_timeout=settings.queue_sleep_timeout,

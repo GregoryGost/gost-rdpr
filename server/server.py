@@ -1,5 +1,4 @@
 from re import sub
-from uvicorn import Config, Server
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -59,7 +58,6 @@ class AppServer:
       openapi_tags=self.tags_metadata,
       lifespan=self.__lifespan
     )
-    # self.commands_router: CommandsRouter = CommandsRouter()
     logger.debug('AppServer init completed')
 
   @asynccontextmanager
@@ -71,13 +69,11 @@ class AppServer:
     await jobs_cache.set(key=Jobs.ROS_UPDATE, value=False)
     # Init DB
     await db.setup()
-    # Domains resolver init
-    # await self.commands_router.domains_resolver.setup()
     #
     yield
     # next RUN AFTER stop FastAPI
 
-  async def run(self: Self):
+  def build(self: Self) -> FastAPI:
     logger.debug('AppServer run ...')
 
     # Init Web API
@@ -120,12 +116,4 @@ class AppServer:
     app.include_router(RosConfigsRouter().get_router())
     app.include_router(CommandsRouter().get_router())
 
-    # Configurable and running
-    config: Config = Config(
-      app,
-      host=settings.app_host,
-      port=settings.app_port,
-      log_level=settings.app_log_level,
-      server_header=False)
-    server: Server = Server(config)
-    await server.serve()
+    return app

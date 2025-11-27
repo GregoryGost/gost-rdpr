@@ -1,0 +1,29 @@
+[project]
+name = "gost-rdpr"
+version = "2.0.9"
+description = "The utility provides parsing of domain names into IP addresses, processing of domain lists and their subsequent parsing, processing of individual IP addresses and summarized IP groups. Updates firewall address list and routing table"
+authors = [
+    {name = "GregoryGost <info@gregory-gost.ru>"}
+]
+license = {text = "GPL v3"}
+readme = "README.md"
+homepage = "https://gregory-gost.ru"
+repository = "https://github.com/GregoryGost/gost-rdpr"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi (>=0.122.0,<0.123.0)",
+    "sqlalchemy (>=2.0.44,<3.0.0)",
+    "aiosqlite (>=0.21.0,<0.22.0)",
+    "dnspython (>=2.8.0,<3.0.0)",
+    "uvicorn (>=0.38.0,<0.39.0)",
+    "httpx (>=0.28.1,<0.29.0)",
+    "pydantic-settings (>=2.12.0,<3.0.0)",
+    "opentelemetry-exporter-prometheus (>=0.59b0,<0.60)",
+    "cashews (>=7.4.3,<8.0.0)",
+    "gunicorn (>=23.0.0,<24.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
