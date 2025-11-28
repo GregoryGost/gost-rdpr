@@ -165,7 +165,8 @@ Upgrade pip
 python -m pip install --upgrade pip
 ```
 
-Install libs from lock poetry file
+Install libs from lock poetry file  
+Poetry packet manager: <https://python-poetry.org/docs/>
 
 ```sh
 poetry install
@@ -213,7 +214,7 @@ poetry show --tree
 
 Build docker image for RouterOS CHR `x86_64` and `ARM64` device
 
-```shell
+```sh
 # first run
 docker buildx create --driver=docker-container --name build-container
 
@@ -221,17 +222,33 @@ docker buildx create --driver=docker-container --name build-container
 docker buildx use build-container
 
 # Build for amd64(x86_64) and arm64 without arguments
-# PROD
-docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push -t gregorygost/gost-rdpr .
-# Spec PROD version
-docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push -t gregorygost/gost-rdpr:latest -t gregorygost/gost-rdpr:2.0.1 .
+# LOCAL
+docker buildx build --no-cache --platform linux/amd64 --load -t gost-rdpr:2.0.9 .
 # DEV
 docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push -t gregorygost/gost-rdpr:dev .
+# PROD
+docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push -t gregorygost/gost-rdpr:latest -t gregorygost/gost-rdpr:2.0.1 .
 ```
 
-```shell
-# run docker after build
-docker run -d -p 8080:4000 -e LOG_LEVEL='debug' --memory=1024m --cpus="1" --restart unless-stopped gregorygost/gost-rdpr
+Run docker
+
+```sh
+# run local docker after build
+docker run -p 8080:4000 -e LOG_LEVEL='debug' --memory=1024m --cpus="1" --restart unless-stopped gost-rdpr:2.0.9
+# or dev as daemon
+docker run -d -p 8080:4000 -e LOG_LEVEL='debug' --memory=1024m --cpus="1" --restart unless-stopped gregorygost/gost-rdpr:dev
+```
+
+Check docker
+
+```sh
+docker ps
+```
+
+Connect to daemon docker instance
+
+```sh
+docker exec -it 60fd587a51f0 bash
 ```
 
 ## Docs
@@ -247,7 +264,7 @@ responsibility for claims or damage caused.
 
 This application uses external modules. The authors of these modules are (or are not) responsible for the quality and
 stability of their work. See the licenses of these modules. External modules are listed in the dependencies file of the
-`requirements.txt`.
+`pyproject.toml`.
 
 ## About
 

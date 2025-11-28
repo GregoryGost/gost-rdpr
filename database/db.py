@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from time import monotonic
 from threading import Event
 from pathlib import Path
+from os.path import exists
 from importlib.util import spec_from_file_location, module_from_spec
 from importlib.machinery import ModuleSpec
 from typing import Self, Tuple, Optional, Dict, List, Sequence
@@ -155,7 +156,7 @@ class DataBase:
         await self.__main_migrations(conn=conn)
         await conn.commit()
       except Exception as err:
-        logger.error(f'Try create all tables failed : {err}')
+        logger.error(f'Try create all tables failed [{err.__class__.__name__}] : {err}')
         await conn.rollback()
       finally:
         await conn.close()
@@ -168,7 +169,7 @@ class DataBase:
         return session
       except Exception as err:
         await session.rollback()
-        logger.error(f'Try DB connect failed : {settings.db_path} : {err}')
+        logger.error(f'Try DB connect failed : {settings.db_connection} : {err}')
         raise err
       finally:
         await session.close()
@@ -179,9 +180,23 @@ class DataBase:
     '''
     logger.debug(f'Try SQLite setup on db link: {settings.db_connection}')
     try:
+      db_path: Path = Path(settings.db_path_dir)
+      db_path.mkdir(exist_ok=True)
+    except Exception as err:
+      logger.error(f'Try DB setup create directory failed at {settings.db_connection} : {err}')
+      raise err
+    try:
       await self.__create_tables()
       self.__state = True
+    except Exception as err:
+      logger.error(f'Try DB setup create tables failed at {settings.db_connection} : {err}')
+      raise err
+    try:
       db_session: AsyncSession = await self.__connect()
+    except Exception as err:
+      logger.error(f'Try DB setup connect failed at {settings.db_connection} : {err}')
+      raise err
+    try:
       result: Result = await db_session.execute(text('SELECT sqlite_version() AS version'))
       logger.info(f'SQLite version="{str(result.scalar())}"')
       logger.debug(f'SQLite pool_status="{self.pool_status}"')
@@ -194,7 +209,7 @@ class DataBase:
         name='task_save_to_db_queue'
       )
       #
-      logger.debug('Setup DataBase - OK')
+      logger.debug(f'Setup DataBase [{settings.db_connection}] - OK')
     except Exception as err:
       logger.error(f'Try DB setup failed at {settings.db_connection} : {err}')
       await db_session.rollback()

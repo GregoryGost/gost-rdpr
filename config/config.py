@@ -34,7 +34,7 @@ class Settings(BaseSettings):
   # DB section
   db_log_level: str = Field(default='error')
   db_timeout: float = Field(default=30.0) # default in lib sqlite3 = 5.0
-  db_base_dir: str = Field(default='db')
+  db_dir: str | None = Field(default=None)
   db_file_name: str = Field(default='rdpr-db.sqlite')
   db_table_prefix: str = Field(default='rdpr_')
   db_save_batch_size: int = Field(default=1000) # for while task save to db
@@ -81,16 +81,25 @@ class Settings(BaseSettings):
   def app_title_metrics(self: Self) -> str:
     app_title_slug: str = sub(r'[^a-z0-9]+', '-', self.app_title.lower()).strip('-')
     return app_title_slug
+  
+  @computed_field
+  @property
+  def db_path_dir(self: Self) -> str:
+    if self.db_dir != None and self.db_dir != '':
+      return self.db_dir
+    return join(self.root_path, 'db')
 
   @computed_field
   @property
-  def db_path(self: Self) -> str:
-    return join(self.db_base_dir, self.db_file_name)
+  def db_file_path(self: Self) -> str:
+    return join(self.db_path_dir, self.db_file_name)
 
   @computed_field
   @property
   def db_connection(self: Self) -> str:
-    return f'sqlite+aiosqlite:///{self.db_path}'
+    # :/// - relative path
+    # ://// - absolute path
+    return f'sqlite+aiosqlite:///{self.db_file_path}'
 
 try:
   load_dotenv()
