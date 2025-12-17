@@ -11,10 +11,8 @@ RUN apt-get update \
   curl \
   libpq-dev \
   pkg-config \
-  openssh-server \
   net-tools \
   htop \
-  pwgen \
   libpam-modules \
   libpam-modules-bin
 
