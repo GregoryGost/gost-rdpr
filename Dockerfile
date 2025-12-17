@@ -17,7 +17,7 @@ RUN apt-get update \
   libpam-modules-bin
 
 WORKDIR /poetry
-COPY poetry.lock pyproject.toml ./
+COPY poetry.lock pyproject.toml LICENSE ./
 
 RUN pip install poetry==2.2.1 --no-cache --root-user-action=ignore \
   && poetry config virtualenvs.in-project true \
