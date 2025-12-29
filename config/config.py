@@ -2,8 +2,10 @@ from os import getcwd
 from os.path import normpath, join
 from pydantic import Field, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pathlib import Path
+from toml import load
 from dotenv import load_dotenv
-from typing import Self, List, Pattern
+from typing import Self, List, Pattern, Dict, Any
 from re import sub, escape, compile, IGNORECASE
 
 class Settings(BaseSettings):
@@ -22,7 +24,6 @@ class Settings(BaseSettings):
     and routing table'''
   )
   app_debug: bool = Field(default=False)
-  app_version: str = Field(default='2.0.8')
   app_host: str = Field(default='0.0.0.0')
   app_port: int = Field(default=4000)
   app_log_level: str = Field(default='error')
@@ -60,6 +61,17 @@ class Settings(BaseSettings):
   ip_not_allowed: str = Field(default='127.0.0.1, 0.0.0.0, 0.0.0.0/0, ::, ::/0')
   # ROUTEROS section
   ros_rest_api_read_timeout: float = Field(default=59.0) # ROS REST API server timeout = 60s
+
+  @computed_field
+  @property
+  def app_version(self: Self) -> str:
+    version: str = 'unknown'
+    pyproject_toml_file = Path(join(self.root_path, 'pyproject.toml'))
+    if pyproject_toml_file.exists() and pyproject_toml_file.is_file():
+      data: Dict[str, Any] = load(pyproject_toml_file)
+      if 'project' in data and 'version' in data['project']:
+        version = data['project']['version']
+    return version
 
   @computed_field
   @property
