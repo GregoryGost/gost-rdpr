@@ -17,6 +17,26 @@ Docker support OS/ARCH:
 - linux/amd64
 - linux/arm64
 
+## UI Dashboard
+
+An interface has been developed for the program. Its source code is located in a separate repository.
+It can be embedded in a Docker container and is accessible along with the API methods and OpenAPI documentation.
+
+UI REPO - <https://github.com/GregoryGost/gost-rdpr-ui>
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/dashboard-dark.png" alt="Dashboard Home page example" />
+      <p align="center"><i>Home page example</i></p>
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/domains-page-dark.png" alt="Dashboard Domains Page example" />
+      <p align="center"><i>Domains Page example</i></p>
+    </td>
+  </tr>
+</table>
+
 ## Application URLs
 
 - `/docs` Swagger/OpenAPI docs
@@ -211,7 +231,6 @@ poetry show --tree
 ### TODO
 
 - ADD NEW JOB - check if IP addresses are included in a wider mask (summarization)
-- WEB UI (extended project/docker - Vue.js 3) - GOST-RDPR-UI
 
 ### Build docker images
 
@@ -231,11 +250,17 @@ docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push -t greg
 docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push -t gregorygost/gost-rdpr:latest -t gregorygost/gost-rdpr:2.0.1 .
 # DEV
 docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push -t gregorygost/gost-rdpr:dev .
+# TEST in builder
+docker buildx build --no-cache --progress=plain --platform linux/amd64 --load -t gregorygost/gost-rdpr:dev --builder=build-container .
 ```
 
 ```shell
 # run docker after build
-docker run -d -p 8080:4000 -e LOG_LEVEL='debug' --memory=1024m --cpus="1" --restart unless-stopped gregorygost/gost-rdpr
+docker run --name gost-rdpr -p 8080:80 -p 5000:4000 -e LOG_LEVEL='debug' --memory=1024m --cpus="1" --restart unless-stopped -d gregorygost/gost-rdpr
+# simple
+docker run --name gost-rdpr-dev -p 8080:80 -p 5000:4000 -d gregorygost/gost-rdpr:dev
+# enter in docker shell
+docker exec -it gost-rdpr-dev bash
 ```
 
 ## Docs
