@@ -39,7 +39,7 @@ fi
 
 echo "================================"
 echo "Starting services via supervisor..."
-echo "- Nginx on port 8080 (Web UI + API proxy)"
+echo "- Nginx on port 80 (Web UI + API proxy)"
 echo "- Python API on port 4000 (internal)"
 echo "================================"
 
