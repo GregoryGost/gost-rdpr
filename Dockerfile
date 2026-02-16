@@ -21,6 +21,9 @@ ARG NODE_VERSION=24.13-alpine
 ########################################################################################################################
 FROM node:${NODE_VERSION} AS ui-builder
 
+# Fix OOM kill Docker with build
+ENV NODE_OPTIONS="--max-old-space-size=8192"
+
 WORKDIR /ui
 
 # Install git for cloning
