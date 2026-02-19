@@ -1,17 +1,18 @@
 from datetime import datetime, timedelta
 from sqlalchemy import (
   select,
+  text,
   or_,
   and_,
   func,
+  Index,
   Row,
   Select,
   Result,
   CheckConstraint,
   INTEGER,
   TIMESTAMP,
-  TEXT,
-  BOOLEAN
+  TEXT
 )
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,12 +39,13 @@ class IpsListsDbo(Dbo):
   hash: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
   attempts: Mapped[int] = mapped_column(INTEGER, nullable=False, default=0) # If attempts > settings(attempts_limit), then the file is no longer available
 
-  created_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=func.now())
+  created_at: Mapped[datetime] = mapped_column(TIMESTAMP, index=True, server_default=func.now())
   updated_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP, onupdate=func.now(), nullable=True)
 
   __table_args__ = (
     CheckConstraint("name != ''", name='name_chk'),
-    CheckConstraint("url != ''", name='url_chk')
+    CheckConstraint("url != ''", name='url_chk'),
+    Index(f'ix_{__tablename__}_updated_at', 'updated_at', sqlite_where=text('updated_at IS NOT NULL'))
   )
 
   # get_total in Base class

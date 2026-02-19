@@ -25,9 +25,10 @@ from datetime import datetime, timezone
 from time import monotonic
 from threading import Event
 from pathlib import Path
+from json import loads
 from importlib.util import spec_from_file_location, module_from_spec
 from importlib.machinery import ModuleSpec
-from typing import Self, Tuple, Optional, Dict, List, Sequence
+from typing import Self, Tuple, Optional, Dict, List, Sequence, Any
 from types import ModuleType
 
 from config.config import settings
@@ -63,6 +64,19 @@ from models.http.ips_resp import IpsPayloadResp, IpsElementResp
 #
 from models.http.ros_configs_req import RosConfigsPostElementReq
 from models.http.ros_configs_resp import RosConfigPayloadResp, RosConfigElementResp
+#
+from models.http.statistics_req import DATE_FORMAT, GrowthEntity, GrowthGranularity, GrowthDateField
+from models.http.statistics_resp import (
+  StatsResp,
+  StatsDnsData,
+  StatsDomainsData,
+  StatsDomainsListItem,
+  StatsIpsData,
+  StatsIpsListItem,
+  StatsRosData,
+  StatsGrowthResp,
+  StatsGrowthPoint
+)
 
 from models.dto.queue_dto import QueueElementDto, TargetAction
 from models.dto.domains_dto import DomainResult
@@ -1393,6 +1407,122 @@ class DataBase:
     finally:
       await db_session.close()
       await jobs_cache.set(Jobs.LISTS_LOAD, False)
+
+  # Stats
+
+  async def stats(self: Self) -> StatsResp:
+    logger.debug(f'Try get all statistics ...')
+    result: StatsResp = StatsResp(
+      generated_at=datetime.now().strftime(DATE_FORMAT),
+      dns=StatsDnsData(),
+      domains=StatsDomainsData(),
+      ips=StatsIpsData(),
+      ros=StatsRosData()
+    )
+    try:
+      db_session: AsyncSession = await self.__connect()
+      #
+      dns_stats: Row[Tuple[int, int, int]] = await DnsServersDbo.get_stats(db_session=db_session)
+      domains_stats: Row[Tuple[int, int, int, int, Any]] = await DomainsDbo.get_stats(db_session=db_session)
+      ips_stats: Row[Tuple[int, int, int, int, int, int, Any]] = await IpRecordsDbo.get_stats(db_session=db_session)
+      ros_stats: Row[Tuple[int]] = await RosConfigsDbo.get_stats(db_session=db_session)
+      #
+      result.dns = StatsDnsData(total=dns_stats.total, classic=dns_stats.classic, doh=dns_stats.doh)
+      result.domains = StatsDomainsData(
+        total=domains_stats.total,
+        resolved=domains_stats.resolved,
+        unresolved=domains_stats.unresolved,
+        lists_total=domains_stats.lists_total,
+        per_list=[
+          StatsDomainsListItem(**item)
+          for item in loads(domains_stats.per_list or '[]')
+        ]
+      )
+      result.ips = StatsIpsData(
+        total=ips_stats.total,
+        v4_total=ips_stats.v4_total,
+        v6_total=ips_stats.v6_total,
+        linked_to_domain=ips_stats.linked_to_domain,
+        standalone=ips_stats.standalone,
+        lists_total=ips_stats.lists_total,
+        per_list=[
+          StatsIpsListItem(**item)
+          for item in loads(ips_stats.per_list or '[]')
+        ]
+      )
+      result.ros = StatsRosData(total=ros_stats.total)
+      #
+      return result
+    except Exception as err:
+      logger.error(f'Try get all statistics failed : {err}', exc_info=True)
+      await db_session.rollback()
+      return result
+    finally:
+      await db_session.close()
+
+  async def stats_growth(
+      self: Self,
+      before_time: float,
+      entity: GrowthEntity,
+      granularity: GrowthGranularity,
+      date_field: GrowthDateField,
+      start_date: str | None = None,
+      end_date: str | None = None,
+      ip_subtype: int | None = None
+  ) -> StatsGrowthResp:
+    logger.debug(f'Try get aggregated metrics ...')
+    result: StatsGrowthResp = StatsGrowthResp(
+      entity=entity,
+      granularity=granularity,
+      start_date=start_date,
+      end_date=end_date,
+      ip_subtype=ip_subtype,
+      duration=monotonic() - before_time,
+    )
+    logger.debug(f'{entity=} {granularity=} {start_date=} {end_date=} {ip_subtype=}')
+    try:
+      db_session: AsyncSession = await self.__connect()
+      if entity == GrowthEntity.DOMAINS:
+        domains_stats_growth: Sequence[Row[Tuple[str, int]]] = await DomainsDbo.get_stats_growth(
+          db_session=db_session,
+          granularity=granularity,
+          start_date=start_date,
+          end_date=end_date,
+          date_field=date_field
+        )
+        result.payload = [StatsGrowthPoint(date=row[0], count=row[1]) for row in domains_stats_growth]
+        result.total_in_period = sum(row[1] for row in domains_stats_growth)
+        result.duration = monotonic() - before_time
+      elif entity == GrowthEntity.LISTS:
+        # ALL LISTS - DOMAINS AND IPS !!!
+        all_lists_stats_growth: Sequence[Row[Tuple[str, int]]] = await DomainsListsDbo.get_stats_growth(
+          db_session=db_session,
+          granularity=granularity,
+          start_date=start_date,
+          end_date=end_date,
+          date_field=date_field
+        )
+        result.payload = [StatsGrowthPoint(date=row[0], count=row[1]) for row in all_lists_stats_growth]
+        result.total_in_period = sum(row[1] for row in all_lists_stats_growth)
+        result.duration = monotonic() - before_time
+      elif entity == GrowthEntity.IPS:
+        ips_stats_growth: Sequence[Row[Tuple[str, int]]] = await IpRecordsDbo.get_stats_growth(
+          db_session=db_session,
+          granularity=granularity,
+          start_date=start_date,
+          end_date=end_date,
+          date_field=date_field
+        )
+        result.payload = [StatsGrowthPoint(date=row[0], count=row[1]) for row in ips_stats_growth]
+        result.total_in_period = sum(row[1] for row in ips_stats_growth)
+        result.duration = monotonic() - before_time
+      return result
+    except Exception as err:
+      logger.error(f'Try get aggregated metrics failed : {err}', exc_info=True)
+      await db_session.rollback()
+      return result
+    finally:
+      await db_session.close()
 
   #
 

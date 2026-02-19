@@ -27,6 +27,7 @@ from routers.ips_lists_router import IpsListsRouter
 from routers.ips_router import IpsRouter
 from routers.ros_configs_router import RosConfigsRouter
 from routers.commands_router import CommandsRouter, Jobs
+from routers.statistics_router import StatisticsRouter
 
 from models.http.base import ErrorResp
 
@@ -119,6 +120,7 @@ class AppServer:
     app.include_router(IpsRouter().get_router())
     app.include_router(RosConfigsRouter().get_router())
     app.include_router(CommandsRouter().get_router())
+    app.include_router(StatisticsRouter().get_router())
 
     # Configurable and running
     config: Config = Config(
