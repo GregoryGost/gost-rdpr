@@ -178,7 +178,9 @@ class DataBase:
     if self.__state == False: raise Exception('Database not ready to work')
     async with self.db_session() as session:
       try:
-        await session.execute(text('PRAGMA foreign_keys=ON'))
+        # Config PRAGMA
+        await session.execute(text('PRAGMA foreign_keys=ON')) # foreign keys support
+        await session.execute(text('PRAGMA journal_mode=WAL')) # Write-Ahead Logging - better concurrent access
         return session
       except Exception as err:
         await session.rollback()
