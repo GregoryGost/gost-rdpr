@@ -180,7 +180,10 @@ class DataBase:
       try:
         # Config PRAGMA
         await session.execute(text('PRAGMA foreign_keys=ON')) # foreign keys support
-        await session.execute(text('PRAGMA journal_mode=WAL')) # Write-Ahead Logging - better concurrent access
+        await session.execute(text(f'PRAGMA journal_mode={settings.db_journal_mode}'))
+        await session.execute(text(f'PRAGMA wal_autocheckpoint={settings.db_wal_autocheckpoint}'))
+        await session.execute(text(f'PRAGMA synchronous={settings.db_synchronous}'))
+        await session.execute(text(f'PRAGMA busy_timeout={settings.db_busy_timeout}'))
         return session
       except Exception as err:
         await session.rollback()
@@ -1785,6 +1788,8 @@ class DataBase:
       #
       #
       db_session: AsyncSession = await self.__connect()
+      # Recording with immediate write lock
+      await db_session.execute(text('BEGIN IMMEDIATE'))
       # DNS SERVERS
       if len(dns_servers_add) > 0:
         logger.debug(f'DB save queue batch prepare: {dns_servers_add=}')

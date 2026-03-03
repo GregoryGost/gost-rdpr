@@ -39,6 +39,11 @@ class Settings(BaseSettings):
   db_table_prefix: str = Field(default='rdpr_')
   db_save_batch_size: int = Field(default=1000) # for while task save to db
   db_save_batch_timeout: float = Field(default=5.0) # 5 sec // recomend time.monotonic()
+  db_journal_mode: str = Field(default='WAL') # Write-Ahead Logging - better concurrent access
+  db_wal_autocheckpoint: int = Field(default=1000) # Initiate a checkpoint approximately every 1000 WAL pages (choose experimentally: if WAL grows too quickly, decrease it; if checkpoints interfere, increase it)
+  db_synchronous: str = Field(default='NORMAL') # NORMAL - A good balance of performance and reliability for most VDS applications. `FULL`` provides maximum reliability, but is more expensive in terms of I/O.
+  db_busy_timeout: int = Field(default=2000) # This is the timeout (in milliseconds) during which SQLite will retry acquiring a lock instead of immediately failing with a "database is locked" error. Defaults in SQLite to 0 (no wait).
+  # HTTP client Requests section
   attempts_limit: int = Field(default=5) # files download attempts limit
   # HTTP client Requests section
   req_connection_retries: int = Field(default=3)

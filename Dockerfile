@@ -30,7 +30,8 @@ WORKDIR /ui
 RUN apk add --no-cache git
 
 # Clone UI repository
-RUN git clone --depth 1 --branch main https://github.com/GregoryGost/gost-rdpr-ui.git .
+ARG BRANCH=main
+RUN git clone --depth 1 --branch ${BRANCH} https://github.com/GregoryGost/gost-rdpr-ui.git .
 
 # Install pnpm
 RUN corepack enable && corepack prepare pnpm@latest --activate
