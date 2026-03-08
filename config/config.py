@@ -44,7 +44,7 @@ class Settings(BaseSettings):
   db_synchronous: str = Field(default='NORMAL') # NORMAL - A good balance of performance and reliability for most VDS applications. `FULL`` provides maximum reliability, but is more expensive in terms of I/O.
   db_busy_timeout: int = Field(default=2000) # This is the timeout (in milliseconds) during which SQLite will retry acquiring a lock instead of immediately failing with a "database is locked" error. Defaults in SQLite to 0 (no wait).
   # HTTP client Requests section
-  attempts_limit: int = Field(default=5) # files download attempts limit
+  attempts_limit: int = Field(default=5) # Files download attempts limit
   # HTTP client Requests section
   req_connection_retries: int = Field(default=3)
   req_timeout_default: float = Field(default=20.0)
