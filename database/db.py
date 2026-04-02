@@ -123,7 +123,8 @@ class DataBase:
     self.__session_factory = async_sessionmaker(
       bind=self.__engine,
       expire_on_commit=False,
-      autocommit=False
+      autocommit=False,
+      autoflush=True
     )
     self.file_loader_client: FileLoaderClient = FileLoaderClient()
     logger.debug(f'{self.__class__.__name__} init ...')
@@ -179,7 +180,10 @@ class DataBase:
     async with self.db_session() as session:
       try:
         # Config PRAGMA
-        await session.execute(text('PRAGMA foreign_keys=ON')) # foreign keys support
+        await session.execute(text(f'PRAGMA foreign_keys=ON')) # foreign keys support
+        await session.execute(text(f'PRAGMA temp_store = MEMORY'))
+        await session.execute(text(f'PRAGMA mmap_size = 268435456'))
+        await session.execute(text(f'PRAGMA cache_size = 10000'))
         await session.execute(text(f'PRAGMA journal_mode={settings.db_journal_mode}'))
         await session.execute(text(f'PRAGMA wal_autocheckpoint={settings.db_wal_autocheckpoint}'))
         await session.execute(text(f'PRAGMA synchronous={settings.db_synchronous}'))
