@@ -1,7 +1,7 @@
 from asyncio import sleep, wait_for, create_task, Queue
 from threading import Event
 
-from httpx import Response, AsyncClient, BasicAuth, Timeout
+from httpx import Response, AsyncClient, BasicAuth, Timeout, RemoteProtocolError
 from httpx._types import HeaderTypes
 from typing import Self, List, Dict, Set
 
@@ -40,7 +40,7 @@ class RosClient:
     'User-Agent': f'{settings.app_title} [{settings.app_version}]'
   }
   __timeout: Timeout = Timeout(
-    timeout=settings.req_timeout_default,
+    timeout=settings.ros_rest_api_default_timeout,
     connect=settings.req_timeout_connect,
     read=settings.ros_rest_api_read_timeout
   )
@@ -146,8 +146,12 @@ class RosClient:
         await sleep(self.__queue_sleep_timeout)
         self.update_ros_queue.task_done()
         continue
+      except RemoteProtocolError:
+        await sleep(self.__queue_sleep_timeout)
+        logger.error(f'ERROR Update ROS configs : [{err.__class__.__name__}] {err}')
+        continue
       except Exception as err:
-        logger.error(f'Unexpected error in flow - Update ROS configs : {err}', exc_info=True)
+        logger.error(f'Unexpected error in flow - Update ROS configs : [{err.__class__.__name__}] {err}', exc_info=True)
         await sleep(self.__task_exception_error_timeout)
         self.update_ros_queue.task_done()
         continue

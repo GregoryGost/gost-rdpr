@@ -206,7 +206,7 @@ class DomainsResolver:
                   ))
         else:
           logger.warning(f'__cname_doh_resolver for {domain=} : {response.status_code} - {response.content.decode('utf-8')}')
-      except (ConnectTimeout, ReadError, RemoteProtocolError) as err:
+      except (ConnectError, ConnectTimeout, ReadError, RemoteProtocolError) as err:
         logger.warning(f'[{err.__class__.__name__}] : __cname_doh_resolver debug err : {err}')
         pass
       except Exception as err:

@@ -65,7 +65,8 @@ class Settings(BaseSettings):
   # IP address section
   ip_not_allowed: str = Field(default='127.0.0.1, 0.0.0.0, 0.0.0.0/0, ::, ::/0')
   # ROUTEROS section
-  ros_rest_api_read_timeout: float = Field(default=59.0) # ROS REST API server timeout = 60s
+  ros_rest_api_read_timeout: float = Field(default=59.0) # ROS REST API server read timeout = 60s
+  ros_rest_api_default_timeout: float = Field(default=59.0) # ROS REST API server base default timeout = 60s
 
   @computed_field
   @property
