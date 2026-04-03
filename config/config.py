@@ -43,6 +43,10 @@ class Settings(BaseSettings):
   db_wal_autocheckpoint: int = Field(default=1000) # Initiate a checkpoint approximately every 1000 WAL pages (choose experimentally: if WAL grows too quickly, decrease it; if checkpoints interfere, increase it)
   db_synchronous: str = Field(default='NORMAL') # NORMAL - A good balance of performance and reliability for most VDS applications. `FULL`` provides maximum reliability, but is more expensive in terms of I/O.
   db_busy_timeout: int = Field(default=2000) # This is the timeout (in milliseconds) during which SQLite will retry acquiring a lock instead of immediately failing with a "database is locked" error. Defaults in SQLite to 0 (no wait).
+  db_pool_size: int = Field(default=3)
+  db_pool_recycle: int = Field(default=1500)
+  db_pool_timeout: int = Field(default=30)
+  db_pool_size_overflow: int = Field(default=2) # max 3+2=5
   # HTTP client Requests section
   attempts_limit: int = Field(default=5) # Files download attempts limit
   # HTTP client Requests section

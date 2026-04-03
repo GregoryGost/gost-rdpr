@@ -20,7 +20,6 @@ from sqlalchemy import (
 )
 from aiosqlite import __version__ as aiosqlite_version
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine, async_sessionmaker, AsyncSession, AsyncConnection
-from sqlalchemy.pool import NullPool
 from datetime import datetime, timezone
 from time import monotonic
 from threading import Event
@@ -112,11 +111,14 @@ class DataBase:
     logger.debug(f'aiosqlite version="{aiosqlite_version}"')
     logger.debug(f'db_connection="{settings.db_connection}"')
     self.__migrations_path.mkdir(exist_ok=True)
-    # NullPool - for SQLite only !!!
     self.__engine: AsyncEngine = create_async_engine(
       url=settings.db_connection,
       connect_args={'timeout': settings.db_timeout},
-      poolclass=NullPool
+      pool_timeout=settings.db_pool_timeout,
+      pool_size=settings.db_pool_size,
+      pool_recycle=settings.db_pool_recycle,
+      max_overflow=settings.db_pool_size_overflow,
+      pool_pre_ping=True
     )
     self.__engine.dialect.identifier_preparer.initial_quote = ''
     self.__engine.dialect.identifier_preparer.final_quote = ''
@@ -127,7 +129,7 @@ class DataBase:
       autoflush=True
     )
     self.file_loader_client: FileLoaderClient = FileLoaderClient()
-    logger.debug(f'{self.__class__.__name__} init ...')
+    logger.debug(f'{self.__class__.__name__} INIT OK')
 
   @property
   def db_session(self: Self) -> async_sessionmaker[AsyncSession]:

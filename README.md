@@ -208,22 +208,23 @@ poetry init
 ```
 
 ```shell
-poetry add "fastapi"
-poetry add "SQLAlchemy"
-poetry add "aiosqlite"
-poetry add "dnspython"
-poetry add "uvicorn"
-poetry add "httpx"
-poetry add "pydantic-settings"
-poetry add "opentelemetry-exporter-prometheus"
-poetry add "cashews"
+poetry add fastapi
+poetry add SQLAlchemy
+poetry add aiosqlite
+poetry add aiosqlitepool
+poetry add dnspython
+poetry add uvicorn
+poetry add httpx
+poetry add pydantic-settings
+poetry add opentelemetry-exporter-prometheus
+poetry add cashews
 ```
 
 or upgrade libs (not recomend)
 
 ```sh
 poetry update
-poetry update "fastapi"
+poetry update fastapi
 ```
 
 Get tree all modules
