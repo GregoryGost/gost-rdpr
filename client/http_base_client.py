@@ -1,6 +1,8 @@
+import logging
 from httpx import AsyncClient, Timeout, AsyncHTTPTransport, Limits
 from httpx._types import HeaderTypes
 
+from logger.logger import Logger
 from config.config import settings
 from metrics.httpx_metrics import HttpxMetrics
 
@@ -13,6 +15,7 @@ class HttpClient:
   metrics: HttpxMetrics = HttpxMetrics()
 
   def __init__(self) -> None:
+    logging.getLogger('httpx').setLevel(Logger.LOGGER_LEVEL[settings.httpx_log_level])
     # Common
     self.limits: Limits = Limits(
       max_connections=settings.req_max_connections,

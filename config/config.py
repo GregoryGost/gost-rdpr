@@ -49,6 +49,7 @@ class Settings(BaseSettings):
   db_pool_size_overflow: int = Field(default=2) # max 3+2=5
   # HTTP client Requests section
   attempts_limit: int = Field(default=5) # Files download attempts limit
+  httpx_log_level: str = Field(default='error')
   # HTTP client Requests section
   req_connection_retries: int = Field(default=3)
   req_timeout_default: float = Field(default=20.0)
