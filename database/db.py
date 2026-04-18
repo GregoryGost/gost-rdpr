@@ -140,7 +140,7 @@ class DataBase:
       autoflush=True
     )
     self.__write_session_factory = async_sessionmaker(
-      bind=self.__read_engine,
+      bind=self.__write_engine,
       expire_on_commit=False,
       autocommit=False,
       autoflush=True
@@ -149,15 +149,15 @@ class DataBase:
     logger.debug(f'{self.__class__.__name__} INIT OK')
 
   @property
-  def db_read_session(self: Self) -> async_sessionmaker[AsyncSession]:
+  def __db_read_session(self: Self) -> async_sessionmaker[AsyncSession]:
     return self.__read_session_factory
   
   @property
-  def db_write_session(self: Self) -> async_sessionmaker[AsyncSession]:
+  def __db_write_session(self: Self) -> async_sessionmaker[AsyncSession]:
     return self.__write_session_factory
 
   @property
-  def pool_status(self: Self) -> str:
+  def read_pool_status(self: Self) -> str:
     return self.__read_engine.pool.status()
   
   #
@@ -212,7 +212,7 @@ class DataBase:
 
   async def __read_connect(self: Self) -> AsyncSession:
     if self.__state == False: raise Exception('Database not ready to work')
-    async with self.db_read_session() as session:
+    async with self.__db_read_session() as session:
       try:
         return await self.__session_tune(session)
       except Exception as err:
@@ -224,7 +224,7 @@ class DataBase:
 
   async def __write_connect(self: Self) -> AsyncSession:
     if self.__state == False: raise Exception('Database not ready to work')
-    async with self.db_write_session() as session:
+    async with self.__db_write_session() as session:
       try:
         return await self.__session_tune(session)
       except Exception as err:
@@ -245,7 +245,7 @@ class DataBase:
       db_session: AsyncSession = await self.__read_connect()
       result: Result = await db_session.execute(text('SELECT sqlite_version() AS version'))
       logger.info(f'SQLite version="{str(result.scalar())}"')
-      logger.debug(f'SQLite pool_status="{self.pool_status}"')
+      logger.debug(f'SQLite pool_status="{self.read_pool_status}"')
       #
       logger.debug('Start tasks flows for DataBase')
       # ONE FLOW FOR SAVE TO DB
