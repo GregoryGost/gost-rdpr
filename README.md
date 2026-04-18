@@ -48,20 +48,21 @@ UI REPO - <https://github.com/GregoryGost/gost-rdpr-ui>
 Available environment variables
 
 | ENV PARAMETER | Type | Default value | Description |
-|---------------|------|---------------|-------------|
-| `ROOT_PATH`   | str  | `normpath(getcwd())` | Path to the application root folder |
+| --------------- | ------ | --------------- | ------------- |
+| `ROOT_PATH` | str | `normpath(getcwd())` | Path to the application root folder |
 | `ROOT_LOG_LEVEL` | str | `error` | Root level logging |
 | `APP_TITLE` | str | `GOST-RDPR (Resolve Domains Per Records)` | Application name |
 | `APP_SUMMARY` | str | `A utility for working with Mikrotik RouterOS and BGP protocol for announcing IP addresses` | Description title |
 | `APP_DESCRIPTION` | str | `The utility provides parsing of domain names into IP addresses, processing of domain lists and their subsequent parsing, processing of individual IP addresses and summarized IP groups. Updates firewall address list and routing table` | Detailed description of the application |
 | `APP_DEBUG` | str | `False` | FastAPI application debug level |
 | `APP_VERSION` | str | `2.0.0` | Application version. Get in config from `pyproject.toml` file |
-| `APP_HOST`    | str  | `0.0.0.0`   | Listen on IP addr. `0.0.0.0` - Listen on all IP addresses |
+| `APP_HOST` | str | `0.0.0.0` | Listen on IP addr. `0.0.0.0` - Listen on all IP addresses |
 | `APP_PORT` | int | `4000` | Listen on TCP/IP specific port |
 | `APP_LOG_LEVEL` | str | `error` | Application level logging |
 | `QUEUE_MAX_SIZE` | int | `1000` | Maximum size of each individual queue |
 | `QUEUE_GET_TIMEOUT` | float | `0.1` | Maximum waiting time for a queue entry. 0.1s = 100ms |
 | `QUEUE_SLEEP_TIMEOUT` | float | `0.01` | The maximum wait time while the queue is empty. At the same time, the infinite loop should allow the scheduler to integrate other tasks into the overall flow. 0.01s = 10ms |
+| `RESOLVE_DOMAINS_LOG_EVERY` | int | `10` | Specifies the number of messages that will be logged during domain resolution. Distributes the total volume of domains to resolve among this number |
 | `DB_LOG_LEVEL` | str | `error` | SQLAlchemy level logging |
 | `DB_TIMEOUT` | float | `30.0` | Maximum time to wait for a database to be freed |
 | `DB_BASE_DIR` | str | `db` | A separate folder containing the database. It is also later mounted in a container for downloading to a local PC |
@@ -69,10 +70,14 @@ Available environment variables
 | `DB_TABLE_PREFIX` | str | `rdpr_` | Prefix for database table names |
 | `DB_SAVE_BATCH_SIZE` | int | `1000` | The maximum number of all insert, update, and delete events in the database queue. This means we write a maximum of 1000 events to the file at a time (which can be very frequent). But you should also look at the timeout parameter |
 | `DB_SAVE_BATCH_TIMEOUT` | float | `0.5` | If we haven't accumulated a batch of the size limited by the parameter "parameter1" within the interval specified here, then we do what's already in the current batch |
-| `DB_JOURNAL_MODE` | str | `WAL` |  Write-Ahead Logging - better concurrent access |
+| `DB_JOURNAL_MODE` | str | `WAL` | Write-Ahead Logging - better concurrent access |
 | `DB_WAL_AUTOCHECKPOINT` | int | `1000` | Initiate a checkpoint approximately every 1000 WAL pages (choose experimentally: if WAL grows too quickly, decrease it; if checkpoints interfere, increase it) |
 | `DB_SYNCHRONOUS` | str | `NORMAL` | NORMAL - A good balance of performance and reliability for most VDS applications. `FULL`` provides maximum reliability, but is more expensive in terms of I/O. |
 | `DB_BUSY_TIMEOUT` | int | `2000` | This is the timeout (in milliseconds) during which SQLite will retry acquiring a lock instead of immediately failing with a "database is locked" error. Defaults in SQLite to 0 (no wait). |
+| `DB_POOL_SIZE` | int | `10` | The number of connections to keep open inside the connection pool |
+| `DB_POOL_RECYCLE` | int | `1500` | This setting causes the pool to recycle connections after the given number of seconds has passed |
+| `DB_POOL_TIMEOUT` | int | `30` | Number of seconds to wait before giving up on getting a connection from the pool |
+| `DB_POOL_SIZE_OVERFLOW` | int | `2` | The number of connections to allow in connection pool `overflow`, that is connections that can be opened above and beyond the `db_pool_size` setting, which defaults to five |
 | `ATTEMPTS_LIMIT` | int | `5` | How many times a file must be checked with a negative result before it (and all its child entities) are deleted from the database |
 | `REQ_CONNECTION_RETRIES` | int | `3` | Requests will be retried the given number of times in case an `httpx.ConnectError` or an `httpx.ConnectTimeout` occurs, allowing smoother operation under flaky networks |
 | `REQ_TIMEOUT_DEFAULT` | float | `20.0` | General timeout for connections parameters `connect`, `read`, `write` or `pool` |
@@ -87,7 +92,7 @@ Available environment variables
 | `DOMAINS_BLACK_LIST` | str | `None` | Domains that should not be included in the database. Comma-separated list |
 | `LISTS_UPDATE_INTERVAL_SEC` | int | `604800` | The period after which the file must be uploaded and verified again. Specified in seconds. 604800s = 7days |
 | `IP_NOT_ALLOWED` | str | `127.0.0.1, 0.0.0.0, 0.0.0.0/0, ::, ::/0` | A list of IP addresses that should not be included in the database. Comma-separated list. |
-| `ROS_REST_API_READ_TIMEOUT`| float | `59.0` | ROS REST API server timeout = 60s |
+| `ROS_REST_API_READ_TIMEOUT` | float | `59.0` | ROS REST API server timeout = 60s |
 
 ## MikroTik RouterOS
 

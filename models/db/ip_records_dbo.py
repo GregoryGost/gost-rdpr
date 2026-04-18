@@ -211,7 +211,7 @@ class IpRecordsDbo(Dbo):
   @classmethod
   async def get_all_for_update(cls: type[Self], db_session: AsyncSession, addr_type: int | None = None):
     try:
-      select_stmt: Select[Tuple[str, str | None]] = select(
+      select_stmt: Select[Tuple[str, str]] = select(
         cls.ip_address,
         func.coalesce(cls.ros_comment, DomainsDbo.ros_comment, DomainsDbo.name).label('comment')
       ).join(
@@ -219,7 +219,7 @@ class IpRecordsDbo(Dbo):
       )
       if addr_type != None:
         select_stmt = select_stmt.where(cls.addr_type == addr_type)
-      result: Result[Tuple[str, str | None]] = await db_session.execute(select_stmt)
+      result: Result[Tuple[str, str]] = await db_session.execute(select_stmt)
       #
       return result.fetchall()
     except Exception as err:

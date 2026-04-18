@@ -67,7 +67,7 @@ class RosClient:
         # get all addresses from Database
         stored_ip_address: List[IpRecordDto] = await db.get_all_ips_for_update(addr_type=config.addr_type)
         stored_addresses_set: Set[str] = {ip.ip_address for ip in stored_ip_address}
-        logger.debug(f'IP address count for ros update: {len(stored_ip_address)}')
+        logger.info(f'IP address count for ros update: {len(stored_ip_address)}')
         # get default gateway
         default_gateway: RosIpRouteDefaultGatewayResp = await self.__get_default_gateway(config=config)
         # get rdpr routing table
@@ -423,6 +423,7 @@ class RosClient:
       await jobs_cache.set(Jobs.ROS_UPDATE, True)
       # get all RoS configs from DB
       configs: List[RosConfigDto] = await db.get_all_configs_for_ros_update()
+      logger.info(f'Configs for update: {len(configs)}')
       if len(configs) > 0:
         #
         logger.debug(f'Start task ...')

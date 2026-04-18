@@ -19,6 +19,7 @@ from sqlalchemy import (
   Row
 )
 from aiosqlite import __version__ as aiosqlite_version
+from sqlalchemy.pool import NullPool, AsyncAdaptedQueuePool
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine, async_sessionmaker, AsyncSession, AsyncConnection
 from datetime import datetime, timezone
 from time import monotonic
@@ -93,8 +94,10 @@ class DataBase:
   '''
 
   __state: bool = False
-  __engine: AsyncEngine
-  __session_factory: async_sessionmaker[AsyncSession]
+  __read_engine: AsyncEngine
+  __write_engine: AsyncEngine
+  __read_session_factory: async_sessionmaker[AsyncSession]
+  __write_session_factory: async_sessionmaker[AsyncSession]
   __stop_db_save_event: Event = Event()
   __queue_sleep_timeout: float = settings.queue_sleep_timeout
   __queue_get_timeout: float = settings.queue_get_timeout
@@ -111,19 +114,33 @@ class DataBase:
     logger.debug(f'aiosqlite version="{aiosqlite_version}"')
     logger.debug(f'db_connection="{settings.db_connection}"')
     self.__migrations_path.mkdir(exist_ok=True)
-    self.__engine: AsyncEngine = create_async_engine(
+    self.__read_engine: AsyncEngine = create_async_engine(
       url=settings.db_connection,
       connect_args={'timeout': settings.db_timeout},
       pool_timeout=settings.db_pool_timeout,
       pool_size=settings.db_pool_size,
       pool_recycle=settings.db_pool_recycle,
       max_overflow=settings.db_pool_size_overflow,
+      poolclass=AsyncAdaptedQueuePool,
       pool_pre_ping=True
     )
-    self.__engine.dialect.identifier_preparer.initial_quote = ''
-    self.__engine.dialect.identifier_preparer.final_quote = ''
-    self.__session_factory = async_sessionmaker(
-      bind=self.__engine,
+    self.__write_engine: AsyncEngine = create_async_engine(
+      url=settings.db_connection,
+      connect_args={'timeout': settings.db_timeout},
+      poolclass=NullPool
+    )
+    self.__read_engine.dialect.identifier_preparer.initial_quote = ''
+    self.__read_engine.dialect.identifier_preparer.final_quote = ''
+    self.__write_engine.dialect.identifier_preparer.initial_quote = ''
+    self.__write_engine.dialect.identifier_preparer.final_quote = ''
+    self.__read_session_factory = async_sessionmaker(
+      bind=self.__read_engine,
+      expire_on_commit=False,
+      autocommit=False,
+      autoflush=True
+    )
+    self.__write_session_factory = async_sessionmaker(
+      bind=self.__read_engine,
       expire_on_commit=False,
       autocommit=False,
       autoflush=True
@@ -132,18 +149,34 @@ class DataBase:
     logger.debug(f'{self.__class__.__name__} INIT OK')
 
   @property
-  def db_session(self: Self) -> async_sessionmaker[AsyncSession]:
-    return self.__session_factory
+  def db_read_session(self: Self) -> async_sessionmaker[AsyncSession]:
+    return self.__read_session_factory
   
   @property
+  def db_write_session(self: Self) -> async_sessionmaker[AsyncSession]:
+    return self.__write_session_factory
+
+  @property
   def pool_status(self: Self) -> str:
-    return self.__engine.pool.status()
+    return self.__read_engine.pool.status()
   
   #
 
+  async def __session_tune(self: Self, session: AsyncSession):
+    # Config PRAGMA
+    await session.execute(text(f'PRAGMA foreign_keys=ON')) # foreign keys support
+    await session.execute(text(f'PRAGMA temp_store = MEMORY'))
+    await session.execute(text(f'PRAGMA mmap_size = 268435456'))
+    await session.execute(text(f'PRAGMA cache_size = 10000'))
+    await session.execute(text(f'PRAGMA journal_mode={settings.db_journal_mode}'))
+    await session.execute(text(f'PRAGMA wal_autocheckpoint={settings.db_wal_autocheckpoint}'))
+    await session.execute(text(f'PRAGMA synchronous={settings.db_synchronous}'))
+    await session.execute(text(f'PRAGMA busy_timeout={settings.db_busy_timeout}'))
+    return session
+
   async def __create_tables(self: Self) -> None:
     logger.debug('Try create all tables ...')
-    async with self.__engine.begin() as conn:
+    async with self.__write_engine.begin() as conn:
       try:
         await conn.run_sync(MigrationsDbo.metadata.create_all)
         await conn.run_sync(DnsServersDbo.metadata.create_all)
@@ -177,20 +210,23 @@ class DataBase:
       finally:
         await conn.close()
 
-  async def __connect(self: Self) -> AsyncSession:
+  async def __read_connect(self: Self) -> AsyncSession:
     if self.__state == False: raise Exception('Database not ready to work')
-    async with self.db_session() as session:
+    async with self.db_read_session() as session:
       try:
-        # Config PRAGMA
-        await session.execute(text(f'PRAGMA foreign_keys=ON')) # foreign keys support
-        await session.execute(text(f'PRAGMA temp_store = MEMORY'))
-        await session.execute(text(f'PRAGMA mmap_size = 268435456'))
-        await session.execute(text(f'PRAGMA cache_size = 10000'))
-        await session.execute(text(f'PRAGMA journal_mode={settings.db_journal_mode}'))
-        await session.execute(text(f'PRAGMA wal_autocheckpoint={settings.db_wal_autocheckpoint}'))
-        await session.execute(text(f'PRAGMA synchronous={settings.db_synchronous}'))
-        await session.execute(text(f'PRAGMA busy_timeout={settings.db_busy_timeout}'))
-        return session
+        return await self.__session_tune(session)
+      except Exception as err:
+        await session.rollback()
+        logger.error(f'Try DB connect failed : {settings.db_path} : {err}')
+        raise err
+      finally:
+        await session.close()
+
+  async def __write_connect(self: Self) -> AsyncSession:
+    if self.__state == False: raise Exception('Database not ready to work')
+    async with self.db_write_session() as session:
+      try:
+        return await self.__session_tune(session)
       except Exception as err:
         await session.rollback()
         logger.error(f'Try DB connect failed : {settings.db_path} : {err}')
@@ -206,7 +242,7 @@ class DataBase:
     try:
       await self.__create_tables()
       self.__state = True
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       result: Result = await db_session.execute(text('SELECT sqlite_version() AS version'))
       logger.info(f'SQLite version="{str(result.scalar())}"')
       logger.debug(f'SQLite pool_status="{self.pool_status}"')
@@ -319,7 +355,7 @@ class DataBase:
     logger.debug(f'{limit=}, {offset=}, {start_date=}, {end_date=}, {default=}, {search_text=}')
     payload: List[DnsElementResp] = []
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       #
       total: int = await DnsServersDbo.get_total(db_session=db_session)
       if total > 0:
@@ -370,7 +406,7 @@ class DataBase:
   async def get_dns_server_on_id(self: Self, id: int) -> DnsElementResp | None:
     logger.debug(f'Try get DNS server on ID={id} ...')
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       dns_server: Row[Tuple[int, str | None, str | None, str | None, datetime, datetime | None]] | None = \
         await DnsServersDbo.get_on_id(db_session=db_session, id=id)
       if dns_server != None:
@@ -437,7 +473,7 @@ class DataBase:
     logger.debug(f'Try get DNS servers for resolve ...')
     dns_servers: Tuple[List[DnsServerDto], List[DnsServerDto]] = ([], [])
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       # get dns servers for resolve
       dns_servers_for_resolve: Sequence[Row[Tuple[str | None, str | None, DnsServerType]]] = await DnsServersDbo.get_all_for_resolve(db_session=db_session)
       dns_servers_default: List[DnsServerDto] = [DnsServerDto(server=dns_server[0]) for dns_server in dns_servers_for_resolve if dns_server[2] == DnsServerType.DEFAULT]
@@ -468,7 +504,7 @@ class DataBase:
     logger.debug(f'{limit=}, {offset=}, {start_date=}, {end_date=}, {search_text=}')
     payload: List[DomainsListElementResp] = []
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       total: int = await DomainsListsDbo.get_total(db_session=db_session)
       if total > 0:
         domains_lists: Sequence[Row[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]]] = \
@@ -525,7 +561,7 @@ class DataBase:
   async def get_domains_list_on_id(self: Self, id: int) -> DomainsListElementResp | None:
     logger.debug(f'Try get Domains list on ID={id} ...')
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       domains_list: Row[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]] | None = \
         await DomainsListsDbo.get_on_id(db_session=db_session, id=id)
       if domains_list != None:
@@ -630,7 +666,7 @@ class DataBase:
     logger.debug(f'{limit=}, {offset=}, {start_date=}, {end_date=}, {search_text=}')
     payload: List[DomainElementResp] = []
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       total: int = await DomainsDbo.get_total(db_session=db_session)
       resolved_count: int = await DomainsDbo.get_total_resolved(db_session=db_session)
       if total > 0:
@@ -692,7 +728,7 @@ class DataBase:
   async def get_domain_on_id(self: Self, id: int) -> DomainElementResp | None:
     logger.debug(f'Try get Domain on ID={id} ...')
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       domain: Row[Tuple[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None]] | None = \
         await DomainsDbo.get_on_id(db_session=db_session, id=id)
       if domain != None:
@@ -781,7 +817,7 @@ class DataBase:
     logger.debug(f'Try get Domains for resolve ...')
     domains: List[DomainResult] = []
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       # get domains for resolve
       domains_for_resolve: Sequence[Row[Tuple[int, str, int | None, int]]] = await DomainsDbo.get_all_for_resolve(db_session=db_session)
       domains = [DomainResult(id=domain[0], name=domain[1], list_id=domain[2]) for domain in domains_for_resolve]
@@ -798,7 +834,7 @@ class DataBase:
     logger.debug(f'Try get Domains on domains list {domains_list_id=} ...')
     domains: List[DomainResult] = []
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       # get domains
       domains_on_list: Sequence[Row[Tuple[int, str]]] = await DomainsDbo.get_all_on_domains_list(
         db_session=db_session,
@@ -847,7 +883,7 @@ class DataBase:
     logger.debug(f'{limit=}, {offset=}, {start_date=}, {end_date=}, {search_text=}')
     payload: List[IpsListElementResp] = []
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       total: int = await IpsListsDbo.get_total(db_session=db_session)
       if total > 0:
         ips_lists: Sequence[Row[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]]] = \
@@ -901,7 +937,7 @@ class DataBase:
   async def get_ips_list_on_id(self: Self, id: int) -> IpsListElementResp | None:
     logger.debug(f'Try get Ips list on ID={id} ...')
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       ips_list: Row[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]] | None = \
         await IpsListsDbo.get_on_id(db_session=db_session, id=id)
       if ips_list != None:
@@ -1002,7 +1038,7 @@ class DataBase:
     logger.debug(f'{limit=}, {offset=}, {start_date=}, {end_date=}, {search_text=}')
     payload: List[IpsElementResp] = []
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       total: int = await IpRecordsDbo.get_total(db_session=db_session)
       if total > 0:
         ips: Sequence[Row[Tuple[int, int | None, str, int | None, str, int, str, str | None, datetime, datetime | None]]] = \
@@ -1055,7 +1091,7 @@ class DataBase:
   async def get_ip_record_on_id(self: Self, id: int) -> IpsElementResp | None:
     logger.debug(f'Try get IP address record on ID={id} ...')
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       ip_address_record: Row[Tuple[int, int | None, str, int | None, str, str, int, str | None, datetime, datetime | None]] | None = \
         await IpRecordsDbo.get_on_id(db_session=db_session, id=id)
       if ip_address_record != None:
@@ -1138,7 +1174,7 @@ class DataBase:
     logger.debug(f'Try get all IP address records for Domain {domain_id=} ...')
     result: List[IpRecordDto] = []
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       ips_result: Sequence[Row[Tuple[int, str, int]]] = await IpRecordsDbo.get_ips_on_domain_id_extend(db_session=db_session, domain_id=domain_id)
       result = [IpRecordDto(id=ip[0], ip_address=ip[1], addr_type=ip[2]) for ip in ips_result]
       return result
@@ -1153,7 +1189,7 @@ class DataBase:
     logger.debug(f'Try get all IP address records for ips list {ips_list_id=} ...')
     result: List[IpRecordDto] = []
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       ips_result: Sequence[Row[Tuple[int, str]]] = await IpRecordsDbo.get_all_on_ips_list(
         db_session=db_session,
         ip_list_id=ips_list_id
@@ -1171,8 +1207,8 @@ class DataBase:
     logger.debug(f'Try get all IP address for update ...')
     ips: List[IpRecordDto] = []
     try:
-      db_session: AsyncSession = await self.__connect()
-      all_ips: Sequence[Row[Tuple[str, str | None]]] = await IpRecordsDbo.get_all_for_update(
+      db_session: AsyncSession = await self.__read_connect()
+      all_ips: Sequence[Row[Tuple[str, str]]] = await IpRecordsDbo.get_all_for_update(
         db_session=db_session,
         addr_type=addr_type
       )
@@ -1201,7 +1237,7 @@ class DataBase:
     logger.debug(f'{limit=}, {offset=}, {start_date=}, {end_date=}, {default=}, {search_text=}')
     payload: List[RosConfigElementResp] = []
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       #
       total: int = await RosConfigsDbo.get_total(db_session=db_session)
       if total > 0:
@@ -1254,7 +1290,7 @@ class DataBase:
   async def get_ros_config_on_id(self: Self, id: int) -> RosConfigElementResp | None:
     logger.debug(f'Try get RoS config on ID={id} ...')
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       ros_config: Row[Tuple[int, str, str, str, str, str | None, datetime, datetime | None]] | None = \
         await RosConfigsDbo.get_on_id(db_session=db_session, id=id)
       if ros_config != None:
@@ -1323,7 +1359,7 @@ class DataBase:
     logger.debug(f'Try get all RoS configs for update ...')
     configs: List[RosConfigDto] = []
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       ros_configs: Sequence[Row[Tuple[int, str, str, str, str]]] = await RosConfigsDbo.get_all_for_update(db_session=db_session)
       configs: List[RosConfigDto] = [
         RosConfigDto(id=config[0], host=config[1], user=config[2], passwd=config[3], bgp_list_name=config[4])
@@ -1343,7 +1379,7 @@ class DataBase:
     logger.info(f'Lists load - START {forced=}')
     try:
       await jobs_cache.set(Jobs.LISTS_LOAD, True)
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       domains_lists_total: int = await DomainsListsDbo.get_total(db_session=db_session)
       ips_lists_total: int = await IpsListsDbo.get_total(db_session=db_session)
       if domains_lists_total > 0:
@@ -1431,7 +1467,7 @@ class DataBase:
       ros=StatsRosData()
     )
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       #
       dns_stats: Row[Tuple[int, int, int]] = await DnsServersDbo.get_stats(db_session=db_session)
       domains_stats: Row[Tuple[int, int, int, int, Any]] = await DomainsDbo.get_stats(db_session=db_session)
@@ -1492,7 +1528,7 @@ class DataBase:
     )
     logger.debug(f'{entity=} {granularity=} {start_date=} {end_date=} {ip_subtype=}')
     try:
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__read_connect()
       if entity == GrowthEntity.DOMAINS:
         domains_stats_growth: Sequence[Row[Tuple[str, int]]] = await DomainsDbo.get_stats_growth(
           db_session=db_session,
@@ -1793,7 +1829,7 @@ class DataBase:
       ]
       #
       #
-      db_session: AsyncSession = await self.__connect()
+      db_session: AsyncSession = await self.__write_connect()
       # Recording with immediate write lock
       await db_session.execute(text('BEGIN IMMEDIATE'))
       # DNS SERVERS
