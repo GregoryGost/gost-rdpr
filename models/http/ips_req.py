@@ -42,6 +42,9 @@ class IpsPostElementReq(BaseModel):
     min_length=3,
     examples=['discord ip address']
   )] = None
+  use_default_gw: Annotated[bool, Field(
+    title='Not use VPN gateway. Use default client router gateway'
+  )] = False
 
   @field_validator('addr', mode='before')
   @classmethod

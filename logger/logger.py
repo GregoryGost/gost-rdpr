@@ -16,7 +16,7 @@ class Logger:
 
   def __init__(self):
     self.format: Formatter = Formatter(
-      fmt='[%(asctime)s.%(msecs)03d] [%(thread)s] %(levelname)s : %(message)s',
+      fmt='[%(asctime)s.%(msecs)03d] [%(thread)s] [%(name)s] %(levelname)s : %(message)s',
       datefmt='%Y-%m-%d %H:%M:%S'
     )
     self.stream_handler: StreamHandler = ConsoleHandler()

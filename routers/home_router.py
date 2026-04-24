@@ -56,7 +56,7 @@ class HomeRouter(BaseRouter):
       resp: HealthResp = HealthResp(
         ts=ts,
         uptime=uptime,
-        db_pool=db.pool_status
+        db_pool=db.read_pool_status
       )
       return JSONResponse(resp.to_dict(), status.HTTP_200_OK)
     

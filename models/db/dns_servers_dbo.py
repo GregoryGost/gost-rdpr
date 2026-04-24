@@ -144,3 +144,19 @@ class DnsServersDbo(Dbo):
       return exec_result.fetchall()
     except Exception as err:
       raise err
+
+  @classmethod
+  async def get_stats(
+    cls: type[Self],
+    db_session: AsyncSession
+  ) -> Row[Tuple[int, int, int]]:
+    try:
+      select_stmt: Select[Tuple[int, int, int]] = select(
+        func.count().label('total'),
+        func.count(cls.server).label('classic'),
+        func.count(cls.doh_server).label('doh')
+      )
+      exec_result: Result[Tuple[int, int, int]] = await db_session.execute(select_stmt)
+      return exec_result.one()
+    except Exception as err:
+      raise err

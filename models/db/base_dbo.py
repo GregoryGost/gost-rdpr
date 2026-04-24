@@ -5,7 +5,18 @@ from typing import Self, Dict, Tuple, List, Any
 
 from config.config import settings
 
+from models.http.statistics_req import GrowthGranularity
+
 # AUTOINCREMENT MAX VALUE = 9223372036854775807 (max 64bit number not unsigned)
+
+GRANULARITY_FORMAT: Dict[GrowthGranularity, Tuple[str, str, str]] = {
+  GrowthGranularity.MINUTE: ('%Y-%m-%d %H:%M:00', '%Y-%m-%d %H:%M', '+1 minute'),
+  GrowthGranularity.HOUR:   ('%Y-%m-%d %H:00:00', '%Y-%m-%d %H',    '+1 hour'),
+  GrowthGranularity.DAY:    ('%Y-%m-%d',          '%Y-%m-%d',       '+1 day'),
+  GrowthGranularity.WEEK:   ('%Y-%m-%d',          '%Y-%W',          '+7 days'),
+  GrowthGranularity.MONTH:  ('%Y-%m-01',          '%Y-%m',          '+1 month'),
+  GrowthGranularity.YEAR:   ('%Y-01-01',          '%Y',             '+1 year'),
+}
 
 class PrefixerMeta(DeclarativeMeta):
 

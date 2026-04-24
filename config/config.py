@@ -31,6 +31,7 @@ class Settings(BaseSettings):
   queue_max_size: int = Field(default=1000)
   queue_get_timeout: float = Field(default=0.1)
   queue_sleep_timeout: float = Field(default=0.01)
+  resolve_domains_log_every: int = Field(default=10)
   # DB section
   db_log_level: str = Field(default='error')
   db_timeout: float = Field(default=30.0) # default in lib sqlite3 = 5.0
@@ -39,7 +40,17 @@ class Settings(BaseSettings):
   db_table_prefix: str = Field(default='rdpr_')
   db_save_batch_size: int = Field(default=1000) # for while task save to db
   db_save_batch_timeout: float = Field(default=5.0) # 5 sec // recomend time.monotonic()
-  attempts_limit: int = Field(default=5) # files download attempts limit
+  db_journal_mode: str = Field(default='WAL') # Write-Ahead Logging - better concurrent access
+  db_wal_autocheckpoint: int = Field(default=1000) # Initiate a checkpoint approximately every 1000 WAL pages (choose experimentally: if WAL grows too quickly, decrease it; if checkpoints interfere, increase it)
+  db_synchronous: str = Field(default='NORMAL') # NORMAL - A good balance of performance and reliability for most VDS applications. `FULL`` provides maximum reliability, but is more expensive in terms of I/O.
+  db_busy_timeout: int = Field(default=2000) # This is the timeout (in milliseconds) during which SQLite will retry acquiring a lock instead of immediately failing with a "database is locked" error. Defaults in SQLite to 0 (no wait).
+  db_pool_size: int = Field(default=10)
+  db_pool_recycle: int = Field(default=1500)
+  db_pool_timeout: int = Field(default=30)
+  db_pool_size_overflow: int = Field(default=2) # max 3+2=5
+  # HTTP client Requests section
+  attempts_limit: int = Field(default=5) # Files download attempts limit
+  httpx_log_level: str = Field(default='error')
   # HTTP client Requests section
   req_connection_retries: int = Field(default=3)
   req_timeout_default: float = Field(default=20.0)
@@ -60,7 +71,8 @@ class Settings(BaseSettings):
   # IP address section
   ip_not_allowed: str = Field(default='127.0.0.1, 0.0.0.0, 0.0.0.0/0, ::, ::/0')
   # ROUTEROS section
-  ros_rest_api_read_timeout: float = Field(default=59.0) # ROS REST API server timeout = 60s
+  ros_rest_api_read_timeout: float = Field(default=59.0) # ROS REST API server read timeout = 60s
+  ros_rest_api_default_timeout: float = Field(default=59.0) # ROS REST API server base default timeout = 60s
 
   @computed_field
   @property

@@ -3,11 +3,18 @@ from typing import Annotated, List, Tuple, Self, Set
 
 from .base import Base
 
-from utils.utils import get_ip_without_prefix
+from utils.utils import get_ip_without_prefix, get_ip_version
 
 class RosFirewallIpResp(Base):
   id: Annotated[str, Field(alias='.id')]
   address: str
+  type: int = 4
+
+  @model_validator(mode='after')
+  def remove_prefix(self: Self):
+    # set type
+    self.type = get_ip_version(ip=self.address)
+    return self
   
   @staticmethod
   def separate_duplicates(addresses: List[RosFirewallIpResp]) -> Tuple[List[RosFirewallIpResp], List[RosFirewallIpResp]]:
@@ -28,11 +35,14 @@ class RosRoutingIpResp(Base):
   id: Annotated[str, Field(alias='.id')]
   address: Annotated[str, Field(alias='dst-address')]
   gateway: str
+  type: int = 4
 
   @model_validator(mode='after')
   def remove_prefix(self: Self):
     # need remove /32 prefix for dst-address
     self.address = get_ip_without_prefix(ip_address=self.address)
+    # set type
+    self.type = get_ip_version(ip=self.address)
     return self
   
   @staticmethod

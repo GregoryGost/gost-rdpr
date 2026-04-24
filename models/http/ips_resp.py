@@ -11,6 +11,7 @@ class IpsElementResp(Base):
   domain_id: Optional[int] = None
   domain_name: Optional[str] = None
   ros_comment: Optional[str] = None
+  use_default_gw: bool = False
   created_at: int | float
   created_at_hum: str
   updated_at: Optional[int | float] = None

@@ -4,6 +4,8 @@ from typing import Optional, Annotated, Self, Dict, Any
 
 from config.config import settings
 
+DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
+
 class Base(BaseModel):
   
   def to_dict(self: Self) -> Dict[str, Any]:
@@ -41,15 +43,15 @@ class LimitOffsetQuery(Base):
   )] = 0
   start_date: Annotated[str | None, Field(
     title='Start date',
-    description='Date from which you want to start sampling',
-    examples=['%Y-%m-%d %H:%M:%S', '2024-10-01 15:00:00'],
+    description='Date from which you want to start sampling. Example `2024-04-24 00:00:00`',
+    examples=[DATE_FORMAT, '2024-10-01 15:00:00'],
     min_length=19,
     max_length=19
   )] = None
   end_date: Annotated[str | None, Field(
     title='End date',
-    description='Date from which you want to end sampling',
-    examples=['%Y-%m-%d %H:%M:%S', '2024-10-01 15:00:00'],
+    description='Date from which you want to end sampling. Example `2024-04-24 23:59:59`',
+    examples=[DATE_FORMAT, '2024-10-01 15:00:00'],
     min_length=19,
     max_length=19
   )] = None
@@ -58,17 +60,17 @@ class LimitOffsetQuery(Base):
   def start_date_and_end_date_validator(self: Self) -> Self:
     if self.start_date != None:
       try:
-        datetime.strptime(self.start_date, '%Y-%m-%d %H:%M:%S')
+        datetime.strptime(self.start_date, DATE_FORMAT)
       except:
-        raise ValueError('Invalid start_date format. Use YYYY-MM-DD HH:MM:SS')
+        raise ValueError(f'Invalid start_date format. Use {DATE_FORMAT!r}')
     if self.end_date != None:
       try:
-        datetime.strptime(self.end_date, '%Y-%m-%d %H:%M:%S')
+        datetime.strptime(self.end_date, DATE_FORMAT)
       except:
-        raise ValueError('Invalid end_date format. Use YYYY-MM-DD HH:MM:SS')
+        raise ValueError(f'Invalid end_date format. Use {DATE_FORMAT!r}')
     if self.start_date != None and self.end_date != None:
-      startUnixDt = int(datetime.strptime(self.start_date, '%Y-%m-%d %H:%M:%S').timestamp())
-      endUnixDt = int(datetime.strptime(self.end_date, '%Y-%m-%d %H:%M:%S').timestamp())
+      startUnixDt = int(datetime.strptime(self.start_date, DATE_FORMAT).timestamp())
+      endUnixDt = int(datetime.strptime(self.end_date, DATE_FORMAT).timestamp())
       if startUnixDt >= endUnixDt:
         raise ValueError('The start_date must be less than the end_date')
     return self

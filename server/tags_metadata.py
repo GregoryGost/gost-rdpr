@@ -43,4 +43,7 @@ class TagsMetadata:
     name='Commands',
     description='Commands to perform periodic background tasks (downloading lists, resolving domains, etc.)'
   ))
-  # jobs_tag
+  statistics_tag: TagElement = field(default_factory=lambda: TagElement(
+    name='Statistics',
+    description='Producing statistical data for subsequent use in tables and graphs'
+  ))

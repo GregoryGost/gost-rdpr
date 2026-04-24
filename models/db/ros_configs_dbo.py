@@ -123,3 +123,17 @@ class RosConfigsDbo(Dbo):
       return exec_result.fetchall()
     except Exception as err:
       raise err
+
+  @classmethod
+  async def get_stats(
+    cls: type[Self],
+    db_session: AsyncSession
+  ) -> Row[Tuple[int]]:
+    try:
+      select_stmt: Select[Tuple[int]] = select(
+        func.count().label('total')
+      )
+      exec_result: Result[Tuple[int]] = await db_session.execute(select_stmt)
+      return exec_result.one()
+    except Exception as err:
+      raise err
