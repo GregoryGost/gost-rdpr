@@ -1,5 +1,6 @@
 from datetime import datetime
 from sqlalchemy import (
+  text,
   select,
   case,
   literal,
@@ -13,6 +14,7 @@ from sqlalchemy import (
   INTEGER,
   TIMESTAMP,
   TEXT,
+  BOOLEAN,
   CTE
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -42,6 +44,7 @@ class IpRecordsDbo(Dbo):
   addr_type: Mapped[int] = mapped_column(INTEGER, nullable=False)
   ip_address: Mapped[str] = mapped_column(TEXT, unique=True, index=True, nullable=False)
   ros_comment: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
+  use_default_gw: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False, server_default=text('0'))
 
   created_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=func.now())
   updated_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP, onupdate=func.now(), nullable=True)
@@ -64,9 +67,9 @@ class IpRecordsDbo(Dbo):
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     search_text: Optional[str] = None
-  ) -> Sequence[Row[Tuple[int, int | None, str, int | None, str, int, str, str | None, datetime, datetime | None]]]:
+  ) -> Sequence[Row[Tuple[int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None]]]:
     try:
-      select_stmt: Select[Tuple[int, int | None, str, int | None, str, int, str, str | None, datetime, datetime | None]] = select(
+      select_stmt: Select[Tuple[int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None]] = select(
         cls.id,
         cls.ip_list_id,
         IpsListsDbo.name,
@@ -75,6 +78,7 @@ class IpRecordsDbo(Dbo):
         cls.addr_type,
         cls.ip_address,
         cls.ros_comment,
+        cls.use_default_gw,
         cls.created_at,
         cls.updated_at
       ).join(
@@ -88,9 +92,9 @@ class IpRecordsDbo(Dbo):
         select_stmt = select_stmt.where(cls.created_at <= end_date)
       if search_text != None:
         select_stmt = select_stmt.where(cls.ip_address.contains(search_text))
-      select_limit_stmt: Select[Tuple[int, int | None, str, int | None, str, int, str, str | None, datetime, datetime | None]] = \
+      select_limit_stmt: Select[Tuple[int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None]] = \
         select_stmt.limit(limit).offset(offset)
-      result: Result[Tuple[int, int | None, str, int | None, str, int, str, str | None, datetime, datetime | None]] = \
+      result: Result[Tuple[int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None]] = \
         await db_session.execute(select_limit_stmt)
       #
       return result.fetchall()
@@ -145,9 +149,9 @@ class IpRecordsDbo(Dbo):
     cls: type[Self],
     db_session: AsyncSession,
     id: int
-  ) -> Row[Tuple[int, int | None, str, int | None, str, str, int, str | None, datetime, datetime | None]] | None:
+  ) -> Row[Tuple[int, int | None, str, int | None, str, str, int, str | None, bool, datetime, datetime | None]] | None:
     try:
-      select_stmt: Select[Tuple[int, int | None, str, int | None, str, str, int, str | None, datetime, datetime | None]] = select(
+      select_stmt: Select[Tuple[int, int | None, str, int | None, str, str, int, str | None, bool, datetime, datetime | None]] = select(
         cls.id,
         cls.ip_list_id,
         IpsListsDbo.name,
@@ -156,6 +160,7 @@ class IpRecordsDbo(Dbo):
         cls.ip_address,
         cls.addr_type,
         cls.ros_comment,
+        cls.use_default_gw,
         cls.created_at,
         cls.updated_at
       ).where(
@@ -165,9 +170,9 @@ class IpRecordsDbo(Dbo):
       ).join(
         DomainsDbo, DomainsDbo.id == cls.domain_id, isouter=True
       )
-      exec_result: Result[Tuple[int, int | None, str, int | None, str, str, int, str | None, datetime, datetime | None]] = \
+      exec_result: Result[Tuple[int, int | None, str, int | None, str, str, int, str | None, bool, datetime, datetime | None]] = \
         await db_session.execute(select_stmt)
-      result: Row[Tuple[int, int | None, str, int | None, str, str, int, str | None, datetime, datetime | None]] | None = \
+      result: Row[Tuple[int, int | None, str, int | None, str, str, int, str | None, bool, datetime, datetime | None]] | None = \
         exec_result.fetchone()
       return result
     except Exception as err:
@@ -209,17 +214,23 @@ class IpRecordsDbo(Dbo):
       raise err
 
   @classmethod
-  async def get_all_for_update(cls: type[Self], db_session: AsyncSession, addr_type: int | None = None):
+  async def get_all_for_update(
+    cls: type[Self],
+    db_session: AsyncSession,
+    addr_type: int | None = None
+  ) -> Sequence[Row[Tuple[str, str, bool, int]]]:
     try:
-      select_stmt: Select[Tuple[str, str]] = select(
+      select_stmt: Select[Tuple[str, str, bool, int]] = select(
         cls.ip_address,
-        func.coalesce(cls.ros_comment, DomainsDbo.ros_comment, DomainsDbo.name).label('comment')
+        func.coalesce(cls.ros_comment, DomainsDbo.ros_comment, DomainsDbo.name).label('comment'),
+        cls.use_default_gw,
+        cls.addr_type
       ).join(
         DomainsDbo, DomainsDbo.id == cls.domain_id, isouter=True
       )
       if addr_type != None:
         select_stmt = select_stmt.where(cls.addr_type == addr_type)
-      result: Result[Tuple[str, str]] = await db_session.execute(select_stmt)
+      result: Result[Tuple[str, str, bool, int]] = await db_session.execute(select_stmt)
       #
       return result.fetchall()
     except Exception as err:

@@ -20,7 +20,7 @@ from itertools import product
 from base64 import urlsafe_b64encode
 from httpx import AsyncClient, Response, ConnectTimeout, ReadError, RemoteProtocolError, ConnectError
 from types import CoroutineType
-from typing import Self, List, Tuple, Dict
+from typing import Self, List, Tuple, Dict, Literal
 
 from logger.logger import logger
 from config.config import settings
@@ -42,7 +42,7 @@ class DomainsResolver:
   __queue_get_timeout: float = settings.queue_get_timeout
   __task_exception_error_timeout: float = 10.0
 
-  __lookup_types: Tuple[RdataType, RdataType] = (A, AAAA)
+  __lookup_types: tuple[Literal[RdataType.A]] = (A, ) # (A, AAAA)
   __semaphore: Semaphore = Semaphore(settings.domain_resolve_semaphore_limit)
 
   __http_client: AsyncClient = HttpClient().client

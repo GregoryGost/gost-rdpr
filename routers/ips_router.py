@@ -34,6 +34,16 @@ class IpsRouter(BaseRouter):
         'addr': '2001:0db8:85a3:0000:0000:8a2e:0370:7334',
         'domain_id': 3,
         'ros_comment': 'meta ip address'
+      },
+      {
+        'addr': '8.8.8.8',
+        'list_id': 15,
+        'ros_comment': 'add address to list'
+      },
+      {
+        'addr': '172.10.4.4', # 213.180.193.115
+        'use_default_gw': True,
+        'ros_comment': 'Exclude IP /32 from the larger mask /16/24 so it doesnt go through the VPN'
       }
     ]
   ]

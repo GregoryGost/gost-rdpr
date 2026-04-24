@@ -91,11 +91,20 @@ class CommandsRouter(BaseRouter):
       response_model=OkResp,
       responses={
         status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp},
+        status.HTTP_400_BAD_REQUEST: {'model': ErrorResp}
       }
     )
     async def ros_update_command(query: Annotated[RosUpdateCommandQueryReq, Query()], background_tasks: BackgroundTasks) -> JSONResponse:
       logger.debug(f'Call API route: POST /commands/ros/update')
       try:
+        if query.type != 4:
+          return JSONResponse(
+            ErrorResp(
+              error=f'INVALID QUERY TYPE. {query=}',
+              resolution='''RouterOS Firewall address-list. IP-IP ranges are supported only for IPv4 addresses. More info: https://help.mikrotik.com/docs/spaces/ROS/pages/130220135/Address-lists#Addresslists-Properties Use type=4 parameter only !!!'''
+            ).to_dict(),
+            status.HTTP_400_BAD_REQUEST
+          )
         job_status: bool | None = await jobs_cache.get(Jobs.ROS_UPDATE)
         if job_status != True:
           background_tasks.add_task(self.__ros_client.update, query.type)

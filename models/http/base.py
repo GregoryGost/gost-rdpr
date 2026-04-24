@@ -43,14 +43,14 @@ class LimitOffsetQuery(Base):
   )] = 0
   start_date: Annotated[str | None, Field(
     title='Start date',
-    description='Date from which you want to start sampling',
+    description='Date from which you want to start sampling. Example `2024-04-24 00:00:00`',
     examples=[DATE_FORMAT, '2024-10-01 15:00:00'],
     min_length=19,
     max_length=19
   )] = None
   end_date: Annotated[str | None, Field(
     title='End date',
-    description='Date from which you want to end sampling',
+    description='Date from which you want to end sampling. Example `2024-04-24 23:59:59`',
     examples=[DATE_FORMAT, '2024-10-01 15:00:00'],
     min_length=19,
     max_length=19

@@ -44,6 +44,7 @@ class RosClient:
     connect=settings.req_timeout_connect,
     read=settings.ros_rest_api_read_timeout
   )
+  __fw_strict_addr_list_postfix: str = 'strict'
 
   def __init__(self: Self) -> None:
     self.__client.timeout = self.__timeout
@@ -64,16 +65,21 @@ class RosClient:
         logger.debug(f'START update ros config {config=}')
         # check connection
         await self.__check(config=config)
-        # get all addresses from Database
+        #
+        # DATABASE
+        #
+        # get all addresses from database
         stored_ip_address: List[IpRecordDto] = await db.get_all_ips_for_update(addr_type=config.addr_type)
         stored_addresses_set: Set[str] = {ip.ip_address for ip in stored_ip_address}
         logger.info(f'IP address count for ros update: {len(stored_ip_address)}')
         # get default gateway
-        default_gateway: RosIpRouteDefaultGatewayResp = await self.__get_default_gateway(config=config)
+        default_ipv4_gateway: RosIpRouteDefaultGatewayResp = await self.__get_ipv4_default_gateway(config=config)
+        #default_ipv6_gateway: RosIpRouteDefaultGatewayResp | None = await self.__get_ipv6_default_gateway(config=config)
         # get rdpr routing table
         routing_table: RosRoutingTableResp | None = await self.__get_routing_table(config=config)
         #
         # FIREWALL ADDRESS LIST
+        #
         # get all ips from firewall list
         all_ips_from_firewall_list: List[RosFirewallIpResp] = await self.__get_all_ips_from_firewall_list(config=config)
         all_ips_from_firewall_set: Set[str] = {ip.address for ip in all_ips_from_firewall_list}
@@ -95,14 +101,22 @@ class RosClient:
         logger.info(f'Update RoS config [{config.host}] : firewall-address-list ADD count={len(firewall_address_add)}')
         #
         # ROUTING
+        #
         all_ips_from_routing: List[RosRoutingIpResp] = await self.__get_all_ips_from_routing(config=config)
         all_ips_from_routing_set: Set[str] = {ip.address for ip in all_ips_from_routing}
-        routing_address_wrong_gateway_update: List[RosRoutingIpResp] = [
+        routing_ipv4_address_wrong_gateway_update: List[RosRoutingIpResp] = [
           address
           for address in all_ips_from_routing
-          if address.gateway != default_gateway.gateway
+          if address.gateway != default_ipv4_gateway.gateway and address.type == 4
         ]
-        logger.info(f'Update RoS config [{config.host}] : ip-routing wrong gateway UPDATE count={len(routing_address_wrong_gateway_update)}')
+        logger.info(f'Update RoS config [{config.host}] : ipv4-routing wrong gateway UPDATE count={len(routing_ipv4_address_wrong_gateway_update)}')
+        # if default_ipv6_gateway != None:
+        #   routing_ipv6_address_wrong_gateway_update: List[RosRoutingIpResp] = [
+        #     address
+        #     for address in all_ips_from_routing
+        #     if address.gateway != default_ipv6_gateway.gateway and address.type == 6
+        #   ]
+        #   logger.info(f'Update RoS config [{config.host}] : ipv6-routing wrong gateway UPDATE count={len(routing_ipv6_address_wrong_gateway_update)}')
         # duplicate protection in route
         duplicate_routing_ips, unique_routing_ips = RosRoutingIpResp.separate_duplicates(addresses=all_ips_from_routing)
         routing_address_delete: List[RosRoutingIpResp] = [
@@ -120,15 +134,23 @@ class RosClient:
         logger.info(f'Update RoS config [{config.host}] : ip-routing ADD count={len(routing_address_add)}')
         #
         # ROUTING TABLE
+        #
         if routing_table == None:
           await self.__add_routing_table(config=config)
         # CHANGE WRONG GATEWAY
-        if len(routing_address_wrong_gateway_update) > 0:
+        if len(routing_ipv4_address_wrong_gateway_update) > 0:
           await self.__update_wrong_route_gateway(
             config=config,
-            default_gateway=default_gateway,
-            address_list=routing_address_wrong_gateway_update
+            default_gateway=default_ipv4_gateway,
+            address_list=routing_ipv4_address_wrong_gateway_update
           )
+        # if default_ipv6_gateway != None:
+        #   if len(routing_ipv6_address_wrong_gateway_update) > 0:
+        #     await self.__update_wrong_route_gateway(
+        #     config=config,
+        #     default_gateway=default_ipv6_gateway,
+        #     address_list=routing_ipv6_address_wrong_gateway_update
+        #   )
         # DELETE FROM FIREWALL AND ROUTING
         if len(firewall_address_delete) > 0:
           await self.__delete_from_ros(config=config, action=RosAction.FIREWALL_DELETE, address_list=firewall_address_delete)
@@ -138,7 +160,9 @@ class RosClient:
         if len(firewall_address_add) > 0:
           await self.__add_to_ros(config=config, action=RosAction.FIREWALL_ADD, address_list=firewall_address_add)
         if len(routing_address_add) > 0:
-          await self.__add_to_ros(config=config, action=RosAction.ROUTING_ADD, address_list=routing_address_add, default_gateway=default_gateway)
+          await self.__add_to_ros(config=config, action=RosAction.ROUTING_ADD, address_list=routing_address_add, route_gateway=default_ipv4_gateway)
+          # if default_ipv6_gateway != None:
+          #   await self.__add_to_ros(config=config, action=RosAction.ROUTING_ADD, address_list=routing_address_add, route_gateway=default_ipv6_gateway)
         #
         logger.debug(f'END update ros config element {config=}')
         self.update_ros_queue.task_done()
@@ -162,13 +186,13 @@ class RosClient:
     try:
       url: str = f'http://{config.host}/rest/system/resource'
       auth: BasicAuth = BasicAuth(username=config.user, password=config.passwd)
-      system_resource_response: Response = await self.__client.head(url=url, auth=auth)
+      system_resource_response: Response = await self.__client.get(url=url, auth=auth)
       system_resource_response.raise_for_status()
       logger.debug(f'RoS check {config.host=} is OK')
     except Exception as err:
       raise err
 
-  async def __get_default_gateway(self: Self, config: RosConfigDto) -> RosIpRouteDefaultGatewayResp:
+  async def __get_ipv4_default_gateway(self: Self, config: RosConfigDto) -> RosIpRouteDefaultGatewayResp:
     logger.debug(f'Get default gateway in {config.host=} ...')
     try:
       url: str = f'http://{config.host}/rest/ip/route/print'
@@ -198,6 +222,39 @@ class RosClient:
       return result
     except Exception as err:
       raise err
+    
+  # async def __get_ipv6_default_gateway(self: Self, config: RosConfigDto) -> RosIpRouteDefaultGatewayResp | None:
+  #   logger.debug(f'Get default gateway in {config.host=} ...')
+  #   try:
+  #     url: str = f'http://{config.host}/rest/ipv6/route/print'
+  #     auth: BasicAuth = BasicAuth(username=config.user, password=config.passwd)
+  #     data: Dict[str, List[str]] = {
+  #       '.proplist': ['gateway', 'routing-table', 'immediate-gw'],
+  #       '.query': ['dst-address=::/0', 'active=true']
+  #     }
+  #     ip_route_response: Response = await self.__client.post(url=url, auth=auth, json=data, headers=self.__headers)
+  #     ip_route_response.raise_for_status()
+  #     '''
+  #     [
+  #       {
+  #         "gateway": "1.1.1.1",
+  #         "immediate-gw": "1.1.1.1%WAN-Eth1",
+  #         "routing-table": "main"
+  #       }
+  #     ]
+  #     '''
+  #     result_list: List[RosIpRouteDefaultGatewayResp] = [RosIpRouteDefaultGatewayResp(**item) for item in ip_route_response.json()]
+  #     if len(result_list) < 1:
+  #       logger.debug(f'Not found default IPv6 gateway for {config.host=}')
+  #       return None
+  #     if len(result_list) > 1:
+  #       raise Exception(f'Found many default gateway on {config.host=} for active route and dst-address=::/0 {result_list=}')
+  #     result: RosIpRouteDefaultGatewayResp = result_list[0]
+  #     logger.debug(f'Default IPv6 gateway in {config.host=} : {result.gateway=}, {result.routing_table=}, {result.immediate_gw=}')
+  #     return result
+  #   except Exception as err:
+  #     logger.error(err)
+  #     return None
 
   async def __get_routing_table(self: Self, config: RosConfigDto) -> RosRoutingTableResp | None:
     logger.debug(f'Get routing table in {config.host=} ...')
@@ -254,7 +311,12 @@ class RosClient:
       auth: BasicAuth = BasicAuth(username=config.user, password=config.passwd)
       data: Dict[str, List[str]] = {
         '.proplist': ['.id', 'address'],
-        '.query': [f'list={config.bgp_list_name}', 'disabled=false']
+        '.query': [
+          f'list={config.bgp_list_name}',
+          f'list={config.bgp_list_name}-{self.__fw_strict_addr_list_postfix}',
+          '#|',
+          'disabled=false'
+        ]
       }
       routing_table_response: Response = await self.__client.post(url=url, auth=auth, json=data, headers=self.__headers)
       routing_table_response.raise_for_status()
@@ -285,15 +347,19 @@ class RosClient:
     '''ROS CPU intensive usage operation'''
     logger.debug(f'Get all ips address from firewall list from {config.host=} ...')
     result: List[RosRoutingIpResp] = []
+    route_base_url: str = f'http://{config.host}/rest/ip/route/print'
+    routev6_base_url: str = f'http://{config.host}/rest/ipv6/route/print'
+    auth: BasicAuth = BasicAuth(username=config.user, password=config.passwd)
     try:
-      url: str = f'http://{config.host}/rest/ip/route/print'
-      auth: BasicAuth = BasicAuth(username=config.user, password=config.passwd)
       data: Dict[str, List[str]] = {
         '.proplist': ['.id', 'dst-address', 'gateway'],
         '.query': [f'routing-table={config.bgp_list_name}', 'disabled=false']
       }
-      ip_route_response: Response = await self.__client.post(url=url, auth=auth, json=data, headers=self.__headers)
-      ip_route_response.raise_for_status()
+      ipv4_route_response: Response = await self.__client.post(url=route_base_url, auth=auth, json=data, headers=self.__headers)
+      ipv4_route_response.raise_for_status()
+      #
+      ipv6_route_response: Response = await self.__client.post(url=routev6_base_url, auth=auth, json=data, headers=self.__headers)
+      ipv6_route_response.raise_for_status()
       '''
       [
         {
@@ -315,7 +381,11 @@ class RosClient:
       '''
       [
         result.append(RosRoutingIpResp(**item))
-        for item in ip_route_response.json()
+        for item in ipv4_route_response.json()
+      ]
+      [
+        result.append(RosRoutingIpResp(**item))
+        for item in ipv6_route_response.json()
       ]
       logger.debug(f'All ips from routing {config.host=}, {config.bgp_list_name=} : count={len(result)}')
       return result
@@ -332,7 +402,10 @@ class RosClient:
     try:
       auth: BasicAuth = BasicAuth(username=config.user, password=config.passwd)
       for address in address_list:
-        url: str = f'http://{config.host}/rest/ip/route/{address.id}'
+        if address.type == 6:
+          url: str = f'http://{config.host}/rest/ipv6/route/{address.id}'
+        else:
+          url: str = f'http://{config.host}/rest/ip/route/{address.id}'
         data = {
           'gateway': default_gateway.gateway
         }
@@ -349,19 +422,22 @@ class RosClient:
 
   async def __delete_from_ros(self: Self, config: RosConfigDto, action: RosAction, address_list: List[RosFirewallIpResp] | List[RosRoutingIpResp]) -> None:
     logger.debug(f'Delete from {action=} in {config.host=} ...')
-    base_url: str | None = None
     try:
       auth: BasicAuth = BasicAuth(username=config.user, password=config.passwd)
-      if action == RosAction.FIREWALL_DELETE:
-        base_url = f'http://{config.host}/rest/ip/firewall/address-list'
-      if action == RosAction.ROUTING_DELETE:
-        base_url = f'http://{config.host}/rest/ip/route'
-      if base_url == None: raise Exception(f'Target url not exists. Action value: {action=}')
       for address in address_list:
         try:
-          url: str = f'{base_url}/{address.id}'
-          response: Response = await self.__client.delete(url=url, auth=auth, headers=self.__headers)
-          response.raise_for_status()
+          if action == RosAction.FIREWALL_DELETE:
+            url = f'http://{config.host}/rest/ip/firewall/address-list/{address.id}'
+            response: Response = await self.__client.delete(url=url, auth=auth, headers=self.__headers)
+            response.raise_for_status()
+          if action == RosAction.ROUTING_DELETE:
+            if address.type == 4:
+              url = f'http://{config.host}/rest/ip/route/{address.id}'
+              response: Response = await self.__client.delete(url=url, auth=auth, headers=self.__headers)
+              response.raise_for_status()
+            else:
+              url = f'http://{config.host}/rest/ipv6/route/{address.id}'
+              continue
         except Exception as err:
           logger.error(f'Delete failed for {action=} {address=}: {err}')
           continue
@@ -375,28 +451,31 @@ class RosClient:
     config: RosConfigDto,
     action: RosAction,
     address_list: List[IpRecordDto],
-    default_gateway: RosIpRouteDefaultGatewayResp | None = None
+    route_gateway: RosIpRouteDefaultGatewayResp | None = None
   ) -> None:
     logger.debug(f'Add to {action=} in {config.host=} ...')
-    base_url: str | None = None
+    fw_base_url: str = f'http://{config.host}/rest/ip/firewall/address-list'
+    route_base_url: str = f'http://{config.host}/rest/ip/route'
+    #routev6_base_url: str = f'http://{config.host}/rest/ipv6/route'
+    auth: BasicAuth = BasicAuth(username=config.user, password=config.passwd)
     try:
-      auth: BasicAuth = BasicAuth(username=config.user, password=config.passwd)
-      if action == RosAction.FIREWALL_ADD:
-        base_url = f'http://{config.host}/rest/ip/firewall/address-list'
-      if action == RosAction.ROUTING_ADD:
-        base_url = f'http://{config.host}/rest/ip/route'
-      if base_url == None: raise Exception(f'Target url not exists. Action value: {action=}')
       for address in address_list:
         try:
           if action == RosAction.FIREWALL_ADD:
+            if address.addr_type == 6:
+              continue
             data: Dict[str, str | bool] = {
               'address': address.ip_address,
               'disabled': False,
               'list': config.bgp_list_name,
               'comment': address.comment
             }
-            response: Response = await self.__client.put(url=base_url, auth=auth, json=data, headers=self.__headers)
+            response: Response = await self.__client.put(url=fw_base_url, auth=auth, json=data, headers=self.__headers)
             response.raise_for_status()
+            if address.use_default_gw != False:
+              data['list'] = f'{config.bgp_list_name}-{self.__fw_strict_addr_list_postfix}'
+              response: Response = await self.__client.put(url=fw_base_url, auth=auth, json=data, headers=self.__headers)
+              response.raise_for_status()
           if action == RosAction.ROUTING_ADD:
             data: Dict[str, str | bool] = {
               'routing-table': config.bgp_list_name,
@@ -404,12 +483,21 @@ class RosClient:
               'disabled': False,
               'comment': address.comment
             }
-            if default_gateway != None:
-              data['gateway'] = default_gateway.gateway
-            response: Response = await self.__client.put(url=base_url, auth=auth, json=data, headers=self.__headers)
+            if route_gateway != None:
+              data['gateway'] = route_gateway.gateway
+            #
+            # A single IP address or range of IPs to add to the address list or DNS name.
+            # You can input for example, '192.168.0.0-192.168.1.255' and it will auto modify the typed entry to 192.168.0.0/23 on saving.
+            # IP-IP ranges are supported only for IPv4 addresses.
+            #
+            # if address.addr_type == 6:
+            #   response: Response = await self.__client.put(url=routev6_base_url, auth=auth, json=data, headers=self.__headers)
+            #   response.raise_for_status()
+            # else:
+            response: Response = await self.__client.put(url=route_base_url, auth=auth, json=data, headers=self.__headers)
             response.raise_for_status()
         except Exception as err:
-          logger.error(f'Delete failed for {action=} {address=}: {err}')
+          logger.error(f'[{err.__class__.__name__}] Adding failed for {action=} {address=}: {err}')
           continue
         finally:
           await sleep(self.ros_update_sleep_timeout)

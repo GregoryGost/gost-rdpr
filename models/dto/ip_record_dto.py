@@ -7,3 +7,4 @@ class IpRecordDto:
   comment: str = 'unknown_comment'
   addr_type: int | None = None
   id: int | None = None
+  use_default_gw: bool = False

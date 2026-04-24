@@ -1041,7 +1041,7 @@ class DataBase:
       db_session: AsyncSession = await self.__read_connect()
       total: int = await IpRecordsDbo.get_total(db_session=db_session)
       if total > 0:
-        ips: Sequence[Row[Tuple[int, int | None, str, int | None, str, int, str, str | None, datetime, datetime | None]]] = \
+        ips: Sequence[Row[Tuple[int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None]]] = \
         await IpRecordsDbo.get_all(
           db_session=db_session,
           limit=limit,
@@ -1061,10 +1061,11 @@ class DataBase:
             domain_id=ip[3],
             domain_name=ip[4],
             ros_comment=ip[7],
-            created_at=ip[8].timestamp(),
-            created_at_hum=ip[8].strftime('%Y-%m-%d %H:%M:%S'),
-            updated_at=None if ip[9] == None else ip[9].timestamp(),
-            updated_at_hum=None if ip[9] == None else ip[9].strftime('%Y-%m-%d %H:%M:%S')
+            use_default_gw=ip[8],
+            created_at=ip[9].timestamp(),
+            created_at_hum=ip[9].strftime('%Y-%m-%d %H:%M:%S'),
+            updated_at=None if ip[10] == None else ip[10].timestamp(),
+            updated_at_hum=None if ip[10] == None else ip[10].strftime('%Y-%m-%d %H:%M:%S')
           ))
       return IpsPayloadResp(
         limit=limit,
@@ -1092,7 +1093,7 @@ class DataBase:
     logger.debug(f'Try get IP address record on ID={id} ...')
     try:
       db_session: AsyncSession = await self.__read_connect()
-      ip_address_record: Row[Tuple[int, int | None, str, int | None, str, str, int, str | None, datetime, datetime | None]] | None = \
+      ip_address_record: Row[Tuple[int, int | None, str, int | None, str, str, int, str | None, bool, datetime, datetime | None]] | None = \
         await IpRecordsDbo.get_on_id(db_session=db_session, id=id)
       if ip_address_record != None:
         return IpsElementResp(
@@ -1104,10 +1105,11 @@ class DataBase:
           addr=ip_address_record[5],
           type=ip_address_record[6],
           ros_comment=ip_address_record[7],
-          created_at=ip_address_record[8].timestamp(),
-          created_at_hum=ip_address_record[8].strftime('%Y-%m-%d %H:%M:%S'),
-          updated_at=None if ip_address_record[9] == None else ip_address_record[9].timestamp(),
-          updated_at_hum=None if ip_address_record[9] == None else ip_address_record[9].strftime('%Y-%m-%d %H:%M:%S')
+          use_default_gw=ip_address_record[8],
+          created_at=ip_address_record[9].timestamp(),
+          created_at_hum=ip_address_record[9].strftime('%Y-%m-%d %H:%M:%S'),
+          updated_at=None if ip_address_record[10] == None else ip_address_record[10].timestamp(),
+          updated_at_hum=None if ip_address_record[10] == None else ip_address_record[10].strftime('%Y-%m-%d %H:%M:%S')
         )
       return None
     except Exception as err:
@@ -1208,11 +1210,11 @@ class DataBase:
     ips: List[IpRecordDto] = []
     try:
       db_session: AsyncSession = await self.__read_connect()
-      all_ips: Sequence[Row[Tuple[str, str]]] = await IpRecordsDbo.get_all_for_update(
+      all_ips: Sequence[Row[Tuple[str, str, bool, int]]] = await IpRecordsDbo.get_all_for_update(
         db_session=db_session,
         addr_type=addr_type
       )
-      ips = [IpRecordDto(ip_address=ip[0], comment=ip[1]) for ip in all_ips]
+      ips = [IpRecordDto(ip_address=ip[0], comment=ip[1], use_default_gw=ip[2], addr_type=ip[3]) for ip in all_ips]
       return ips
     except Exception as err:
       logger.error(f'Try get all IP address for update failed : {err}', exc_info=True)
@@ -1762,7 +1764,8 @@ class DataBase:
           IpRecordsDbo.ip_list_id.property.key: item.list_id,
           IpRecordsDbo.domain_id.property.key: item.domain_id,
           IpRecordsDbo.addr_type.property.key: get_ip_version(item.addr),
-          IpRecordsDbo.ros_comment.property.key: item.ros_comment
+          IpRecordsDbo.ros_comment.property.key: item.ros_comment,
+          IpRecordsDbo.use_default_gw.property.key: item.use_default_gw
         }
         for queue_element in queue_elements
         if queue_element.target == TargetAction.IPS_ADD
