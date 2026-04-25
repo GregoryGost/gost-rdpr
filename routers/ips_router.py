@@ -41,7 +41,7 @@ class IpsRouter(BaseRouter):
         'ros_comment': 'add address to list'
       },
       {
-        'addr': '172.10.4.4', # 213.180.193.115
+        'addr': '172.10.4.4',
         'use_default_gw': True,
         'ros_comment': 'Exclude IP /32 from the larger mask /16/24 so it doesnt go through the VPN'
       }

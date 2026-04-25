@@ -3,7 +3,7 @@ from threading import Event
 
 from httpx import Response, AsyncClient, BasicAuth, Timeout, RemoteProtocolError
 from httpx._types import HeaderTypes
-from typing import Self, List, Dict, Set
+from typing import Self, List, Dict, Set, Tuple
 
 from .http_base_client import HttpClient
 from logger.logger import logger
@@ -19,6 +19,7 @@ from models.http.ros_rest_api_resp import (
   RosIpRouteDefaultGatewayResp,
   RosRoutingTableResp
 )
+from models.dto.ros_firewall_ip_add_dto import RosFirewallIpAddDto
 
 class RosClient:
   '''
@@ -82,22 +83,57 @@ class RosClient:
         #
         # get all ips from firewall list
         all_ips_from_firewall_list: List[RosFirewallIpResp] = await self.__get_all_ips_from_firewall_list(config=config)
-        all_ips_from_firewall_set: Set[str] = {ip.address for ip in all_ips_from_firewall_list}
+        all_ips_from_firewall_set: Set[Tuple[str, str]] = {
+          (ip.address, ip.list_name)
+          for ip in all_ips_from_firewall_list
+        }
+        firewall_address_list_name: str = config.bgp_list_name
+        firewall_strict_address_list_name: str = f'{config.bgp_list_name}-{self.__fw_strict_addr_list_postfix}'
+        stored_firewall_addresses_set: Set[Tuple[str, str]] = set()
+        firewall_address_add: List[RosFirewallIpAddDto] = []
+        #
+        for address in stored_ip_address:
+          stored_firewall_addresses_set.add(
+            (address.ip_address, firewall_address_list_name)
+          )
+          #
+          if address.use_default_gw != False:
+            stored_firewall_addresses_set.add(
+              (address.ip_address, firewall_strict_address_list_name)
+            )
+          if address.addr_type == 6:
+            continue
+          #
+          if (address.ip_address, firewall_address_list_name) not in all_ips_from_firewall_set:
+            firewall_address_add.append(
+              RosFirewallIpAddDto(
+                ip_address=address.ip_address,
+                list_name=firewall_address_list_name,
+                comment=address.comment,
+                addr_type=address.addr_type
+              )
+            )
+          if address.use_default_gw != False:
+            if (address.ip_address, firewall_strict_address_list_name) not in all_ips_from_firewall_set:
+              firewall_address_add.append(
+                RosFirewallIpAddDto(
+                  ip_address=address.ip_address,
+                  list_name=firewall_strict_address_list_name,
+                  comment=address.comment,
+                  addr_type=address.addr_type
+                )
+              )
         # duplicate protection in firewall list
         duplicate_firewall_ips, unique_firewall_ips = RosFirewallIpResp.separate_duplicates(addresses=all_ips_from_firewall_list)
         # prepared firewall
         firewall_address_delete: List[RosFirewallIpResp] = [
           address
           for address in unique_firewall_ips
-          if address.address not in stored_addresses_set
+          if (address.address, address.list_name) not in stored_firewall_addresses_set
         ]
         firewall_address_delete.extend(duplicate_firewall_ips)
+        #
         logger.info(f'Update RoS config [{config.host}] : firewall-address-list DELETE count={len(firewall_address_delete)}')
-        firewall_address_add: List[IpRecordDto] = [
-          address
-          for address in stored_ip_address
-          if address.ip_address not in all_ips_from_firewall_set
-        ]
         logger.info(f'Update RoS config [{config.host}] : firewall-address-list ADD count={len(firewall_address_add)}')
         #
         # ROUTING
@@ -170,9 +206,10 @@ class RosClient:
         await sleep(self.__queue_sleep_timeout)
         self.update_ros_queue.task_done()
         continue
-      except RemoteProtocolError:
-        await sleep(self.__queue_sleep_timeout)
+      except RemoteProtocolError as err:
         logger.error(f'ERROR Update ROS configs : [{err.__class__.__name__}] {err}')
+        await sleep(self.__queue_sleep_timeout)
+        self.update_ros_queue.task_done()
         continue
       except Exception as err:
         logger.error(f'Unexpected error in flow - Update ROS configs : [{err.__class__.__name__}] {err}', exc_info=True)
@@ -306,14 +343,16 @@ class RosClient:
     '''ROS CPU intensive usage operation'''
     logger.debug(f'Get all ips address from firewall list from {config.host=} ...')
     result: List[RosFirewallIpResp] = []
+    firewall_list_name: str = config.bgp_list_name
+    firewall_strict_list_name: str = f'{config.bgp_list_name}-{self.__fw_strict_addr_list_postfix}'
     try:
       url: str = f'http://{config.host}/rest/ip/firewall/address-list/print'
       auth: BasicAuth = BasicAuth(username=config.user, password=config.passwd)
       data: Dict[str, List[str]] = {
-        '.proplist': ['.id', 'address'],
+        '.proplist': ['.id', 'address', 'list'],
         '.query': [
-          f'list={config.bgp_list_name}',
-          f'list={config.bgp_list_name}-{self.__fw_strict_addr_list_postfix}',
+          f'list={firewall_list_name}',
+          f'list={firewall_strict_list_name}',
           '#|',
           'disabled=false'
         ]
@@ -337,7 +376,7 @@ class RosClient:
       ]
       '''
       result = [RosFirewallIpResp(**item) for item in routing_table_response.json()]
-      logger.debug(f'All ips from firewall list {config.host=}, {config.bgp_list_name=} : count={len(result)}')
+      logger.debug(f'All ips from firewall list {config.host=}, {config.bgp_list_name=} and {config.bgp_list_name}-{self.__fw_strict_addr_list_postfix} : count={len(result)}')
       return result
     except Exception as err:
       raise err
@@ -450,7 +489,7 @@ class RosClient:
     self: Self,
     config: RosConfigDto,
     action: RosAction,
-    address_list: List[IpRecordDto],
+    address_list: List[IpRecordDto] | List[RosFirewallIpAddDto],
     route_gateway: RosIpRouteDefaultGatewayResp | None = None
   ) -> None:
     logger.debug(f'Add to {action=} in {config.host=} ...')
@@ -458,24 +497,37 @@ class RosClient:
     route_base_url: str = f'http://{config.host}/rest/ip/route'
     #routev6_base_url: str = f'http://{config.host}/rest/ipv6/route'
     auth: BasicAuth = BasicAuth(username=config.user, password=config.passwd)
+    firewall_address_list_name: str = config.bgp_list_name
+    firewall_strict_address_list_name: str = f'{config.bgp_list_name}-{self.__fw_strict_addr_list_postfix}'
     try:
       for address in address_list:
         try:
           if action == RosAction.FIREWALL_ADD:
             if address.addr_type == 6:
               continue
-            data: Dict[str, str | bool] = {
-              'address': address.ip_address,
-              'disabled': False,
-              'list': config.bgp_list_name,
-              'comment': address.comment
-            }
-            response: Response = await self.__client.put(url=fw_base_url, auth=auth, json=data, headers=self.__headers)
-            response.raise_for_status()
-            if address.use_default_gw != False:
-              data['list'] = f'{config.bgp_list_name}-{self.__fw_strict_addr_list_postfix}'
+            if isinstance(address, RosFirewallIpAddDto):
+              data: Dict[str, str | bool] = {
+                'address': address.ip_address,
+                'disabled': False,
+                'list': address.list_name,
+                'comment': address.comment
+              }
               response: Response = await self.__client.put(url=fw_base_url, auth=auth, json=data, headers=self.__headers)
               response.raise_for_status()
+            else:
+              data: Dict[str, str | bool] = {
+                'address': address.ip_address,
+                'disabled': False,
+                'list': firewall_address_list_name,
+                'comment': address.comment
+              }
+              response: Response = await self.__client.put(url=fw_base_url, auth=auth, json=data, headers=self.__headers)
+              response.raise_for_status()
+              if address.use_default_gw != False:
+                data['list'] = firewall_strict_address_list_name
+                response: Response = await self.__client.put(url=fw_base_url, auth=auth, json=data, headers=self.__headers)
+                response.raise_for_status()
+
           if action == RosAction.ROUTING_ADD:
             data: Dict[str, str | bool] = {
               'routing-table': config.bgp_list_name,
