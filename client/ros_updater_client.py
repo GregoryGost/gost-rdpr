@@ -376,7 +376,7 @@ class RosClient:
       ]
       '''
       result = [RosFirewallIpResp(**item) for item in routing_table_response.json()]
-      logger.debug(f'All ips from firewall list {config.host=}, {config.bgp_list_name=} and {config.bgp_list_name}-{self.__fw_strict_addr_list_postfix} : count={len(result)}')
+      logger.debug(f'All ips from firewall list {config.host=}, {firewall_list_name=} and {firewall_strict_list_name=} : count={len(result)}')
       return result
     except Exception as err:
       raise err

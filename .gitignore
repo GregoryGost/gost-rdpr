@@ -183,6 +183,7 @@ cython_debug/
 # archives
 *.tar
 *.tar.gz
+*.tmp
 
 # dirs
 images/
