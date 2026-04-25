@@ -95,3 +95,8 @@ venv/
 # Extensions
 *.md
 .markdownlint.json
+
+# Archive
+*.tar
+*.zip
+*.gz
