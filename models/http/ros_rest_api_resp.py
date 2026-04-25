@@ -8,6 +8,7 @@ from utils.utils import get_ip_without_prefix, get_ip_version
 class RosFirewallIpResp(Base):
   id: Annotated[str, Field(alias='.id')]
   address: str
+  list_name: Annotated[str, Field(alias='list')]
   type: int = 4
 
   @model_validator(mode='after')
@@ -20,14 +21,15 @@ class RosFirewallIpResp(Base):
   def separate_duplicates(addresses: List[RosFirewallIpResp]) -> Tuple[List[RosFirewallIpResp], List[RosFirewallIpResp]]:
     duplicates: List[RosFirewallIpResp] = []
     unique: List[RosFirewallIpResp] = []
-    seen: Set[str] = set()
+    seen: Set[Tuple[str, str]] = set()
 
     for record in addresses:
-      if record.address in seen:
+      key: Tuple[str, str] = (record.list_name, record.address)
+      if key in seen:
         duplicates.append(record)
       else:
         unique.append(record)
-        seen.add(record.address)
+        seen.add(key)
 
     return duplicates, unique
   
