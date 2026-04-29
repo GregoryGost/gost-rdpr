@@ -18,7 +18,7 @@ class IpsQueryReq(LimitOffsetQuery):
       raise ValueError('The IP address type must be either 4 or 6 version')
     return self
 
-class IpsSearchQueryReq(LimitOffsetQuery):
+class IpsSearchQueryReq(IpsQueryReq):
   text: Annotated[str, Field(
     title='Search text',
     description='Search text for fields "ip_address"',

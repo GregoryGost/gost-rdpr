@@ -62,7 +62,8 @@ WORKDIR /app
 COPY poetry.lock pyproject.toml LICENSE ./
 
 # Install Poetry and dependencies
-RUN pip install poetry==2.3.2 --no-cache --root-user-action=ignore \
+ARG POETRY_VERSION=2.3.4
+RUN pip install poetry==${POETRY_VERSION} --no-cache --root-user-action=ignore \
   && poetry config virtualenvs.in-project true \
   && poetry install --no-interaction --no-cache
 

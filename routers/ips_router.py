@@ -76,7 +76,8 @@ class IpsRouter(BaseRouter):
           limit=query.limit,
           offset=query.offset,
           start_date=query.start_date,
-          end_date=query.end_date
+          end_date=query.end_date,
+          addr_type=query.type
         )
         return JSONResponse(return_data.to_dict(), status.HTTP_200_OK)
       except Exception as err:
@@ -101,7 +102,8 @@ class IpsRouter(BaseRouter):
           offset=query.offset,
           start_date=query.start_date,
           end_date=query.end_date,
-          search_text=query.text
+          search_text=query.text,
+          addr_type=query.type
         )
         return JSONResponse(return_data.to_dict(), status.HTTP_200_OK)
       except Exception as err:

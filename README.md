@@ -208,6 +208,7 @@ poetry install
 or manual install libs
 
 ```sh
+pip install --upgrade poetry
 pip install poetry
 poetry init
 ```
@@ -262,6 +263,10 @@ docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push -t greg
 docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push -t gregorygost/gost-rdpr:dev .
 # TEST in builder
 docker buildx build --no-cache --progress=plain --platform linux/amd64 --load -t gregorygost/gost-rdpr:dev --builder=build-container .
+
+# Local build (only one platform amd64 or arm64 ... etc.)
+docker buildx build --no-cache --platform linux/amd64 --output=type=docker -t gregorygost/gost-rdpr:dev .
+docker save gregorygost/gost-rdpr:dev > gost-rdpr_amd64_2.0.9-dev.tar
 ```
 
 ```shell
@@ -271,6 +276,11 @@ docker run --name gost-rdpr -p 8080:80 -p 5000:4000 -e LOG_LEVEL='debug' --memor
 docker run --name gost-rdpr-dev -p 8080:80 -p 5000:4000 -d gregorygost/gost-rdpr:dev
 # enter in docker shell
 docker exec -it gost-rdpr-dev bash
+```
+
+```shell
+docker buildx prune
+docker image prune -a
 ```
 
 ## Docs

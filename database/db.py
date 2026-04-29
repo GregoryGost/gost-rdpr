@@ -1032,7 +1032,8 @@ class DataBase:
     offset: int,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    search_text: Optional[str] = None
+    search_text: Optional[str] = None,
+    addr_type: Optional[int] = None
   ) -> IpsPayloadResp:
     logger.debug(f'Try get all IP address records ...')
     logger.debug(f'{limit=}, {offset=}, {start_date=}, {end_date=}, {search_text=}')
@@ -1048,7 +1049,8 @@ class DataBase:
           offset=offset,
           start_date=start_date,
           end_date=end_date,
-          search_text=search_text
+          search_text=search_text,
+          addr_type=addr_type
         )
         #
         for ip in ips:

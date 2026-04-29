@@ -66,7 +66,8 @@ class IpRecordsDbo(Dbo):
     offset: int,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    search_text: Optional[str] = None
+    search_text: Optional[str] = None,
+    addr_type: Optional[int] = None
   ) -> Sequence[Row[Tuple[int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None]]]:
     try:
       select_stmt: Select[Tuple[int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None]] = select(
@@ -86,6 +87,8 @@ class IpRecordsDbo(Dbo):
       ).join(
         DomainsDbo, DomainsDbo.id == cls.domain_id, isouter=True
       )
+      if addr_type != None:
+        select_stmt = select_stmt.where(cls.addr_type == addr_type)
       if start_date != None:
         select_stmt = select_stmt.where(cls.created_at >= start_date)
       if end_date != None:
