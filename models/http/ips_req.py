@@ -11,6 +11,10 @@ class IpsQueryReq(LimitOffsetQuery):
     description='IP address type filter parameter',
     examples=[4, 6]
   )] = None
+  default_gw: Annotated[bool | None, Field(
+    title='Filtered default gateway',
+    description='Filtered use default gateway for IP addr on clients'
+  )] = None
 
   @model_validator(mode='after')
   def type_validator(self: Self) -> Self:
