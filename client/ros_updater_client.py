@@ -559,8 +559,6 @@ class RosClient:
   async def update(self: Self, addr_type: int | None = None) -> None:
     logger.info(f'Run update ROS configs {addr_type=}')
     try:
-      # start JOB
-      await jobs_cache.set(Jobs.ROS_UPDATE, True)
       # get all RoS configs from DB
       configs: List[RosConfigDto] = await db.get_all_configs_for_ros_update()
       logger.info(f'Configs for update: {len(configs)}')

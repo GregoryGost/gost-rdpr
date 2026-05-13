@@ -48,6 +48,7 @@ class CommandsRouter(BaseRouter):
       try:
         job_status: bool | None = await jobs_cache.get(Jobs.LISTS_LOAD)
         if job_status != True:
+          await jobs_cache.set(Jobs.LISTS_LOAD, True)
           background_tasks.add_task(db.lists_load, query.forced)
         else:
           return JSONResponse(
@@ -73,7 +74,7 @@ class CommandsRouter(BaseRouter):
       try:
         job_status: bool | None = await jobs_cache.get(Jobs.DOMAINS_RESOLVE)
         if job_status != True:
-          # default - Jobs.DOMAINS_RESOLVE_NEW
+          await jobs_cache.set(Jobs.DOMAINS_RESOLVE, True)
           background_tasks.add_task(
             self.domains_resolver.domains_resolve,
             Jobs.DOMAINS_RESOLVE_NEW
@@ -101,6 +102,7 @@ class CommandsRouter(BaseRouter):
       try:
         job_status: bool | None = await jobs_cache.get(Jobs.DOMAINS_RESOLVE)
         if job_status != True:
+          await jobs_cache.set(Jobs.DOMAINS_RESOLVE, True)
           background_tasks.add_task(
             self.domains_resolver.domains_resolve,
             Jobs.DOMAINS_RESOLVE_STALE
@@ -138,6 +140,7 @@ class CommandsRouter(BaseRouter):
           )
         job_status: bool | None = await jobs_cache.get(Jobs.ROS_UPDATE)
         if job_status != True:
+          await jobs_cache.set(Jobs.ROS_UPDATE, True)
           background_tasks.add_task(self.__ros_client.update, query.type)
         else:
           return JSONResponse(

@@ -1403,7 +1403,6 @@ class DataBase:
   async def lists_load(self: Self, forced: bool) -> None:
     logger.info(f'Lists load - START {forced=}')
     try:
-      await jobs_cache.set(Jobs.LISTS_LOAD, True)
       db_session: AsyncSession = await self.__read_connect()
       domains_lists_total: int = await DomainsListsDbo.get_total(db_session=db_session)
       ips_lists_total: int = await IpsListsDbo.get_total(db_session=db_session)

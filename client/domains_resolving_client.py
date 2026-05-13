@@ -303,7 +303,6 @@ class DomainsResolver:
   async def domains_resolve(self: Self, job_mode: Jobs) -> None:
     logger.info(f'Domains resolve mode={job_mode} - START')
     try:
-      await jobs_cache.set(Jobs.DOMAINS_RESOLVE, True)
       await jobs_cache.set(job_mode, True)
       #
       match job_mode:
