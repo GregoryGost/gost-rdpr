@@ -1,6 +1,7 @@
 import logging
 from httpx import AsyncClient, Timeout, AsyncHTTPTransport, Limits
 from httpx._types import HeaderTypes
+from typing import Self
 
 from logger.logger import Logger
 from config.config import settings
@@ -12,32 +13,42 @@ class HttpClient:
     'Accept': '*/*',
     'User-Agent': f'{settings.app_title} [{settings.app_version}]'
   }
-  metrics: HttpxMetrics = HttpxMetrics()
+  __metrics: HttpxMetrics = HttpxMetrics()
+  __clients: dict[str, AsyncClient] = {}
 
-  def __init__(self) -> None:
+  def __init__(self: Self) -> None:
     logging.getLogger('httpx').setLevel(Logger.LOGGER_LEVEL[settings.httpx_log_level])
+
+  @classmethod
+  def get_client(cls: type[Self], name: str = 'default', timeout: Timeout | None = None) -> AsyncClient:
+    if name in cls.__clients:
+      return cls.__clients[name]
     # Common
-    self.limits: Limits = Limits(
+    limits: Limits = Limits(
       max_connections=settings.req_max_connections,
       max_keepalive_connections=settings.req_max_keepalive_connections
     )
-    self.timeout: Timeout = Timeout(
+    default_timeout: Timeout = Timeout(
       timeout=settings.req_timeout_default,
       connect=settings.req_timeout_connect,
       read=settings.req_timeout_read
     )
-    # Async
-    self.transport: AsyncHTTPTransport = AsyncHTTPTransport(
+    transport: AsyncHTTPTransport = AsyncHTTPTransport(
       retries=settings.req_connection_retries,
       verify=settings.req_ssl_verify
     )
-    self.client: AsyncClient = AsyncClient(
-      headers=self.headers,
-      limits=self.limits,
-      transport=self.transport,
-      timeout=self.timeout
+    client: AsyncClient = AsyncClient(
+      headers=cls.headers,
+      limits=limits,
+      transport=transport,
+      timeout=timeout or default_timeout
     )
-    self.client.event_hooks['response'] = [self.metrics.async_metric_hook]
+    client.event_hooks['response'] = [cls.__metrics.async_metric_hook]
+    cls.__clients[name] = client
+    return client
 
-  async def close(self) -> None:
-    await self.client.aclose()
+  @classmethod
+  async def close(cls: type[Self]) -> None:
+    for client in cls.__clients.values():
+      await client.aclose()
+    cls.__clients.clear()

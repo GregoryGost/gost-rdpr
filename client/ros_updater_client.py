@@ -34,7 +34,6 @@ class RosClient:
   __queue_sleep_timeout: float = settings.queue_sleep_timeout
   __queue_get_timeout: float = settings.queue_get_timeout
   __task_exception_error_timeout: float = 10.0
-  __client: AsyncClient = HttpClient().client
   __headers: HeaderTypes = {
     'Accept': '*/*',
     'Content-Type': 'application/json',
@@ -45,10 +44,10 @@ class RosClient:
     connect=settings.req_timeout_connect,
     read=settings.ros_rest_api_read_timeout
   )
+  __client: AsyncClient = HttpClient().get_client('ros', timeout=__timeout)
   __fw_strict_addr_list_postfix: str = 'strict'
 
   def __init__(self: Self) -> None:
-    self.__client.timeout = self.__timeout
     logger.debug(f'{self.__class__.__name__} init ...')
 
   async def __task_process_update_ros_from_queue(self: Self) -> None:

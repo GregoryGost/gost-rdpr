@@ -15,6 +15,7 @@ from logger.logger import logger
 from database.db import db
 from cache.cache import jobs_cache
 from metrics.metrics import PrometheusMiddleware
+from client.http_base_client import HttpClient
 
 from .tags_metadata import TagsMetadata
 
@@ -79,6 +80,7 @@ class AppServer:
     #
     yield
     # next RUN AFTER stop FastAPI
+    await HttpClient.close()
 
   async def run(self: Self):
     logger.debug('AppServer run ...')
