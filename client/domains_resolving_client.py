@@ -88,7 +88,6 @@ class DomainsResolver:
       except Exception as err:
         logger.error(f'Unexpected error in flow - Resolve domains : {err}', exc_info=True)
         await sleep(self.__task_exception_error_timeout)
-  
       finally:
         self.domains_resolve_queue.task_done()
         processed += 1
