@@ -35,7 +35,7 @@ ARG UI_REPO_URL=https://github.com/GregoryGost/gost-rdpr-ui.git
 RUN git clone --depth 1 --branch ${UI_BRANCH} ${UI_REPO_URL} .
 
 # Install pnpm
-ARG PNPM_VERSION=10.33.2
+ARG PNPM_VERSION=11.1.1
 RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
 
 # Install dependencies
