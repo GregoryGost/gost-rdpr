@@ -13,7 +13,7 @@ from dns.resolver import Answer, NoAnswer
 from dns.asyncresolver import Resolver
 from dns.exception import DNSException
 from dns.rdata import Rdata
-from dns.rdatatype import RdataType, A, AAAA, CNAME
+from dns.rdatatype import RdataType, A, CNAME
 from dns.message import QueryMessage, make_query, from_wire
 from dns.rrset import RRset
 from itertools import product
@@ -43,11 +43,11 @@ class DomainsResolver:
   __task_exception_error_timeout: float = 10.0
 
   __lookup_types: tuple[Literal[RdataType.A]] = (A, ) # (A, AAAA)
-  __semaphore: Semaphore = Semaphore(settings.domain_resolve_semaphore_limit)
+  __semaphore: Semaphore = Semaphore(settings.domains_resolve_semaphore_limit)
 
-  __http_client: AsyncClient = HttpClient().client
+  __http_client: AsyncClient = HttpClient.get_client('domains_resolver')
 
-  domains_resolve_queue: Queue = Queue(maxsize=settings.queue_max_size)
+  domains_resolve_queue: Queue[DomainResult] = Queue(maxsize=settings.queue_max_size)
 
   def __init__(self: Self) -> None:
     logger.info(f'{self.__class__.__name__} init')
@@ -55,43 +55,45 @@ class DomainsResolver:
   # Get domains from Queue
   async def __task_process_domains_resolve_from_queue(self: Self, count_all: int, log_every: int) -> None:
     logger.info('STARTING A FLOW - Resolve domains')
-    processed = 0
-    while not self.__stop_domains_resolve_event.is_set() and count_all > 0:
+    processed: int = 0
+    while not self.__stop_domains_resolve_event.is_set() and processed < count_all:
       try:
-        # queue is empty - skip
-        if self.domains_resolve_queue.empty():
-          await sleep(self.__queue_sleep_timeout)
-          continue
         domain: DomainResult = await wait_for(
           self.domains_resolve_queue.get(),
           timeout=self.__queue_get_timeout
         )
+      except TimeoutError:
+        await sleep(self.__queue_sleep_timeout)
+        continue
+      try:
         logger.debug(f'START resolving domain element {domain=}')
         # get dns servers
         dns_servers: Tuple[List[DnsServerDto], List[DnsServerDto]] = await db.get_dns_servers_for_resolve() # first default, second doh
         # cname
-        domain_cname: List[DomainsPostElementReq] = await self.__dns_cname_tasker(domain=domain, default_dns_servers=dns_servers[0], doh_dns_servers=dns_servers[1])
+        domain_cname: List[DomainsPostElementReq] = await self.__dns_cname_tasker(
+          domain=domain,
+          default_dns_servers=dns_servers[0],
+          doh_dns_servers=dns_servers[1]
+        )
         if len(domain_cname) > 0:
           logger.debug(f'{domain_cname=}')
           await db.put_add_domains_to_queue(domains=domain_cname)
         # resolve
-        await self.__dns_main_tasker(domain=domain, default_dns_servers=dns_servers[0], doh_dns_servers=dns_servers[1])
+        await self.__dns_main_tasker(
+          domain=domain,
+          default_dns_servers=dns_servers[0],
+          doh_dns_servers=dns_servers[1]
+        )
         logger.debug(f'END resolving domain element {domain=}')
-        if processed % log_every == 0 or count_all == 0:
-          logger.info(f'Domains resolved: {processed}, residue: {count_all}')
-        self.domains_resolve_queue.task_done()
-      except TimeoutError:
-        await sleep(self.__queue_sleep_timeout)
-        self.domains_resolve_queue.task_done()
-        continue
       except Exception as err:
         logger.error(f'Unexpected error in flow - Resolve domains : {err}', exc_info=True)
         await sleep(self.__task_exception_error_timeout)
-        self.domains_resolve_queue.task_done()
-        continue
       finally:
+        self.domains_resolve_queue.task_done()
         processed += 1
-        count_all -= 1
+        residue: int = count_all - processed
+        if processed % log_every == 0 or residue == 0:
+          logger.info(f'Domains resolved: {processed}, residue: {residue}')
     logger.info('STOP FLOW - Resolve domains')
 
   async def __dns_main_tasker(self: Self, domain: DomainResult, default_dns_servers: List[DnsServerDto], doh_dns_servers: List[DnsServerDto]) -> None:
@@ -176,7 +178,7 @@ class DomainsResolver:
           if len(result) > 0:
             domain.append_doh_lookup(result)
         else:
-          logger.warning(f'__doh_resolver for {domain=} : {response.status_code} - {response.content.decode('utf-8')}')
+          logger.warning(f"__doh_resolver for {domain=} : {response.status_code} - {response.content.decode('utf-8')}")
       except (ConnectTimeout, ReadError, RemoteProtocolError, ConnectError) as err:
         logger.debug(f'[{err.__class__.__name__}] : __doh_resolver warning err : {err}')
       except Exception as err:
@@ -213,7 +215,7 @@ class DomainsResolver:
                     list_id=domain.list_id
                   ))
         else:
-          logger.warning(f'__cname_doh_resolver for {domain=} : {response.status_code} - {response.content.decode('utf-8')}')
+          logger.warning(f"__cname_doh_resolver for {domain=} : {response.status_code} - {response.content.decode('utf-8')}")
       except (ConnectError, ConnectTimeout, ReadError, RemoteProtocolError) as err:
         logger.debug(f'[{err.__class__.__name__}] : __cname_doh_resolver debug err : {err}')
       except Exception as err:
@@ -297,32 +299,39 @@ class DomainsResolver:
   # Job
 
   # Put domains to Queue
-  async def domains_resolve(self: Self) -> None:
-    logger.info(f'Domains resolve - START')
+  async def domains_resolve(self: Self, job_mode: Jobs) -> None:
+    logger.info(f'Domains resolve mode={job_mode} - START')
     try:
-      await jobs_cache.set(Jobs.DOMAINS_RESOLVE, True)
+      await jobs_cache.set(job_mode, True)
       #
-      domains: List[DomainResult] = await db.get_domains_for_resolve()
-      len_domains = len(domains)
-      resolve_domains_log_every = settings.resolve_domains_log_every
+      match job_mode:
+        case Jobs.DOMAINS_RESOLVE_NEW:
+          domains: List[DomainResult] = await db.get_new_domains_for_resolve()
+        case Jobs.DOMAINS_RESOLVE_STALE:
+          domains: List[DomainResult] = await db.get_stale_domains_for_resolve()
+        case _:
+          raise Exception(f'Unknown domains resolve job_mode:{job_mode}')
+      len_domains: int = len(domains)
+      resolve_domains_log_every: int = settings.resolve_domains_log_every
       log_every: int = max(1, ceil(len_domains / resolve_domains_log_every))
-      logger.info(f'Domains for resolve: {len_domains}, log_every: {log_every}')
+      logger.info(f'Domains for resolve mode={job_mode}: {len_domains}, log_every: {log_every}')
       if len_domains > 0:
         #
-        logger.debug(f'Start task ...')
+        logger.debug(f'Start task {job_mode} ...')
         self.__stop_domains_resolve_event.clear()
         create_task(
           coro=self.__task_process_domains_resolve_from_queue(count_all=len_domains, log_every=log_every),
-          name='__task_process_domains_resolve_from_queue'
+          name=f'__task_process_domains_resolve_from_queue_{job_mode}'
         )
         [await self.domains_resolve_queue.put(item=domain) for domain in domains]
         # STOP domains resolve
         await self.domains_resolve_queue.join()
         self.__stop_domains_resolve_event.set()
-        logger.info(f'Domains resolve - DONE')
+        logger.info(f'Domains resolve mode={job_mode} - DONE')
       else:
-        logger.info(f'Domains resolve - Not found domains for resolve. DONE')
+        logger.info(f'Domains resolve mode={job_mode} - Not found domains for resolve. DONE')
     except Exception as err:
-      logger.error(f'Try Domains resolve failed [{err.__class__.__name__}] : {err}', exc_info=True)
+      logger.error(f'Try Domains resolve mode={job_mode} failed [{err.__class__.__name__}] : {err}', exc_info=True)
     finally:
+      await jobs_cache.set(job_mode, False)
       await jobs_cache.set(Jobs.DOMAINS_RESOLVE, False)

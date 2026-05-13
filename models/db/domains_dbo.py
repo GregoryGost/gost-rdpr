@@ -159,26 +159,50 @@ class DomainsDbo(Dbo):
       raise err
 
   @classmethod
-  async def get_all_for_resolve(
+  async def get_stale_for_resolve(
     cls: type[Self],
-    db_session: AsyncSession
+    db_session: AsyncSession,
+    limit: int
   ) -> Sequence[Row[Tuple[int, str, int | None, int]]]:
     '''
     WHERE id > 0 AND (updated_at IS NULL OR (unixepoch(CURRENT_TIMESTAMP) - unixepoch(updated_at)) >= {DOMAINS_UPDATE_INTERVAL})
     '''
     try:
+      elapsed_expr = func.coalesce(func.unixepoch(func.current_timestamp()) - func.unixepoch(cls.last_resolved_at), 0)
+      #
       select_stmt: Select[Tuple[int, str, int | None, int]] = select(
         cls.id,
         cls.name,
         cls.domain_list_id,
-        text(f'COALESCE(unixepoch(CURRENT_TIMESTAMP) - unixepoch({cls.__tablename__}.{cls.last_resolved_at.property.key}), 0) AS elapsed')
+        elapsed_expr.label('elapsed')
       ).where(
         cls.id > 0,
-        or_(
-          cls.last_resolved_at == None,
-          text(f'elapsed >= {settings.domains_update_interval}')
-        )
-      )
+        cls.last_resolved_at.is_not(None),
+        elapsed_expr >= settings.domains_update_interval
+      ).order_by(cls.last_resolved_at, cls.id).limit(limit)
+      result: Result[Tuple[int, str, int | None, int]] = \
+        await db_session.execute(select_stmt)
+      #
+      return result.fetchall()
+    except Exception as err:
+      raise err
+
+  @classmethod
+  async def get_new_for_resolve(
+    cls: type[Self],
+    db_session: AsyncSession,
+    limit: int
+  ) -> Sequence[Row[Tuple[int, str, int | None, int]]]:
+    try:
+      select_stmt: Select[Tuple[int, str, int | None, int]] = select(
+        cls.id,
+        cls.name,
+        cls.domain_list_id,
+        literal(0).label('elapsed')
+      ).where(
+        cls.id > 0,
+        cls.last_resolved_at.is_(None)
+      ).order_by(cls.id).limit(limit)
       result: Result[Tuple[int, str, int | None, int]] = \
         await db_session.execute(select_stmt)
       #

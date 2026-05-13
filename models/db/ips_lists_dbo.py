@@ -96,8 +96,13 @@ class IpsListsDbo(Dbo):
       raise err
 
   @classmethod
-  async def get_for_update(cls: type[Self], db_session: AsyncSession) -> List[IpsListDto]:
+  async def get_for_update(cls: type[Self], db_session: AsyncSession, forced: bool) -> List[IpsListDto]:
     try:
+      elapsed_expr = func.coalesce(
+        func.unixepoch(func.current_timestamp()) - func.unixepoch(cls.updated_at),
+        settings.lists_update_interval_sec
+      )
+      #
       select_stmt: Select[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]] = select(
         cls.id,
         cls.name,
@@ -108,14 +113,20 @@ class IpsListsDbo(Dbo):
         cls.created_at,
         cls.updated_at
       ).where(
-        and_(
-          cls.attempts < settings.attempts_limit,
+        cls.attempts < settings.attempts_limit
+      )
+      if forced is False:
+        elapsed_expr = func.coalesce(
+          func.unixepoch(func.current_timestamp()) - func.unixepoch(cls.updated_at),
+          settings.lists_update_interval_sec
+        )
+        select_stmt = select_stmt.where(
           or_(
-            cls.updated_at == None,
-            cls.updated_at >= (datetime.now() - timedelta(seconds=settings.lists_update_interval_sec))
+            cls.updated_at.is_(None),
+            elapsed_expr >= settings.lists_update_interval_sec
           )
         )
-      )
+      #
       exec_result: Result[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]] = \
         await db_session.execute(select_stmt)
       result: List[IpsListDto] = [

@@ -70,10 +70,13 @@ Available environment variables
 | `DB_TABLE_PREFIX` | str | `rdpr_` | Prefix for database table names |
 | `DB_SAVE_BATCH_SIZE` | int | `1000` | The maximum number of all insert, update, and delete events in the database queue. This means we write a maximum of 1000 events to the file at a time (which can be very frequent). But you should also look at the timeout parameter |
 | `DB_SAVE_BATCH_TIMEOUT` | float | `0.5` | If we haven't accumulated a batch of the size limited by the parameter "parameter1" within the interval specified here, then we do what's already in the current batch |
-| `DB_JOURNAL_MODE` | str | `WAL` | Write-Ahead Logging - better concurrent access |
-| `DB_WAL_AUTOCHECKPOINT` | int | `1000` | Initiate a checkpoint approximately every 1000 WAL pages (choose experimentally: if WAL grows too quickly, decrease it; if checkpoints interfere, increase it) |
-| `DB_SYNCHRONOUS` | str | `NORMAL` | NORMAL - A good balance of performance and reliability for most VDS applications. `FULL`` provides maximum reliability, but is more expensive in terms of I/O. |
-| `DB_BUSY_TIMEOUT` | int | `2000` | This is the timeout (in milliseconds) during which SQLite will retry acquiring a lock instead of immediately failing with a "database is locked" error. Defaults in SQLite to 0 (no wait). |
+| `DB_TUNE_JOURNAL_MODE` | str | `WAL` | Write-Ahead Logging - better concurrent access |
+| `DB_TUNE_WAL_AUTOCHECKPOINT` | int | `1000` | Initiate a checkpoint approximately every 1000 WAL pages (choose experimentally: if WAL grows too quickly, decrease it; if checkpoints interfere, increase it) |
+| `DB_TUNE_SYNCHRONOUS` | str | `NORMAL` | NORMAL - A good balance of performance and reliability for most VDS applications. `FULL`` provides maximum reliability, but is more expensive in terms of I/O. |
+| `DB_TUNE_TEMP_STORE` | str | `FILE` | Defines where SQLite stores temporary tables and indexes. `MEMORY` can improve performance but increases memory consumption |
+| `DB_TUNE_MMAP_SIZE` | int | `0` | Defines the maximum amount of database file memory mapping. `0` disables memory-mapped I/O. Higher values may improve read performance but increase container memory usage |
+| `DB_TUNE_CACHE_SIZE` | int | `-2048` | If the value is negative, SQLite treats it as kibibytes; `-2048` means about 2 MiB cache. Positive values are interpreted as number of database pages. Lower values reduce RAM usage; higher values may improve performance at the cost of memory |
+| `DB_TUNE_BUSY_TIMEOUT` | int | `2000` | This is the timeout (in milliseconds) during which SQLite will retry acquiring a lock instead of immediately failing with a "database is locked" error. Defaults in SQLite to 0 (no wait). |
 | `DB_POOL_SIZE` | int | `10` | The number of connections to keep open inside the connection pool |
 | `DB_POOL_RECYCLE` | int | `1500` | This setting causes the pool to recycle connections after the given number of seconds has passed |
 | `DB_POOL_TIMEOUT` | int | `30` | Number of seconds to wait before giving up on getting a connection from the pool |
@@ -89,6 +92,8 @@ Available environment variables
 | `DOMAINS_FILTERED_MIN_LEN` | int | `3` | The minimum domain length required to save it to the database. This is necessary to filter out empty domains that, for some reason, are generated in MikroTik scripts |
 | `DOMAINS_UPDATE_INTERVAL` | int | `172800` | Domain selection period. This means that if a domain has been processed, it will not be processed again until this period has passed. Specified in seconds. 172800s = 2days |
 | `DOMAINS_RESOLVE_SEMAPHORE_LIMIT` | int | `60` | Limit of concurrent domain resolving tasks |
+| `DOMAINS_RESOLVE_NEW_BATCH_SIZE` | int | `500` | Limit for sampling the number of domains that have never been processed |
+| `DOMAINS_RESOLVE_STALE_BATCH_SIZE` | int | `2000` | Limit for sampling the number of previously processed domains |
 | `DOMAINS_BLACK_LIST` | str | `None` | Domains that should not be included in the database. Comma-separated list |
 | `LISTS_UPDATE_INTERVAL_SEC` | int | `604800` | The period after which the file must be uploaded and verified again. Specified in seconds. 604800s = 7days |
 | `IP_NOT_ALLOWED` | str | `127.0.0.1, 0.0.0.0, 0.0.0.0/0, ::, ::/0` | A list of IP addresses that should not be included in the database. Comma-separated list. |
@@ -237,6 +242,7 @@ Get tree all modules
 
 ```sh
 poetry show --tree
+poetry show --outdated
 ```
 
 ### TODO

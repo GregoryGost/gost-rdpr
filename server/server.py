@@ -15,6 +15,7 @@ from logger.logger import logger
 from database.db import db
 from cache.cache import jobs_cache
 from metrics.metrics import PrometheusMiddleware
+from client.http_base_client import HttpClient
 
 from .tags_metadata import TagsMetadata
 
@@ -69,6 +70,8 @@ class AppServer:
     # Cache init
     await jobs_cache.set(key=Jobs.LISTS_LOAD, value=False)
     await jobs_cache.set(key=Jobs.DOMAINS_RESOLVE, value=False)
+    await jobs_cache.set(key=Jobs.DOMAINS_RESOLVE_NEW, value=False)
+    await jobs_cache.set(key=Jobs.DOMAINS_RESOLVE_STALE, value=False)
     await jobs_cache.set(key=Jobs.ROS_UPDATE, value=False)
     # Init DB
     await db.setup()
@@ -77,6 +80,7 @@ class AppServer:
     #
     yield
     # next RUN AFTER stop FastAPI
+    await HttpClient.close()
 
   async def run(self: Self):
     logger.debug('AppServer run ...')

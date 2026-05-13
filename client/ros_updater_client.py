@@ -28,13 +28,12 @@ class RosClient:
   '''
 
   ros_update_sleep_timeout: float = 0.1
-  update_ros_queue: Queue = Queue(maxsize=settings.queue_max_size)
+  update_ros_queue: Queue[RosConfigDto] = Queue(maxsize=settings.queue_max_size)
 
   __stop_update_ros_event: Event = Event()
   __queue_sleep_timeout: float = settings.queue_sleep_timeout
   __queue_get_timeout: float = settings.queue_get_timeout
   __task_exception_error_timeout: float = 10.0
-  __client: AsyncClient = HttpClient().client
   __headers: HeaderTypes = {
     'Accept': '*/*',
     'Content-Type': 'application/json',
@@ -45,24 +44,24 @@ class RosClient:
     connect=settings.req_timeout_connect,
     read=settings.ros_rest_api_read_timeout
   )
+  __client: AsyncClient = HttpClient.get_client('ros', timeout=__timeout)
   __fw_strict_addr_list_postfix: str = 'strict'
 
   def __init__(self: Self) -> None:
-    self.__client.timeout = self.__timeout
     logger.debug(f'{self.__class__.__name__} init ...')
 
   async def __task_process_update_ros_from_queue(self: Self) -> None:
     logger.info('STARTING A FLOW - Update ROS configs')
     while not self.__stop_update_ros_event.is_set():
       try:
-        # queue is empty - skip
-        if self.update_ros_queue.empty():
-          await sleep(self.__queue_sleep_timeout)
-          continue
         config: RosConfigDto = await wait_for(
           self.update_ros_queue.get(),
           timeout=self.__queue_get_timeout
         )
+      except TimeoutError:
+        await sleep(self.__queue_sleep_timeout)
+        continue
+      try:
         logger.debug(f'START update ros config {config=}')
         # check connection
         await self.__check(config=config)
@@ -201,21 +200,14 @@ class RosClient:
           #   await self.__add_to_ros(config=config, action=RosAction.ROUTING_ADD, address_list=routing_address_add, route_gateway=default_ipv6_gateway)
         #
         logger.debug(f'END update ros config element {config=}')
-        self.update_ros_queue.task_done()
-      except TimeoutError:
-        await sleep(self.__queue_sleep_timeout)
-        self.update_ros_queue.task_done()
-        continue
       except RemoteProtocolError as err:
         logger.error(f'ERROR Update ROS configs : [{err.__class__.__name__}] {err}')
         await sleep(self.__queue_sleep_timeout)
-        self.update_ros_queue.task_done()
-        continue
       except Exception as err:
         logger.error(f'Unexpected error in flow - Update ROS configs : [{err.__class__.__name__}] {err}', exc_info=True)
         await sleep(self.__task_exception_error_timeout)
+      finally:
         self.update_ros_queue.task_done()
-        continue
     logger.info('STOP FLOW - Update ROS configs')
 
   async def __check(self: Self, config: RosConfigDto) -> None:
@@ -559,8 +551,6 @@ class RosClient:
   async def update(self: Self, addr_type: int | None = None) -> None:
     logger.info(f'Run update ROS configs {addr_type=}')
     try:
-      # start JOB
-      await jobs_cache.set(Jobs.ROS_UPDATE, True)
       # get all RoS configs from DB
       configs: List[RosConfigDto] = await db.get_all_configs_for_ros_update()
       logger.info(f'Configs for update: {len(configs)}')

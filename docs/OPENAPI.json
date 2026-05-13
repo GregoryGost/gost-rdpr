@@ -1,0 +1,5608 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "GOST-RDPR (Resolve Domains Per Records)",
+    "summary": "A utility for working with Mikrotik RouterOS and BGP protocol for announcing IP addresses",
+    "description": "The utility provides parsing of domain names into IP addresses, processing of domain lists and their \n    subsequent parsing, processing of individual IP addresses and summarized IP groups. Updates firewall address list \n    and routing table",
+    "version": "2.0.9"
+  },
+  "paths": {
+    "/metrics": {
+      "get": {
+        "tags": [
+          "Metrics"
+        ],
+        "summary": "Metrics",
+        "description": "Prometheus metrics",
+        "operationId": "Metrics_metrics_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/": {
+      "get": {
+        "tags": [
+          "Home"
+        ],
+        "summary": "Welcome",
+        "description": "Base welcome answer",
+        "operationId": "Welcome__get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WelcomeResp"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "Home"
+        ],
+        "summary": "Health Check",
+        "description": "API OK checker",
+        "operationId": "Health_check_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResp"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/config": {
+      "get": {
+        "tags": [
+          "Home"
+        ],
+        "summary": "Current Config",
+        "description": "Current config. All settings parameters",
+        "operationId": "Current_config_config_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigResp"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dns": {
+      "get": {
+        "tags": [
+          "DNS Servers"
+        ],
+        "summary": "Get All Dns Servers Records",
+        "description": "Displays all available DNS server records. Also displays the default DNS server with ID -1",
+        "operationId": "Get_all_DNS_servers_records_dns_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "exclusiveMinimum": 0,
+              "title": "Limit param",
+              "description": "Number of items to be sampled",
+              "examples": [
+                100
+              ],
+              "default": 100
+            },
+            "description": "Number of items to be sampled"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "title": "Offset param",
+              "description": "Offset quantity to start sampling from",
+              "examples": [
+                10
+              ],
+              "default": 0
+            },
+            "description": "Offset quantity to start sampling from"
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start date",
+              "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`"
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End date",
+              "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`"
+          },
+          {
+            "name": "default",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "View default DNS",
+              "description": "Whether or not to include the default DNS server in the result",
+              "examples": [
+                true,
+                false
+              ]
+            },
+            "description": "Whether or not to include the default DNS server in the result"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnsPayloadResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "DNS Servers"
+        ],
+        "summary": "Add New Dns Servers",
+        "description": "Allows you to add the required DNS servers through an array with parameters",
+        "operationId": "Add_new_DNS_servers_dns_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/DnsPostElementReq"
+                },
+                "examples": [
+                  [
+                    {
+                      "server": "9.9.9.9"
+                    },
+                    {
+                      "server": "1.1.1.1",
+                      "description": "Simple IPv4 DNS server"
+                    },
+                    {
+                      "doh_server": "https://dns.adguard-dns.com/dns-query",
+                      "description": "DNS over HTTPS server URL"
+                    }
+                  ]
+                ],
+                "title": "Data"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NoDataResp"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "DNS Servers"
+        ],
+        "summary": "Clear All Dns Servers Records (Warning!!!)",
+        "description": "Clear All DNS servers records. But not default record id=-1",
+        "operationId": "Clear_All_DNS_servers_records__WARNING_____dns_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        }
+      }
+    },
+    "/dns/search": {
+      "get": {
+        "tags": [
+          "DNS Servers"
+        ],
+        "summary": "Find Dns Server By Text",
+        "description": "Find a DNS server by text. Using fields \"server\" or \"doh_server\"",
+        "operationId": "Find_DNS_server_by_text_dns_search_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "exclusiveMinimum": 0,
+              "title": "Limit param",
+              "description": "Number of items to be sampled",
+              "examples": [
+                100
+              ],
+              "default": 100
+            },
+            "description": "Number of items to be sampled"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "title": "Offset param",
+              "description": "Offset quantity to start sampling from",
+              "examples": [
+                10
+              ],
+              "default": 0
+            },
+            "description": "Offset quantity to start sampling from"
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start date",
+              "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`"
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End date",
+              "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`"
+          },
+          {
+            "name": "text",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 3,
+              "title": "Search text",
+              "description": "Search text for fields \"server\" or \"doh_server\""
+            },
+            "description": "Search text for fields \"server\" or \"doh_server\""
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnsPayloadResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dns/{id}": {
+      "get": {
+        "tags": [
+          "DNS Servers"
+        ],
+        "summary": "Get One Dns Server Record",
+        "description": "Display parameters at one DNS server record",
+        "operationId": "Get_one_DNS_server_record_dns__id__get",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": -1,
+              "title": "DNS record ID"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnsElementResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundResp"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "DNS Servers"
+        ],
+        "summary": "Delete One Dns Server Record",
+        "description": "Delete one DNS server record",
+        "operationId": "Delete_one_DNS_server_record_dns__id__delete",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "exclusiveMinimum": -1,
+              "title": "DNS record ID"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/domains/lists": {
+      "get": {
+        "tags": [
+          "Domains Lists"
+        ],
+        "summary": "Get All Domains Lists",
+        "description": "Displays all Domains lists records",
+        "operationId": "Get_all_Domains_lists_domains_lists_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "exclusiveMinimum": 0,
+              "title": "Limit param",
+              "description": "Number of items to be sampled",
+              "examples": [
+                100
+              ],
+              "default": 100
+            },
+            "description": "Number of items to be sampled"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "title": "Offset param",
+              "description": "Offset quantity to start sampling from",
+              "examples": [
+                10
+              ],
+              "default": 0
+            },
+            "description": "Offset quantity to start sampling from"
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start date",
+              "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`"
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End date",
+              "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`"
+          },
+          {
+            "name": "attempts",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Attempts count",
+              "description": "Attempts count for ips list"
+            },
+            "description": "Attempts count for ips list"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainsListsPayloadResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Domains Lists"
+        ],
+        "summary": "Add New Domains Lists",
+        "description": "Add new domains lists URL for download and parse for next",
+        "operationId": "Add_new_domains_lists_domains_lists_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/DomainsListsPostElementReq"
+                },
+                "examples": [
+                  [
+                    {
+                      "name": "voice-domains-list",
+                      "url": "https://somedomain.som/path/path/path/voice.txt"
+                    },
+                    {
+                      "name": "voice-domains-list-2",
+                      "url": "https://somedomain.som/path/path/path/voice-2.txt",
+                      "description": "Description for some voice domains list"
+                    }
+                  ]
+                ],
+                "title": "Data"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NoDataResp"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Domains Lists"
+        ],
+        "summary": "Delete All Domains Lists Records",
+        "description": "Delete all Domains lists records",
+        "operationId": "Delete_all_Domains_lists_records_domains_lists_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        }
+      }
+    },
+    "/domains/lists/search": {
+      "get": {
+        "tags": [
+          "Domains Lists"
+        ],
+        "summary": "Find Domains Lists By Text",
+        "description": "Find a Domains lists by text. Using fields \"name\" or \"url\"",
+        "operationId": "Find_Domains_lists_by_text_domains_lists_search_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "exclusiveMinimum": 0,
+              "title": "Limit param",
+              "description": "Number of items to be sampled",
+              "examples": [
+                100
+              ],
+              "default": 100
+            },
+            "description": "Number of items to be sampled"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "title": "Offset param",
+              "description": "Offset quantity to start sampling from",
+              "examples": [
+                10
+              ],
+              "default": 0
+            },
+            "description": "Offset quantity to start sampling from"
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start date",
+              "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`"
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End date",
+              "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`"
+          },
+          {
+            "name": "text",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 3,
+              "title": "Search text",
+              "description": "Search text for fields \"name\" or \"url\""
+            },
+            "description": "Search text for fields \"name\" or \"url\""
+          },
+          {
+            "name": "attempts",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Attempts count",
+              "description": "Attempts count for domains list"
+            },
+            "description": "Attempts count for domains list"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainsListsPayloadResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/domains/lists/{id}": {
+      "get": {
+        "tags": [
+          "Domains Lists"
+        ],
+        "summary": "Get One Domains List",
+        "description": "Displays one Domains list record info",
+        "operationId": "Get_one_Domains_list_domains_lists__id__get",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "title": "Domains list record ID"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainsListElementResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundResp"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Domains Lists"
+        ],
+        "summary": "Delete One Domains List",
+        "description": "Delete one Domains list record",
+        "operationId": "Delete_one_Domains_list_domains_lists__id__delete",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "title": "Domains list record ID"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/domains": {
+      "get": {
+        "tags": [
+          "Domains"
+        ],
+        "summary": "Get All Domains Records",
+        "description": "Displays all available Domains records",
+        "operationId": "Get_all_Domains_records_domains_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "exclusiveMinimum": 0,
+              "title": "Limit param",
+              "description": "Number of items to be sampled",
+              "examples": [
+                100
+              ],
+              "default": 100
+            },
+            "description": "Number of items to be sampled"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "title": "Offset param",
+              "description": "Offset quantity to start sampling from",
+              "examples": [
+                10
+              ],
+              "default": 0
+            },
+            "description": "Offset quantity to start sampling from"
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start date",
+              "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`"
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End date",
+              "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`"
+          },
+          {
+            "name": "resolved",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "View resolved domains"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainsPayloadResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Domains"
+        ],
+        "summary": "Add New Domains",
+        "description": "Background add new domains",
+        "operationId": "Add_new_domains_domains_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/DomainsPostElementReq"
+                },
+                "examples": [
+                  [
+                    {
+                      "domain": "google.com"
+                    },
+                    {
+                      "domain": "rotterdam1192.discord.gg",
+                      "ros_comment": "discord domain"
+                    }
+                  ]
+                ],
+                "title": "Data"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NoDataResp"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Domains"
+        ],
+        "summary": "Clear All Domains Records (Warning!!!)",
+        "description": "Clear All Domains records. But not default record id=-1",
+        "operationId": "Clear_All_Domains_records__WARNING_____domains_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        }
+      }
+    },
+    "/domains/search": {
+      "get": {
+        "tags": [
+          "Domains"
+        ],
+        "summary": "Find Domains By Text",
+        "description": "Find a Domains by text. Using fields \"name\" or \"url\"",
+        "operationId": "Find_Domains_by_text_domains_search_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "exclusiveMinimum": 0,
+              "title": "Limit param",
+              "description": "Number of items to be sampled",
+              "examples": [
+                100
+              ],
+              "default": 100
+            },
+            "description": "Number of items to be sampled"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "title": "Offset param",
+              "description": "Offset quantity to start sampling from",
+              "examples": [
+                10
+              ],
+              "default": 0
+            },
+            "description": "Offset quantity to start sampling from"
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start date",
+              "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`"
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End date",
+              "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`"
+          },
+          {
+            "name": "resolved",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "View resolved domains"
+            }
+          },
+          {
+            "name": "text",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 3,
+              "title": "Search text",
+              "description": "Search text for fields \"name\""
+            },
+            "description": "Search text for fields \"name\""
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainsPayloadResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/domains/{id}": {
+      "get": {
+        "tags": [
+          "Domains"
+        ],
+        "summary": "Get One Domain",
+        "description": "Displays one Domain record info",
+        "operationId": "Get_one_Domain_domains__id__get",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "title": "Domain record ID"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainElementResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundResp"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Domains"
+        ],
+        "summary": "Delete One Domain Record",
+        "description": "Background delete one Domain record",
+        "operationId": "Delete_one_Domain_record_domains__id__delete",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": -1,
+              "title": "Domain record ID"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ips/lists": {
+      "get": {
+        "tags": [
+          "IP Address Lists"
+        ],
+        "summary": "Get All Ip Address Lists",
+        "description": "Displays all IP address lists records",
+        "operationId": "Get_all_IP_address_lists_ips_lists_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "exclusiveMinimum": 0,
+              "title": "Limit param",
+              "description": "Number of items to be sampled",
+              "examples": [
+                100
+              ],
+              "default": 100
+            },
+            "description": "Number of items to be sampled"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "title": "Offset param",
+              "description": "Offset quantity to start sampling from",
+              "examples": [
+                10
+              ],
+              "default": 0
+            },
+            "description": "Offset quantity to start sampling from"
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start date",
+              "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`"
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End date",
+              "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`"
+          },
+          {
+            "name": "attempts",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Attempts count",
+              "description": "Attempts count for ips list"
+            },
+            "description": "Attempts count for ips list"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IpsListsPayloadResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "IP Address Lists"
+        ],
+        "summary": "Add New Ip Address Lists",
+        "description": "Add new IP address lists URL for download",
+        "operationId": "Add_new_IP_address_lists_ips_lists_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/IpsListsPostElementReq"
+                },
+                "examples": [
+                  [
+                    {
+                      "name": "ips-list",
+                      "url": "https://somedomain.som/path/path/path/some-ips-list"
+                    },
+                    {
+                      "name": "ips-list-2",
+                      "url": "https://somedomain.som/path/path/path/some-ips-list-2.txt",
+                      "description": "Description for some ips address list"
+                    }
+                  ]
+                ],
+                "title": "Data"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NoDataResp"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "IP Address Lists"
+        ],
+        "summary": "Delete All Ip Address Lists Records",
+        "description": "Delete all IP address lists records",
+        "operationId": "Delete_all_IP_address_lists_records_ips_lists_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        }
+      }
+    },
+    "/ips/lists/search": {
+      "get": {
+        "tags": [
+          "IP Address Lists"
+        ],
+        "summary": "Find Ips Lists By Text",
+        "description": "Find a Ips lists by text. Using fields \"name\" or \"url\"",
+        "operationId": "Find_Ips_lists_by_text_ips_lists_search_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "exclusiveMinimum": 0,
+              "title": "Limit param",
+              "description": "Number of items to be sampled",
+              "examples": [
+                100
+              ],
+              "default": 100
+            },
+            "description": "Number of items to be sampled"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "title": "Offset param",
+              "description": "Offset quantity to start sampling from",
+              "examples": [
+                10
+              ],
+              "default": 0
+            },
+            "description": "Offset quantity to start sampling from"
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start date",
+              "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`"
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End date",
+              "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`"
+          },
+          {
+            "name": "text",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 3,
+              "title": "Search text",
+              "description": "Search text for fields \"name\" or \"url\""
+            },
+            "description": "Search text for fields \"name\" or \"url\""
+          },
+          {
+            "name": "attempts",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Attempts count",
+              "description": "Attempts count for ips list"
+            },
+            "description": "Attempts count for ips list"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IpsListsPayloadResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ips/lists/{id}": {
+      "get": {
+        "tags": [
+          "IP Address Lists"
+        ],
+        "summary": "Get One Ip Address List",
+        "description": "Displays one IP address list record on ID",
+        "operationId": "Get_one_IP_address_list_ips_lists__id__get",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "title": "Ips list record ID"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IpsListElementResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundResp"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "IP Address Lists"
+        ],
+        "summary": "Delete One Ip Address List",
+        "description": "Delete one IP address list record",
+        "operationId": "Delete_one_IP_address_list_ips_lists__id__delete",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "title": "Ips list record ID"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ips": {
+      "get": {
+        "tags": [
+          "IP address"
+        ],
+        "summary": "Get All Ip Address Records",
+        "description": "Displays all available IP address records",
+        "operationId": "Get_all_IP_address_records_ips_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "exclusiveMinimum": 0,
+              "title": "Limit param",
+              "description": "Number of items to be sampled",
+              "examples": [
+                100
+              ],
+              "default": 100
+            },
+            "description": "Number of items to be sampled"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "title": "Offset param",
+              "description": "Offset quantity to start sampling from",
+              "examples": [
+                10
+              ],
+              "default": 0
+            },
+            "description": "Offset quantity to start sampling from"
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start date",
+              "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`"
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End date",
+              "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`"
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "IP address type v4 or v6",
+              "description": "IP address type filter parameter",
+              "examples": [
+                4,
+                6
+              ]
+            },
+            "description": "IP address type filter parameter"
+          },
+          {
+            "name": "default_gw",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Filtered default gateway",
+              "description": "Filtered use default gateway for IP addr on clients"
+            },
+            "description": "Filtered use default gateway for IP addr on clients"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IpsPayloadResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "IP address"
+        ],
+        "summary": "Add New Ip Address Records",
+        "description": "Add new IP address records. New IPs link to default domain at ID = 0",
+        "operationId": "Add_new_IP_address_records_ips_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/IpsPostElementReq"
+                },
+                "examples": [
+                  [
+                    {
+                      "addr": "1.1.1.1"
+                    },
+                    {
+                      "addr": "9.9.9.9",
+                      "domain_id": 1
+                    },
+                    {
+                      "addr": "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+                      "ros_comment": "discord ip address"
+                    },
+                    {
+                      "addr": "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+                      "domain_id": 3,
+                      "ros_comment": "meta ip address"
+                    },
+                    {
+                      "addr": "8.8.8.8",
+                      "list_id": 15,
+                      "ros_comment": "add address to list"
+                    },
+                    {
+                      "addr": "172.10.4.4",
+                      "use_default_gw": true,
+                      "ros_comment": "Exclude IP /32 from the larger mask /16/24 so it doesnt go through the VPN"
+                    }
+                  ]
+                ],
+                "title": "Data"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NoDataResp"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "IP address"
+        ],
+        "summary": "Clear All Ip Address Records (Warning!!!)",
+        "description": "Clear All IP address records",
+        "operationId": "Clear_All_IP_address_records__WARNING_____ips_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        }
+      }
+    },
+    "/ips/search": {
+      "get": {
+        "tags": [
+          "IP address"
+        ],
+        "summary": "Find Ips Address By Text",
+        "description": "Find a Ips address by text. Using fields \"addr\"",
+        "operationId": "Find_Ips_address_by_text_ips_search_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "exclusiveMinimum": 0,
+              "title": "Limit param",
+              "description": "Number of items to be sampled",
+              "examples": [
+                100
+              ],
+              "default": 100
+            },
+            "description": "Number of items to be sampled"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "title": "Offset param",
+              "description": "Offset quantity to start sampling from",
+              "examples": [
+                10
+              ],
+              "default": 0
+            },
+            "description": "Offset quantity to start sampling from"
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start date",
+              "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`"
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End date",
+              "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`"
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "IP address type v4 or v6",
+              "description": "IP address type filter parameter",
+              "examples": [
+                4,
+                6
+              ]
+            },
+            "description": "IP address type filter parameter"
+          },
+          {
+            "name": "default_gw",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Filtered default gateway",
+              "description": "Filtered use default gateway for IP addr on clients"
+            },
+            "description": "Filtered use default gateway for IP addr on clients"
+          },
+          {
+            "name": "text",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 3,
+              "title": "Search text",
+              "description": "Search text for fields \"ip_address\""
+            },
+            "description": "Search text for fields \"ip_address\""
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IpsPayloadResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ips/{id}": {
+      "get": {
+        "tags": [
+          "IP address"
+        ],
+        "summary": "Get One Ip Address Record On Id",
+        "description": "Displays one IP address record on ID",
+        "operationId": "Get_one_IP_address_record_on_ID_ips__id__get",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "title": "IP address record ID"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IpsElementResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundResp"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ips/{id_or_ip}": {
+      "delete": {
+        "tags": [
+          "IP address"
+        ],
+        "summary": "Delete One Ip Address Record (Ip Or Id Over Query Param)",
+        "description": "Delete one IP address record on ID or IP",
+        "operationId": "Delete_one_IP_address_record__ip_or_id_over_query_param__ips__id_or_ip__delete",
+        "parameters": [
+          {
+            "name": "id_or_ip",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "title": "ID or IP address"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ros": {
+      "get": {
+        "tags": [
+          "RoS Configs"
+        ],
+        "summary": "Get All Router Os Configs",
+        "description": "Displays all Router OS configs records. No connect tests",
+        "operationId": "Get_all_Router_OS_configs_ros_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "exclusiveMinimum": 0,
+              "title": "Limit param",
+              "description": "Number of items to be sampled",
+              "examples": [
+                100
+              ],
+              "default": 100
+            },
+            "description": "Number of items to be sampled"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "title": "Offset param",
+              "description": "Offset quantity to start sampling from",
+              "examples": [
+                10
+              ],
+              "default": 0
+            },
+            "description": "Offset quantity to start sampling from"
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start date",
+              "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`"
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End date",
+              "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RosConfigPayloadResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "RoS Configs"
+        ],
+        "summary": "Add Router Os Configs",
+        "description": "Adds new RouterOS configurations. IP address rollout will be applied to each configuration",
+        "operationId": "Add_Router_OS_configs_ros_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/RosConfigsPostElementReq"
+                },
+                "examples": [
+                  [
+                    {
+                      "host": "192.168.200.1",
+                      "user": "test",
+                      "user_password": "1234",
+                      "bgp_list_name": "bgp-networks",
+                      "description": "Test CHR Host"
+                    }
+                  ]
+                ],
+                "title": "Data"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NoDataResp"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "RoS Configs"
+        ],
+        "summary": "Delete All Routeros Configs",
+        "description": "Delete all RouterOS configs records",
+        "operationId": "Delete_all_RouterOS_configs_ros_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        }
+      }
+    },
+    "/ros/search": {
+      "get": {
+        "tags": [
+          "RoS Configs"
+        ],
+        "summary": "Find Router Os Configs By Text",
+        "description": "Find a Router OS configs by text. Using fields \"host\" or \"user\" or \"bgp_list_name\"",
+        "operationId": "Find_Router_OS_configs_by_text_ros_search_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "exclusiveMinimum": 0,
+              "title": "Limit param",
+              "description": "Number of items to be sampled",
+              "examples": [
+                100
+              ],
+              "default": 100
+            },
+            "description": "Number of items to be sampled"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "title": "Offset param",
+              "description": "Offset quantity to start sampling from",
+              "examples": [
+                10
+              ],
+              "default": 0
+            },
+            "description": "Offset quantity to start sampling from"
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start date",
+              "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to start sampling. Example `2024-04-24 00:00:00`"
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End date",
+              "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`",
+              "examples": [
+                "%Y-%m-%d %H:%M:%S",
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to end sampling. Example `2024-04-24 23:59:59`"
+          },
+          {
+            "name": "text",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 3,
+              "title": "Search text",
+              "description": "Search text for fields \"name\""
+            },
+            "description": "Search text for fields \"name\""
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RosConfigPayloadResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ros/{id}": {
+      "get": {
+        "tags": [
+          "RoS Configs"
+        ],
+        "summary": "Get Router Os Configs By Id",
+        "description": "Get a Router OS configs by id",
+        "operationId": "Get_Router_OS_configs_by_id_ros__id__get",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "title": "Router OS configs record ID"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RosConfigElementResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundResp"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "RoS Configs"
+        ],
+        "summary": "Delete One Routeros Config",
+        "description": "Delete once RouterOS config record",
+        "operationId": "Delete_one_RouterOS_config_ros__id__delete",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "title": "Router OS configs record ID"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/commands/lists/load": {
+      "post": {
+        "tags": [
+          "Commands"
+        ],
+        "summary": "Download Domains And Ips Lists",
+        "description": "Start background task for download domains and ips lists if hash files changed",
+        "operationId": "Download_domains_and_ips_lists_commands_lists_load_post",
+        "parameters": [
+          {
+            "name": "forced",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "title": "Force reload lists",
+              "description": "Force reload lists",
+              "default": false
+            },
+            "description": "Force reload lists"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/commands/domains/resolve/new": {
+      "post": {
+        "tags": [
+          "Commands"
+        ],
+        "summary": "Resolve New Domains",
+        "description": "Start background task for resolve only new domains. It can be done more often",
+        "operationId": "Resolve_new_domains_commands_domains_resolve_new_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/commands/domains/resolve/stale": {
+      "post": {
+        "tags": [
+          "Commands"
+        ],
+        "summary": "Resolve Stale Domains",
+        "description": "Start background task for resolve stale domains. This should be done rarely because there are many such domains",
+        "operationId": "Resolve_stale_domains_commands_domains_resolve_stale_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/commands/ros/update": {
+      "post": {
+        "tags": [
+          "Commands"
+        ],
+        "summary": "Update Firewall And Routing At Routeros Devices",
+        "description": "Update firewall address-list and routing records at all RouterOS devices(configs)",
+        "operationId": "Update_firewall_and_routing_at_RouterOS_devices_commands_ros_update_post",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "IP address type v4 or v6",
+              "description": "IP address type filter parameter",
+              "examples": [
+                4,
+                6
+              ]
+            },
+            "description": "IP address type filter parameter"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/stats": {
+      "get": {
+        "tags": [
+          "Statistics"
+        ],
+        "summary": "Get All Statistics Total Data",
+        "description": "Displays all all statistics total data",
+        "operationId": "Get_all_statistics_total_data_stats_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatsResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/stats/growth": {
+      "get": {
+        "tags": [
+          "Statistics"
+        ],
+        "summary": "Get Growth Time Series",
+        "description": "Time series of record creation grouped by date/week/month.",
+        "operationId": "Get_Growth_Time_Series_stats_growth_get",
+        "parameters": [
+          {
+            "name": "entity",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/GrowthEntity",
+              "description": "Data entity to aggregate",
+              "examples": [
+                "domains",
+                "lists",
+                "ips"
+              ]
+            },
+            "description": "Data entity to aggregate"
+          },
+          {
+            "name": "granularity",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/GrowthGranularity",
+              "description": "Time grouping granularity",
+              "examples": [
+                "minute",
+                "hour",
+                "day",
+                "week",
+                "month",
+                "year"
+              ],
+              "default": "day"
+            },
+            "description": "Time grouping granularity"
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start date",
+              "description": "Date from which you want to start sampling. Format '%Y-%m-%d %H:%M:%S'",
+              "examples": [
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to start sampling. Format '%Y-%m-%d %H:%M:%S'"
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 19,
+                  "maxLength": 19
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End date",
+              "description": "Date from which you want to end sampling. Format '%Y-%m-%d %H:%M:%S'",
+              "examples": [
+                "2024-10-01 15:00:00"
+              ]
+            },
+            "description": "Date from which you want to end sampling. Format '%Y-%m-%d %H:%M:%S'"
+          },
+          {
+            "name": "ip_subtype",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "IP version filter, only for entity=\"ips\". Allowed: 4 or 6",
+              "examples": [
+                4,
+                6
+              ],
+              "title": "Ip Subtype"
+            },
+            "description": "IP version filter, only for entity=\"ips\". Allowed: 4 or 6"
+          },
+          {
+            "name": "date_filter_field",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/GrowthDateField",
+              "description": "Field to filter by date. \"last_resolved_at\" only for entity=\"domains\"",
+              "examples": [
+                "created_at",
+                "updated_at",
+                "last_resolved_at"
+              ],
+              "default": "created_at"
+            },
+            "description": "Field to filter by date. \"last_resolved_at\" only for entity=\"domains\""
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatsGrowthResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ConfigDynamic": {
+        "properties": {
+          "ip_not_allowed_list": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Ip Not Allowed List"
+          },
+          "app_title_metrics": {
+            "type": "string",
+            "title": "App Title Metrics"
+          },
+          "db_path": {
+            "type": "string",
+            "title": "Db Path"
+          },
+          "db_connection": {
+            "type": "string",
+            "title": "Db Connection"
+          }
+        },
+        "type": "object",
+        "required": [
+          "ip_not_allowed_list",
+          "app_title_metrics",
+          "db_path",
+          "db_connection"
+        ],
+        "title": "ConfigDynamic"
+      },
+      "ConfigResp": {
+        "properties": {
+          "static": {
+            "$ref": "#/components/schemas/ConfigStatic"
+          },
+          "dynamic": {
+            "$ref": "#/components/schemas/ConfigDynamic"
+          }
+        },
+        "type": "object",
+        "required": [
+          "static",
+          "dynamic"
+        ],
+        "title": "ConfigResp"
+      },
+      "ConfigStatic": {
+        "properties": {
+          "root_path": {
+            "type": "string",
+            "title": "Root Path"
+          },
+          "root_log_level": {
+            "type": "string",
+            "title": "Root Log Level"
+          },
+          "app_title": {
+            "type": "string",
+            "title": "App Title"
+          },
+          "app_summary": {
+            "type": "string",
+            "title": "App Summary"
+          },
+          "app_description": {
+            "type": "string",
+            "title": "App Description"
+          },
+          "app_debug": {
+            "type": "boolean",
+            "title": "App Debug"
+          },
+          "app_version": {
+            "type": "string",
+            "title": "App Version"
+          },
+          "app_host": {
+            "type": "string",
+            "title": "App Host"
+          },
+          "app_port": {
+            "type": "integer",
+            "title": "App Port"
+          },
+          "app_log_level": {
+            "type": "string",
+            "title": "App Log Level"
+          },
+          "queue_max_size": {
+            "type": "integer",
+            "title": "Queue Max Size"
+          },
+          "queue_get_timeout": {
+            "type": "number",
+            "title": "Queue Get Timeout"
+          },
+          "queue_sleep_timeout": {
+            "type": "number",
+            "title": "Queue Sleep Timeout"
+          },
+          "db_log_level": {
+            "type": "string",
+            "title": "Db Log Level"
+          },
+          "db_timeout": {
+            "type": "number",
+            "title": "Db Timeout"
+          },
+          "db_base_dir": {
+            "type": "string",
+            "title": "Db Base Dir"
+          },
+          "db_file_name": {
+            "type": "string",
+            "title": "Db File Name"
+          },
+          "db_table_prefix": {
+            "type": "string",
+            "title": "Db Table Prefix"
+          },
+          "db_save_batch_size": {
+            "type": "integer",
+            "title": "Db Save Batch Size"
+          },
+          "db_save_batch_timeout": {
+            "type": "number",
+            "title": "Db Save Batch Timeout"
+          },
+          "attempts_limit": {
+            "type": "integer",
+            "title": "Attempts Limit"
+          },
+          "req_connection_retries": {
+            "type": "integer",
+            "title": "Req Connection Retries"
+          },
+          "req_timeout_default": {
+            "type": "number",
+            "title": "Req Timeout Default"
+          },
+          "req_timeout_connect": {
+            "type": "number",
+            "title": "Req Timeout Connect"
+          },
+          "req_timeout_read": {
+            "type": "number",
+            "title": "Req Timeout Read"
+          },
+          "req_max_connections": {
+            "type": "integer",
+            "title": "Req Max Connections"
+          },
+          "req_max_keepalive_connections": {
+            "type": "integer",
+            "title": "Req Max Keepalive Connections"
+          },
+          "req_ssl_verify": {
+            "type": "boolean",
+            "title": "Req Ssl Verify"
+          },
+          "req_default_limit": {
+            "type": "integer",
+            "title": "Req Default Limit"
+          },
+          "domains_filtered_min_len": {
+            "type": "integer",
+            "title": "Domains Filtered Min Len"
+          },
+          "domains_update_interval": {
+            "type": "integer",
+            "title": "Domains Update Interval"
+          },
+          "domain_resolve_semaphore_limit": {
+            "type": "integer",
+            "title": "Domain Resolve Semaphore Limit"
+          },
+          "domains_black_list": {
+            "type": "string",
+            "title": "Domains Black List"
+          },
+          "lists_update_interval_sec": {
+            "type": "integer",
+            "title": "Lists Update Interval Sec"
+          },
+          "ip_not_allowed": {
+            "type": "string",
+            "title": "Ip Not Allowed"
+          },
+          "ros_rest_api_read_timeout": {
+            "type": "number",
+            "title": "Ros Rest Api Read Timeout"
+          }
+        },
+        "type": "object",
+        "required": [
+          "root_path",
+          "root_log_level",
+          "app_title",
+          "app_summary",
+          "app_description",
+          "app_debug",
+          "app_version",
+          "app_host",
+          "app_port",
+          "app_log_level",
+          "queue_max_size",
+          "queue_get_timeout",
+          "queue_sleep_timeout",
+          "db_log_level",
+          "db_timeout",
+          "db_base_dir",
+          "db_file_name",
+          "db_table_prefix",
+          "db_save_batch_size",
+          "db_save_batch_timeout",
+          "attempts_limit",
+          "req_connection_retries",
+          "req_timeout_default",
+          "req_timeout_connect",
+          "req_timeout_read",
+          "req_max_connections",
+          "req_max_keepalive_connections",
+          "req_ssl_verify",
+          "req_default_limit",
+          "domains_filtered_min_len",
+          "domains_update_interval",
+          "domain_resolve_semaphore_limit",
+          "domains_black_list",
+          "lists_update_interval_sec",
+          "ip_not_allowed",
+          "ros_rest_api_read_timeout"
+        ],
+        "title": "ConfigStatic"
+      },
+      "DnsElementResp": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "server": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Server"
+          },
+          "doh_server": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doh Server"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "title": "Created At"
+          },
+          "created_at_hum": {
+            "type": "string",
+            "title": "Created At Hum"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "updated_at_hum": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At Hum"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "created_at",
+          "created_at_hum"
+        ],
+        "title": "DnsElementResp"
+      },
+      "DnsPayloadResp": {
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset"
+          },
+          "duration": {
+            "type": "number",
+            "title": "Duration"
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count",
+            "default": 0
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "default": 0
+          },
+          "payload": {
+            "items": {
+              "$ref": "#/components/schemas/DnsElementResp"
+            },
+            "type": "array",
+            "title": "Payload",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "limit",
+          "offset",
+          "duration"
+        ],
+        "title": "DnsPayloadResp"
+      },
+      "DnsPostElementReq": {
+        "properties": {
+          "server": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 3
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "IPv4, IPv6 DNS server address"
+          },
+          "doh_server": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 3
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "DoH server HTTP address"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 3
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Some description for DNS server"
+          }
+        },
+        "type": "object",
+        "title": "DnsPostElementReq"
+      },
+      "DomainElementResp": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "domains_list_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Domains List Id"
+          },
+          "resolved": {
+            "type": "boolean",
+            "title": "Resolved"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "ros_comment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ros Comment"
+          },
+          "ips_v4": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ips V4"
+          },
+          "ips_v6": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ips V6"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "title": "Created At"
+          },
+          "created_at_hum": {
+            "type": "string",
+            "title": "Created At Hum"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "updated_at_hum": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At Hum"
+          },
+          "last_resolved_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Resolved At"
+          },
+          "last_resolved_at_hum": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Resolved At Hum"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "resolved",
+          "name",
+          "created_at",
+          "created_at_hum"
+        ],
+        "title": "DomainElementResp"
+      },
+      "DomainsListElementResp": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "url": {
+            "type": "string",
+            "title": "Url"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hash"
+          },
+          "attempts": {
+            "type": "integer",
+            "title": "Attempts",
+            "default": 0
+          },
+          "elements_count": {
+            "type": "integer",
+            "title": "Elements Count",
+            "default": 0
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "title": "Created At"
+          },
+          "created_at_hum": {
+            "type": "string",
+            "title": "Created At Hum"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "updated_at_hum": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At Hum"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "url",
+          "created_at",
+          "created_at_hum"
+        ],
+        "title": "DomainsListElementResp"
+      },
+      "DomainsListsPayloadResp": {
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset"
+          },
+          "duration": {
+            "type": "number",
+            "title": "Duration"
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count",
+            "default": 0
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "default": 0
+          },
+          "payload": {
+            "items": {
+              "$ref": "#/components/schemas/DomainsListElementResp"
+            },
+            "type": "array",
+            "title": "Payload",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "limit",
+          "offset",
+          "duration"
+        ],
+        "title": "DomainsListsPayloadResp"
+      },
+      "DomainsListsPostElementReq": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 3,
+            "title": "Domain list name",
+            "examples": [
+              "voice-domains-list"
+            ]
+          },
+          "url": {
+            "type": "string",
+            "minLength": 5,
+            "title": "Link to file with domain lists",
+            "examples": [
+              "https://somedomain.som/path/path/path/voice.txt"
+            ]
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 3
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description for record"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "url"
+        ],
+        "title": "DomainsListsPostElementReq"
+      },
+      "DomainsPayloadResp": {
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset"
+          },
+          "duration": {
+            "type": "number",
+            "title": "Duration"
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count",
+            "default": 0
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "default": 0
+          },
+          "total_resolved": {
+            "type": "integer",
+            "title": "Total Resolved",
+            "default": 0
+          },
+          "total_query": {
+            "type": "integer",
+            "title": "Total Query",
+            "default": 0
+          },
+          "payload": {
+            "items": {
+              "$ref": "#/components/schemas/DomainElementResp"
+            },
+            "type": "array",
+            "title": "Payload",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "limit",
+          "offset",
+          "duration"
+        ],
+        "title": "DomainsPayloadResp"
+      },
+      "DomainsPostElementReq": {
+        "properties": {
+          "domain": {
+            "type": "string",
+            "title": "Domain name",
+            "examples": [
+              "google.com"
+            ]
+          },
+          "list_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Domains list id"
+          },
+          "ros_comment": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 3
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Router OS comment for addr-list and route",
+            "examples": [
+              "discord domain"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "domain"
+        ],
+        "title": "DomainsPostElementReq"
+      },
+      "ErrorResp": {
+        "properties": {
+          "error": {
+            "type": "string",
+            "title": "Error"
+          },
+          "resolution": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolution"
+          }
+        },
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "title": "ErrorResp"
+      },
+      "GrowthDateField": {
+        "type": "string",
+        "enum": [
+          "created_at",
+          "updated_at",
+          "last_resolved_at"
+        ],
+        "title": "GrowthDateField"
+      },
+      "GrowthEntity": {
+        "type": "string",
+        "enum": [
+          "domains",
+          "lists",
+          "ips"
+        ],
+        "title": "GrowthEntity"
+      },
+      "GrowthGranularity": {
+        "type": "string",
+        "enum": [
+          "minute",
+          "hour",
+          "day",
+          "week",
+          "month",
+          "year"
+        ],
+        "title": "GrowthGranularity"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "HealthResp": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Application status",
+            "default": "OK"
+          },
+          "ts": {
+            "type": "number",
+            "title": "Response now timestamp"
+          },
+          "uptime": {
+            "type": "number",
+            "title": "Application uptime"
+          },
+          "db_pool": {
+            "type": "string",
+            "title": "Database pool status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "ts",
+          "uptime",
+          "db_pool"
+        ],
+        "title": "HealthResp"
+      },
+      "IpsElementResp": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "type": {
+            "type": "integer",
+            "title": "Type"
+          },
+          "addr": {
+            "type": "string",
+            "title": "Addr"
+          },
+          "ip_list_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ip List Id"
+          },
+          "ip_list_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ip List Name"
+          },
+          "domain_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Domain Id"
+          },
+          "domain_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Domain Name"
+          },
+          "ros_comment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ros Comment"
+          },
+          "use_default_gw": {
+            "type": "boolean",
+            "title": "Use Default Gw",
+            "default": false
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "title": "Created At"
+          },
+          "created_at_hum": {
+            "type": "string",
+            "title": "Created At Hum"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "updated_at_hum": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At Hum"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "type",
+          "addr",
+          "created_at",
+          "created_at_hum"
+        ],
+        "title": "IpsElementResp"
+      },
+      "IpsListElementResp": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "url": {
+            "type": "string",
+            "title": "Url"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hash"
+          },
+          "attempts": {
+            "type": "integer",
+            "title": "Attempts",
+            "default": 0
+          },
+          "elements_count": {
+            "type": "integer",
+            "title": "Elements Count",
+            "default": 0
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "title": "Created At"
+          },
+          "created_at_hum": {
+            "type": "string",
+            "title": "Created At Hum"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "updated_at_hum": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At Hum"
+          },
+          "ip_v4_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ip V4 Count"
+          },
+          "ip_v6_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ip V6 Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "url",
+          "created_at",
+          "created_at_hum"
+        ],
+        "title": "IpsListElementResp"
+      },
+      "IpsListsPayloadResp": {
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset"
+          },
+          "duration": {
+            "type": "number",
+            "title": "Duration"
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count",
+            "default": 0
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "default": 0
+          },
+          "payload": {
+            "items": {
+              "$ref": "#/components/schemas/IpsListElementResp"
+            },
+            "type": "array",
+            "title": "Payload",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "limit",
+          "offset",
+          "duration"
+        ],
+        "title": "IpsListsPayloadResp"
+      },
+      "IpsListsPostElementReq": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 3,
+            "title": "IP address list name",
+            "examples": [
+              "goog.json"
+            ]
+          },
+          "url": {
+            "type": "string",
+            "minLength": 5,
+            "title": "Link to file with IP address lists",
+            "examples": [
+              "https://somedomain.som/path/path/path/goog.json"
+            ]
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 3
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description for record"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "url"
+        ],
+        "title": "IpsListsPostElementReq"
+      },
+      "IpsPayloadResp": {
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset"
+          },
+          "duration": {
+            "type": "number",
+            "title": "Duration"
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count",
+            "default": 0
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "default": 0
+          },
+          "payload": {
+            "items": {
+              "$ref": "#/components/schemas/IpsElementResp"
+            },
+            "type": "array",
+            "title": "Payload",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "limit",
+          "offset",
+          "duration"
+        ],
+        "title": "IpsPayloadResp"
+      },
+      "IpsPostElementReq": {
+        "properties": {
+          "addr": {
+            "type": "string",
+            "title": "IP address record",
+            "examples": [
+              "1.1.1.1",
+              "9.9.9.9",
+              "2001:0db8:85a3:0000:0000:8a2e:0370:7334"
+            ]
+          },
+          "list_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Linked ips list ID"
+          },
+          "domain_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Linked domain ID",
+            "description": "Linked domain ID. Default = `0`",
+            "default": 0
+          },
+          "ros_comment": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 3
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Router OS comment for addr and route",
+            "examples": [
+              "discord ip address"
+            ]
+          },
+          "use_default_gw": {
+            "type": "boolean",
+            "title": "Not use VPN gateway. Use default client router gateway",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "addr"
+        ],
+        "title": "IpsPostElementReq"
+      },
+      "NoDataResp": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status",
+            "default": "No Data"
+          }
+        },
+        "type": "object",
+        "title": "NoDataResp"
+      },
+      "NotFoundResp": {
+        "properties": {
+          "error": {
+            "type": "string",
+            "title": "Error",
+            "default": "NOT_FOUND"
+          },
+          "resolution": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolution"
+          }
+        },
+        "type": "object",
+        "title": "NotFoundResp"
+      },
+      "OkResp": {
+        "properties": {
+          "result": {
+            "type": "string",
+            "title": "Result OK",
+            "default": "OK"
+          }
+        },
+        "type": "object",
+        "title": "OkResp"
+      },
+      "RosConfigElementResp": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "host": {
+            "type": "string",
+            "title": "Host"
+          },
+          "user": {
+            "type": "string",
+            "title": "User"
+          },
+          "password": {
+            "type": "string",
+            "title": "Password"
+          },
+          "bgp_list_name": {
+            "type": "string",
+            "title": "Bgp List Name"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "title": "Created At"
+          },
+          "created_at_hum": {
+            "type": "string",
+            "title": "Created At Hum"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "updated_at_hum": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At Hum"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "host",
+          "user",
+          "password",
+          "bgp_list_name",
+          "created_at",
+          "created_at_hum"
+        ],
+        "title": "RosConfigElementResp"
+      },
+      "RosConfigPayloadResp": {
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset"
+          },
+          "duration": {
+            "type": "number",
+            "title": "Duration"
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count",
+            "default": 0
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "default": 0
+          },
+          "payload": {
+            "items": {
+              "$ref": "#/components/schemas/RosConfigElementResp"
+            },
+            "type": "array",
+            "title": "Payload",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "limit",
+          "offset",
+          "duration"
+        ],
+        "title": "RosConfigPayloadResp"
+      },
+      "RosConfigsPostElementReq": {
+        "properties": {
+          "host": {
+            "type": "string",
+            "minLength": 3,
+            "title": "RouterOS IP address or domain"
+          },
+          "user": {
+            "type": "string",
+            "minLength": 3,
+            "title": "User in RouterOS"
+          },
+          "user_password": {
+            "type": "string",
+            "minLength": 3,
+            "title": "User password. If you don't use a password, why are you doing it?"
+          },
+          "bgp_list_name": {
+            "type": "string",
+            "minLength": 3,
+            "title": "BGP list name",
+            "description": "BGP list name. Used for the list in the Firewall address list and routing table naming"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 3
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description for record"
+          }
+        },
+        "type": "object",
+        "required": [
+          "host",
+          "user",
+          "user_password",
+          "bgp_list_name"
+        ],
+        "title": "RosConfigsPostElementReq"
+      },
+      "StatsDnsData": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "description": "Total DNS server records",
+            "default": 0
+          },
+          "classic": {
+            "type": "integer",
+            "title": "Classic",
+            "description": "Classic IPv4/IPv6 DNS servers",
+            "default": 0
+          },
+          "doh": {
+            "type": "integer",
+            "title": "Doh",
+            "description": "DNS-over-HTTPS servers",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "StatsDnsData"
+      },
+      "StatsDomainsData": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "description": "Total domain records",
+            "default": 0
+          },
+          "resolved": {
+            "type": "integer",
+            "title": "Resolved",
+            "description": "Resolved domains",
+            "default": 0
+          },
+          "unresolved": {
+            "type": "integer",
+            "title": "Unresolved",
+            "description": "Unresolved domains",
+            "default": 0
+          },
+          "lists_total": {
+            "type": "integer",
+            "title": "Lists Total",
+            "description": "Total domain lists",
+            "default": 0
+          },
+          "per_list": {
+            "items": {
+              "$ref": "#/components/schemas/StatsDomainsListItem"
+            },
+            "type": "array",
+            "title": "Per List",
+            "description": "Per-list breakdown for bar chart"
+          }
+        },
+        "type": "object",
+        "title": "StatsDomainsData"
+      },
+      "StatsDomainsListItem": {
+        "properties": {
+          "list_id": {
+            "type": "integer",
+            "title": "List Id",
+            "description": "Domain list ID"
+          },
+          "list_name": {
+            "type": "string",
+            "title": "List Name",
+            "description": "Domain list name"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "description": "Total domains in this list",
+            "default": 0
+          },
+          "resolved": {
+            "type": "integer",
+            "title": "Resolved",
+            "description": "Resolved domains count",
+            "default": 0
+          },
+          "unresolved": {
+            "type": "integer",
+            "title": "Unresolved",
+            "description": "Unresolved domains count",
+            "default": 0
+          },
+          "attempts": {
+            "type": "integer",
+            "title": "Attempts",
+            "description": "Download attempts count",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "list_id",
+          "list_name"
+        ],
+        "title": "StatsDomainsListItem"
+      },
+      "StatsGrowthPoint": {
+        "properties": {
+          "date": {
+            "type": "string",
+            "title": "Date",
+            "description": "Aggregated date label (format depends on granularity)",
+            "examples": [
+              "2025-01-15",
+              "2025-03",
+              "2025-01"
+            ]
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count",
+            "description": "Number of records created in this period",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "date"
+        ],
+        "title": "StatsGrowthPoint"
+      },
+      "StatsGrowthResp": {
+        "properties": {
+          "entity": {
+            "$ref": "#/components/schemas/GrowthEntity",
+            "description": "Requested entity"
+          },
+          "granularity": {
+            "$ref": "#/components/schemas/GrowthGranularity",
+            "description": "Applied granularity"
+          },
+          "start_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Date",
+            "description": "Applied start date filter"
+          },
+          "end_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Date",
+            "description": "Applied end date filter"
+          },
+          "ip_subtype": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ip Subtype",
+            "description": "Applied IP version filter (only for entity=ips)"
+          },
+          "total_in_period": {
+            "type": "integer",
+            "title": "Total In Period",
+            "description": "Total records in the requested period",
+            "default": 0
+          },
+          "payload": {
+            "items": {
+              "$ref": "#/components/schemas/StatsGrowthPoint"
+            },
+            "type": "array",
+            "title": "Payload",
+            "description": "Time series data points. All dates in range are included, missing dates have count=0"
+          },
+          "duration": {
+            "type": "number",
+            "title": "Duration",
+            "description": "Time taken to compute the response",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "entity",
+          "granularity"
+        ],
+        "title": "StatsGrowthResp"
+      },
+      "StatsIpsData": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "description": "Total IP address records",
+            "default": 0
+          },
+          "v4_total": {
+            "type": "integer",
+            "title": "V4 Total",
+            "description": "Total IPv4 addresses",
+            "default": 0
+          },
+          "v6_total": {
+            "type": "integer",
+            "title": "V6 Total",
+            "description": "Total IPv6 addresses",
+            "default": 0
+          },
+          "linked_to_domain": {
+            "type": "integer",
+            "title": "Linked To Domain",
+            "description": "IPs resolved from domains (domain_id != 0)",
+            "default": 0
+          },
+          "standalone": {
+            "type": "integer",
+            "title": "Standalone",
+            "description": "IPs added manually (domain_id = 0)",
+            "default": 0
+          },
+          "lists_total": {
+            "type": "integer",
+            "title": "Lists Total",
+            "description": "Total IP lists",
+            "default": 0
+          },
+          "per_list": {
+            "items": {
+              "$ref": "#/components/schemas/StatsIpsListItem"
+            },
+            "type": "array",
+            "title": "Per List",
+            "description": "Per-list breakdown for bar chart"
+          }
+        },
+        "type": "object",
+        "title": "StatsIpsData"
+      },
+      "StatsIpsListItem": {
+        "properties": {
+          "list_id": {
+            "type": "integer",
+            "title": "List Id",
+            "description": "IP list ID"
+          },
+          "list_name": {
+            "type": "string",
+            "title": "List Name",
+            "description": "IP list name"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "description": "Total IPs in this list",
+            "default": 0
+          },
+          "v4_count": {
+            "type": "integer",
+            "title": "V4 Count",
+            "description": "IPv4 count",
+            "default": 0
+          },
+          "v6_count": {
+            "type": "integer",
+            "title": "V6 Count",
+            "description": "IPv6 count",
+            "default": 0
+          },
+          "attempts": {
+            "type": "integer",
+            "title": "Attempts",
+            "description": "Download attempts count",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "list_id",
+          "list_name"
+        ],
+        "title": "StatsIpsListItem"
+      },
+      "StatsResp": {
+        "properties": {
+          "generated_at": {
+            "type": "string",
+            "title": "Generated At",
+            "description": "Timestamp when aggregation was computed",
+            "examples": [
+              "2025-01-15 10:30:00"
+            ]
+          },
+          "dns": {
+            "$ref": "#/components/schemas/StatsDnsData"
+          },
+          "domains": {
+            "$ref": "#/components/schemas/StatsDomainsData"
+          },
+          "ips": {
+            "$ref": "#/components/schemas/StatsIpsData"
+          },
+          "ros": {
+            "$ref": "#/components/schemas/StatsRosData"
+          }
+        },
+        "type": "object",
+        "required": [
+          "generated_at",
+          "dns",
+          "domains",
+          "ips",
+          "ros"
+        ],
+        "title": "StatsResp",
+        "description": "Example:\n```json\n{\n  \"generated_at\": \"2025-01-15 10:30:00\",\n  \"dns\": {\n    \"total\": 5,\n    \"classic\": 3,\n    \"doh\": 2\n  },\n  \"domains\": {\n    \"total\": 1500,\n    \"resolved\": 1200,\n    \"unresolved\": 300,\n    \"lists_total\": 4,\n    \"per_list\": [\n      { \"list_id\": 1, \"list_name\": \"voice-domains\", \"total\": 500, \"resolved\": 450, \"unresolved\": 50, \"attempts\": 3 },\n      { \"list_id\": 2, \"list_name\": \"social-domains\", \"total\": 1000, \"resolved\": 750, \"unresolved\": 250, \"attempts\": 1 }\n    ]\n  },\n  \"ips\": {\n    \"total\": 2000,\n    \"v4_total\": 1800,\n    \"v6_total\": 200,\n    \"linked_to_domain\": 1500,\n    \"standalone\": 500,\n    \"lists_total\": 3,\n    \"per_list\": [\n      { \"list_id\": 1, \"list_name\": \"ips-list\", \"total\": 800, \"v4_count\": 700, \"v6_count\": 100 }\n    ]\n  },\n  \"ros\": {\n    \"total\": 2\n  }\n}\n```"
+      },
+      "StatsRosData": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "description": "Total RouterOS configurations",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "StatsRosData"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "WelcomeResp": {
+        "properties": {
+          "version": {
+            "type": "string",
+            "title": "API Version"
+          },
+          "message": {
+            "type": "string",
+            "title": "Welcome message",
+            "default": "Welcome to API"
+          },
+          "docs": {
+            "type": "string",
+            "title": "link to docs"
+          }
+        },
+        "type": "object",
+        "required": [
+          "version",
+          "docs"
+        ],
+        "title": "WelcomeResp"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Home",
+      "description": "Welcome method and healthcheck"
+    }
+  ]
+}

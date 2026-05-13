@@ -30,11 +30,13 @@ WORKDIR /ui
 RUN apk add --no-cache git
 
 # Clone UI repository
-ARG BRANCH=main
-RUN git clone --depth 1 --branch ${BRANCH} https://github.com/GregoryGost/gost-rdpr-ui.git .
+ARG UI_BRANCH=main
+ARG UI_REPO_URL=https://github.com/GregoryGost/gost-rdpr-ui.git
+RUN git clone --depth 1 --branch ${UI_BRANCH} ${UI_REPO_URL} .
 
 # Install pnpm
-RUN corepack enable && corepack prepare pnpm@latest --activate
+ARG PNPM_VERSION=10.33.2
+RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
 
 # Install dependencies
 RUN pnpm install --frozen-lockfile
@@ -62,7 +64,7 @@ WORKDIR /app
 COPY poetry.lock pyproject.toml LICENSE ./
 
 # Install Poetry and dependencies
-ARG POETRY_VERSION=2.3.4
+ARG POETRY_VERSION=2.4.1
 RUN pip install poetry==${POETRY_VERSION} --no-cache --root-user-action=ignore \
   && poetry config virtualenvs.in-project true \
   && poetry install --no-interaction --no-cache

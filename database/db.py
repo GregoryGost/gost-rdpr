@@ -165,13 +165,13 @@ class DataBase:
   async def __session_tune(self: Self, session: AsyncSession):
     # Config PRAGMA
     await session.execute(text(f'PRAGMA foreign_keys=ON')) # foreign keys support
-    await session.execute(text(f'PRAGMA temp_store = MEMORY'))
-    await session.execute(text(f'PRAGMA mmap_size = 268435456'))
-    await session.execute(text(f'PRAGMA cache_size = 10000'))
-    await session.execute(text(f'PRAGMA journal_mode={settings.db_journal_mode}'))
-    await session.execute(text(f'PRAGMA wal_autocheckpoint={settings.db_wal_autocheckpoint}'))
-    await session.execute(text(f'PRAGMA synchronous={settings.db_synchronous}'))
-    await session.execute(text(f'PRAGMA busy_timeout={settings.db_busy_timeout}'))
+    await session.execute(text(f'PRAGMA journal_mode={settings.db_tune_journal_mode}'))
+    await session.execute(text(f'PRAGMA temp_store={settings.db_tune_temp_store}'))
+    await session.execute(text(f'PRAGMA mmap_size={settings.db_tune_mmap_size}'))
+    await session.execute(text(f'PRAGMA cache_size={settings.db_tune_cache_size}'))
+    await session.execute(text(f'PRAGMA wal_autocheckpoint={settings.db_tune_wal_autocheckpoint}'))
+    await session.execute(text(f'PRAGMA synchronous={settings.db_tune_synchronous}'))
+    await session.execute(text(f'PRAGMA busy_timeout={settings.db_tune_busy_timeout}'))
     return session
 
   async def __create_tables(self: Self) -> None:
@@ -813,18 +813,37 @@ class DataBase:
     except Exception as err:
       logger.error(f'Unexpected error - Try send deleted Domains to Queue : {err}', exc_info=True)
 
-  async def get_domains_for_resolve(self: Self) -> List[DomainResult]:
-    logger.debug(f'Try get Domains for resolve ...')
+  async def get_new_domains_for_resolve(self: Self) -> List[DomainResult]:
+    logger.debug(f'Try get new domains for resolve ...')
     domains: List[DomainResult] = []
     try:
       db_session: AsyncSession = await self.__read_connect()
       # get domains for resolve
-      domains_for_resolve: Sequence[Row[Tuple[int, str, int | None, int]]] = await DomainsDbo.get_all_for_resolve(db_session=db_session)
+      domains_for_resolve: Sequence[Row[Tuple[int, str, int | None, int]]] = \
+        await DomainsDbo.get_new_for_resolve(db_session=db_session, limit=settings.domains_resolve_new_batch_size)
       domains = [DomainResult(id=domain[0], name=domain[1], list_id=domain[2]) for domain in domains_for_resolve]
-      logger.debug(f'Domains for resolve: {len(domains)}')
+      logger.debug(f'New domains for resolve: {len(domains)}')
       return domains
     except Exception as err:
-      logger.error(f'Try get Domains for resolve failed : {err}', exc_info=True)
+      logger.error(f'Try get new domains for resolve failed : {err}', exc_info=True)
+      await db_session.rollback()
+      return domains
+    finally:
+      await db_session.close()
+
+  async def get_stale_domains_for_resolve(self: Self) -> List[DomainResult]:
+    logger.debug(f'Try get stale domains for resolve ...')
+    domains: List[DomainResult] = []
+    try:
+      db_session: AsyncSession = await self.__read_connect()
+      # get domains for resolve
+      domains_for_resolve: Sequence[Row[Tuple[int, str, int | None, int]]] = \
+        await DomainsDbo.get_stale_for_resolve(db_session=db_session, limit=settings.domains_resolve_stale_batch_size)
+      domains = [DomainResult(id=domain[0], name=domain[1], list_id=domain[2]) for domain in domains_for_resolve]
+      logger.debug(f'Stale domains for resolve: {len(domains)}')
+      return domains
+    except Exception as err:
+      logger.error(f'Try get stale domains for resolve failed : {err}', exc_info=True)
       await db_session.rollback()
       return domains
     finally:
@@ -1384,13 +1403,12 @@ class DataBase:
   async def lists_load(self: Self, forced: bool) -> None:
     logger.info(f'Lists load - START {forced=}')
     try:
-      await jobs_cache.set(Jobs.LISTS_LOAD, True)
       db_session: AsyncSession = await self.__read_connect()
       domains_lists_total: int = await DomainsListsDbo.get_total(db_session=db_session)
       ips_lists_total: int = await IpsListsDbo.get_total(db_session=db_session)
       if domains_lists_total > 0:
         logger.debug(f'Load Domains lists {domains_lists_total=} ...')
-        domains_lists: List[DomainsListDto] = await DomainsListsDbo.get_for_update(db_session=db_session)
+        domains_lists: List[DomainsListDto] = await DomainsListsDbo.get_for_update(db_session=db_session, forced=forced)
         logger.debug(f'{domains_lists=}')
         await self.file_loader_client.get_domains_from_lists(lists=domains_lists)
         unactive_domains_lists: List[DomainsListDto] = [list for list in domains_lists if list.attempts >= settings.attempts_limit]
@@ -1423,7 +1441,7 @@ class DataBase:
           await self.update_domains_lists(domains_lists=active_domains_lists)
       if ips_lists_total > 0:
         logger.debug(f'Load IPs lists {ips_lists_total=} ...')
-        ips_lists: List[IpsListDto] = await IpsListsDbo.get_for_update(db_session=db_session)
+        ips_lists: List[IpsListDto] = await IpsListsDbo.get_for_update(db_session=db_session, forced=forced)
         logger.debug(f'{ips_lists=}')
         await self.file_loader_client.get_ips_from_lists(lists=ips_lists)
         unactive_ips_lists: List[IpsListDto] = [list for list in ips_lists if list.attempts >= settings.attempts_limit]

@@ -6,9 +6,11 @@ from typing import Any, Self
 from logger.logger import logger
 
 class Jobs(StrEnum):
-  LISTS_LOAD      = 'lists_load'
-  DOMAINS_RESOLVE = 'domains_resolve'
-  ROS_UPDATE      = 'ros_update'
+  LISTS_LOAD            = 'lists_load'
+  DOMAINS_RESOLVE   = 'domains_resolve' # for check job
+  DOMAINS_RESOLVE_NEW   = 'domains_resolve_new'
+  DOMAINS_RESOLVE_STALE = 'domains_resolve_stale'
+  ROS_UPDATE            = 'ros_update'
 
 class Cache():
   '''
