@@ -68,7 +68,9 @@ class AppServer:
     # first RUN BEFORE start FastAPI
     # Cache init
     await jobs_cache.set(key=Jobs.LISTS_LOAD, value=False)
+    await jobs_cache.set(key=Jobs.DOMAINS_RESOLVE, value=False)
     await jobs_cache.set(key=Jobs.DOMAINS_RESOLVE_NEW, value=False)
+    await jobs_cache.set(key=Jobs.DOMAINS_RESOLVE_STALE, value=False)
     await jobs_cache.set(key=Jobs.ROS_UPDATE, value=False)
     # Init DB
     await db.setup()

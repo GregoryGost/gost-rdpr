@@ -47,7 +47,7 @@ class CommandsRouter(BaseRouter):
       logger.debug(f'Call API route: POST /commands/lists/load')
       try:
         job_status: bool | None = await jobs_cache.get(Jobs.LISTS_LOAD)
-        if job_status != True or query.forced == True:
+        if job_status != True:
           background_tasks.add_task(db.lists_load, query.forced)
         else:
           return JSONResponse(
@@ -71,7 +71,7 @@ class CommandsRouter(BaseRouter):
     async def domains_resolve_new_command(background_tasks: BackgroundTasks) -> JSONResponse:
       logger.debug(f'Call API route: POST /commands/domains/resolve/new')
       try:
-        job_status: bool | None = await jobs_cache.get(Jobs.DOMAINS_RESOLVE_NEW)
+        job_status: bool | None = await jobs_cache.get(Jobs.DOMAINS_RESOLVE)
         if job_status != True:
           # default - Jobs.DOMAINS_RESOLVE_NEW
           background_tasks.add_task(
@@ -80,7 +80,7 @@ class CommandsRouter(BaseRouter):
           )
         else:
           return JSONResponse(
-            OkResp(result=f'Job [{Jobs.DOMAINS_RESOLVE_NEW}] is now active').to_dict(),
+            OkResp(result=f'Job [{Jobs.DOMAINS_RESOLVE}] is now active').to_dict(),
             status.HTTP_200_OK
           )
         return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
@@ -99,7 +99,7 @@ class CommandsRouter(BaseRouter):
     async def domains_resolve_stale_command(background_tasks: BackgroundTasks) -> JSONResponse:
       logger.debug(f'Call API route: POST /commands/domains/resolve/stale')
       try:
-        job_status: bool | None = await jobs_cache.get(Jobs.DOMAINS_RESOLVE_STALE)
+        job_status: bool | None = await jobs_cache.get(Jobs.DOMAINS_RESOLVE)
         if job_status != True:
           background_tasks.add_task(
             self.domains_resolver.domains_resolve,
@@ -107,7 +107,7 @@ class CommandsRouter(BaseRouter):
           )
         else:
           return JSONResponse(
-            OkResp(result=f'Job [{Jobs.DOMAINS_RESOLVE_STALE}] is now active').to_dict(),
+            OkResp(result=f'Job [{Jobs.DOMAINS_RESOLVE}] is now active').to_dict(),
             status.HTTP_200_OK
           )
         return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)

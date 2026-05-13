@@ -108,7 +108,7 @@ class HomeRouter(BaseRouter):
           domains_filtered_min_len=settings.domains_filtered_min_len,
           domains_update_interval=settings.domains_update_interval,
           # domains_one_job_resolve_limit=settings.domains_one_job_resolve_limit,
-          domain_resolve_semaphore_limit=settings.domain_resolve_semaphore_limit,
+          domain_resolve_semaphore_limit=settings.domains_resolve_semaphore_limit,
           domains_black_list=settings.domains_black_list,
           lists_update_interval_sec=settings.lists_update_interval_sec,
           ip_not_allowed=settings.ip_not_allowed,

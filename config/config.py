@@ -69,7 +69,7 @@ class Settings(BaseSettings):
   domains_update_interval: int = Field(default=172800) # default 2 days
   domains_resolve_new_batch_size: int = Field(default=500)
   domains_resolve_stale_batch_size: int = Field(default=2000)
-  domain_resolve_semaphore_limit: int = Field(default=20)
+  domains_resolve_semaphore_limit: int = Field(default=20)
   domains_black_list: str = Field(default='')
   # Lists section
   lists_update_interval_sec: int = Field(default=604800) # default 7 days
