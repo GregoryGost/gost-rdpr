@@ -38,3 +38,6 @@ class HttpClient:
       timeout=self.timeout
     )
     self.client.event_hooks['response'] = [self.metrics.async_metric_hook]
+
+  async def close(self) -> None:
+    await self.client.aclose()

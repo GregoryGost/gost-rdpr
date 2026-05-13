@@ -41,7 +41,7 @@ class HttpxMetrics:
   exceptions: Counter = Counter(
     name='httpx_exceptions_total',
     documentation='Total count of exceptions raised by path and exception type',
-    labelnames=['method', 'host', 'path', 'status_code', 'error', 'detail', 'app_name']
+    labelnames=['method', 'host', 'path', 'status_code', 'error', 'app_name']
   )
   '''EXCEPTIONS'''
 
@@ -88,6 +88,5 @@ class HttpxMetrics:
         path=path,
         status_code=status_code,
         error=error,
-        detail=detail,
         app_name=self.app_name
       ).inc()

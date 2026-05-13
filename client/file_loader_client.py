@@ -19,21 +19,12 @@ class FileLoaderClient:
   def __init__(self: Self):
     logger.debug(f'{self.__class__.__name__} init ...')
 
-  # Get HASH SHA2(256) for string or bytes
-  def __get_hash(self: Self, content: bytes | str) -> str:
-    hasher = sha256()
-    if isinstance(content, str):
-      content_bytes: bytes = content.encode('utf-8')
-    else:
-      content_bytes: bytes = content
-    hasher.update(content_bytes)
-    return hasher.hexdigest().upper()
-
   async def get_domains_from_lists(self: Self, lists: List[DomainsListDto]) -> None:
     logger.debug(f'Try download domains lists: {lists=} ...')
     try:
       for file in lists:
         found_elements: Set[str] = set()
+        hasher = sha256()
         try:
           # checking if a file exists without downloading its contents
           head_response: Response = await self.__client.head(url=file.url)
@@ -41,19 +32,26 @@ class FileLoaderClient:
             # If the file does not exist, update attempts: + 1
             file.attempts = file.attempts + 1
             continue
-          response: Response = await self.__client.get(url=file.url)
-          response.raise_for_status()
-          hash: str = self.__get_hash(content=response.content)
-          if hash == file.hash: continue # skip if hashes are equal
-          async for line in response.aiter_lines():
-            found_domains: list[str] = self.__domains_pattern.findall(line)
-            found_elements.update(found_domains)
+          #
+          async with self.__client.stream(method='GET', url=file.url) as response:
+            response.raise_for_status()
+            #
+            async for line in response.aiter_lines():
+              line_bytes: bytes = line.encode('utf-8', errors='ignore')
+              hasher.update(line_bytes)
+              hasher.update(b'\n')
+              #
+              found_domains: list[str] = self.__domains_pattern.findall(line)
+              found_elements.update(found_domains)
+          hash: str = hasher.hexdigest().upper()
+          if hash == file.hash:
+            continue
           if len(found_elements) == 0:
             file.found_elements = None
             continue
-          logger.debug(f'Domains count in file "{file.name}" found_elements count={len(found_elements)} found_elements {hash=}')
           file.hash = hash
           file.found_elements = found_elements
+          logger.debug(f'Domains count in file "{file.name}" found_elements count={len(found_elements)} found_elements {hash=}')
         except Exception as err:
           logger.error(f'Download domains lists file "{file.name}" error: [{err.__class__.__name__}] {err}')
           continue
@@ -67,6 +65,7 @@ class FileLoaderClient:
     try:
       for file in lists:
         found_elements: Set[str] = set()
+        hasher = sha256()
         try:
           # checking if a file exists without downloading its contents
           head_response: Response = await self.__client.head(url=file.url)
@@ -74,21 +73,26 @@ class FileLoaderClient:
             # If the file does not exist, update attempts: + 1
             file.attempts = file.attempts + 1
             continue
-          # If the file exists, we begin processing it line by line
-          response: Response = await self.__client.get(url=file.url)
-          response.raise_for_status()
-          hash: str = self.__get_hash(content=response.content)
-          if hash == file.hash: continue # skip if hashes are equal
-          async for line in response.aiter_lines():
-            found_ips: List[Tuple[str, str]] = [(element[0], element[6]) for element in self.__ips_pattern.findall(line)]
-            found_elements.update([entry[0] for entry in found_ips if entry[0] != None and entry[0] != '']) #ipv4
-            found_elements.update([entry[1] for entry in found_ips if entry[1] != None and entry[1] != '']) #ipv6
+          async with self.__client.stream(method='GET', url=file.url) as response:
+            response.raise_for_status()
+            #
+            async for line in response.aiter_lines():
+              line_bytes: bytes = line.encode('utf-8', errors='ignore')
+              hasher.update(line_bytes)
+              hasher.update(b'\n')
+              #
+              found_ips: List[Tuple[str, str]] = [(element[0], element[6]) for element in self.__ips_pattern.findall(line)]
+              found_elements.update([entry[0] for entry in found_ips if entry[0] != None and entry[0] != '']) #ipv4
+              found_elements.update([entry[1] for entry in found_ips if entry[1] != None and entry[1] != '']) #ipv6
+          hash: str = hasher.hexdigest().upper()
+          if hash == file.hash:
+            continue
           if len(found_elements) == 0:
             file.found_elements = None
             continue
-          logger.debug(f'Ips address count in file "{file.name}" found_elements count={len(found_elements)} found_elements {hash=}')
           file.hash = hash
           file.found_elements = found_elements
+          logger.debug(f'Ips address count in file "{file.name}" found_elements count={len(found_elements)} found_elements {hash=}')
         except Exception as err:
           logger.error(f'Download ips lists file "{file.name}" error: [{err.__class__.__name__}] {err}')
           continue

@@ -11,14 +11,14 @@ homepage = "https://gregory-gost.ru"
 repository = "https://github.com/GregoryGost/gost-rdpr"
 requires-python = ">=3.13"
 dependencies = [
-    "fastapi (>=0.122.0,<0.123.0)",
+    "fastapi (>=0.136.1,<0.137.0)",
     "sqlalchemy (>=2.0.44,<3.0.0)",
-    "aiosqlite (>=0.21.0,<0.22.0)",
+    "aiosqlite (>=0.22.1,<0.23.0)",
     "dnspython (>=2.8.0,<3.0.0)",
-    "uvicorn (>=0.38.0,<0.39.0)",
+    "uvicorn (>=0.46.0,<0.47.0)",
     "httpx (>=0.28.1,<0.29.0)",
     "pydantic-settings (>=2.12.0,<3.0.0)",
-    "opentelemetry-exporter-prometheus (>=0.59b0,<0.60)",
+    "opentelemetry-exporter-prometheus (>=0.62b1,<0.63)",
     "cashews (>=7.4.3,<8.0.0)",
     "toml (>=0.10.2,<0.11.0)",
 ]

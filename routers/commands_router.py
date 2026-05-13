@@ -47,7 +47,7 @@ class CommandsRouter(BaseRouter):
       logger.debug(f'Call API route: POST /commands/lists/load')
       try:
         job_status: bool | None = await jobs_cache.get(Jobs.LISTS_LOAD)
-        if (job_status != None and job_status == False) or query.forced == True:
+        if job_status != True or query.forced == True:
           background_tasks.add_task(db.lists_load, query.forced)
         else:
           return JSONResponse(
@@ -60,23 +60,54 @@ class CommandsRouter(BaseRouter):
 
     # /domains/resolve
     @router.post(
-      path='/domains/resolve',
-      name='Resolve domains',
-      description='Start background task for resolve all domains',
+      path='/domains/resolve/new',
+      name='Resolve new domains',
+      description='Start background task for resolve only new domains. It can be done more often',
       response_model=OkResp,
       responses={
         status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp},
       }
     )
-    async def domains_resolve_command(background_tasks: BackgroundTasks) -> JSONResponse:
-      logger.debug(f'Call API route: POST /commands/domains/resolve')
+    async def domains_resolve_new_command(background_tasks: BackgroundTasks) -> JSONResponse:
+      logger.debug(f'Call API route: POST /commands/domains/resolve/new')
       try:
-        job_status: bool | None = await jobs_cache.get(Jobs.DOMAINS_RESOLVE)
-        if job_status != None and job_status == False:
-          background_tasks.add_task(self.domains_resolver.domains_resolve)
+        job_status: bool | None = await jobs_cache.get(Jobs.DOMAINS_RESOLVE_NEW)
+        if job_status != True:
+          # default - Jobs.DOMAINS_RESOLVE_NEW
+          background_tasks.add_task(
+            self.domains_resolver.domains_resolve,
+            Jobs.DOMAINS_RESOLVE_NEW
+          )
         else:
           return JSONResponse(
-            OkResp(result=f'Job [{Jobs.DOMAINS_RESOLVE}] is now active').to_dict(),
+            OkResp(result=f'Job [{Jobs.DOMAINS_RESOLVE_NEW}] is now active').to_dict(),
+            status.HTTP_200_OK
+          )
+        return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
+      except Exception as err:
+        return self.errorResp(err)
+      
+    @router.post(
+      path='/domains/resolve/stale',
+      name='Resolve stale domains',
+      description='Start background task for resolve stale domains. This should be done rarely because there are many such domains',
+      response_model=OkResp,
+      responses={
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp},
+      }
+    )
+    async def domains_resolve_stale_command(background_tasks: BackgroundTasks) -> JSONResponse:
+      logger.debug(f'Call API route: POST /commands/domains/resolve/stale')
+      try:
+        job_status: bool | None = await jobs_cache.get(Jobs.DOMAINS_RESOLVE_STALE)
+        if job_status != True:
+          background_tasks.add_task(
+            self.domains_resolver.domains_resolve,
+            Jobs.DOMAINS_RESOLVE_STALE
+          )
+        else:
+          return JSONResponse(
+            OkResp(result=f'Job [{Jobs.DOMAINS_RESOLVE_STALE}] is now active').to_dict(),
             status.HTTP_200_OK
           )
         return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
