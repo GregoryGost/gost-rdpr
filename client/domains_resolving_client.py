@@ -45,7 +45,7 @@ class DomainsResolver:
   __lookup_types: tuple[Literal[RdataType.A]] = (A, ) # (A, AAAA)
   __semaphore: Semaphore = Semaphore(settings.domains_resolve_semaphore_limit)
 
-  __http_client: AsyncClient = HttpClient().get_client('domains_resolver')
+  __http_client: AsyncClient = HttpClient.get_client('domains_resolver')
 
   domains_resolve_queue: Queue[DomainResult] = Queue(maxsize=settings.queue_max_size)
 

@@ -16,13 +16,11 @@ class HttpClient:
   __metrics: HttpxMetrics = HttpxMetrics()
   __clients: dict[str, AsyncClient] = {}
 
-  def __init__(self: Self) -> None:
-    logging.getLogger('httpx').setLevel(Logger.LOGGER_LEVEL[settings.httpx_log_level])
-
   @classmethod
   def get_client(cls: type[Self], name: str = 'default', timeout: Timeout | None = None) -> AsyncClient:
     if name in cls.__clients:
       return cls.__clients[name]
+    logging.getLogger('httpx').setLevel(Logger.LOGGER_LEVEL[settings.httpx_log_level])
     # Common
     limits: Limits = Limits(
       max_connections=settings.req_max_connections,

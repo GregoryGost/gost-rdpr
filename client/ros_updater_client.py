@@ -44,7 +44,7 @@ class RosClient:
     connect=settings.req_timeout_connect,
     read=settings.ros_rest_api_read_timeout
   )
-  __client: AsyncClient = HttpClient().get_client('ros', timeout=__timeout)
+  __client: AsyncClient = HttpClient.get_client('ros', timeout=__timeout)
   __fw_strict_addr_list_postfix: str = 'strict'
 
   def __init__(self: Self) -> None:
