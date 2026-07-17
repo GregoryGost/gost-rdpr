@@ -4,7 +4,7 @@
     "title": "GOST-RDPR (Resolve Domains Per Records)",
     "summary": "A utility for working with Mikrotik RouterOS and BGP protocol for announcing IP addresses",
     "description": "The utility provides parsing of domain names into IP addresses, processing of domain lists and their \n    subsequent parsing, processing of individual IP addresses and summarized IP groups. Updates firewall address list \n    and routing table",
-    "version": "2.0.9"
+    "version": "2.1.0"
   },
   "paths": {
     "/metrics": {
@@ -1626,6 +1626,121 @@
                 }
               }
             }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/domains/resolve/check": {
+      "post": {
+        "tags": [
+          "Domains"
+        ],
+        "summary": "Resolve Domain Once",
+        "description": "Resolve a domain using configured DNS servers without saving the result to the database",
+        "operationId": "Resolve_domain_once_domains_resolve_check_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DomainResolveReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainResolveResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/domains/{id}/resolve": {
+      "post": {
+        "tags": [
+          "Domains"
+        ],
+        "summary": "Resolve Domain Now",
+        "operationId": "resolve_domain_now_domains__id__resolve_post",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "title": "Id"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundResp"
+                }
+              }
+            },
+            "description": "Not Found"
           },
           "500": {
             "content": {
@@ -4043,6 +4158,45 @@
         "type": "object",
         "title": "DnsPostElementReq"
       },
+      "DnsServerResolveResultResp": {
+        "properties": {
+          "server": {
+            "type": "string",
+            "title": "Server"
+          },
+          "server_type": {
+            "type": "string",
+            "title": "Server Type"
+          },
+          "ips_v4": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Ips V4"
+          },
+          "ips_v6": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Ips V6"
+          },
+          "cnames": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Cnames"
+          }
+        },
+        "type": "object",
+        "required": [
+          "server",
+          "server_type"
+        ],
+        "title": "DnsServerResolveResultResp"
+      },
       "DomainElementResp": {
         "properties": {
           "id": {
@@ -4182,6 +4336,64 @@
           "created_at_hum"
         ],
         "title": "DomainElementResp"
+      },
+      "DomainResolveReq": {
+        "properties": {
+          "domain": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 253,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Domain name",
+            "description": "Domain name for one-time resolving without saving to database",
+            "examples": [
+              "example.com"
+            ]
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Existing domain ID",
+            "examples": [
+              123
+            ]
+          }
+        },
+        "type": "object",
+        "title": "DomainResolveReq"
+      },
+      "DomainResolveResp": {
+        "properties": {
+          "domain": {
+            "type": "string",
+            "title": "Domain"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/DnsServerResolveResultResp"
+            },
+            "type": "array",
+            "title": "Results"
+          }
+        },
+        "type": "object",
+        "required": [
+          "domain"
+        ],
+        "title": "DomainResolveResp"
       },
       "DomainsListElementResp": {
         "properties": {

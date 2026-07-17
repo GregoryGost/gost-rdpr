@@ -190,7 +190,24 @@ class DomainsRouter(BaseRouter):
     async def resolve_domain_once(data: Annotated[DomainResolveReq, Body()]) -> JSONResponse:
       logger.debug('Call API route: POST /domains/resolve/check')
       try:
-        result: CheckDomainResultDto = await self.__domains_resolver.resolve_once(domain_name=data.domain)
+        domain_name: str | None = data.domain
+        #
+        if data.id is not None:
+          domain_record: DomainElementResp | None = await db.get_domain_on_id(id=data.id)
+          if domain_record is None:
+            not_found_resp: NotFoundResp = NotFoundResp(
+              resolution=f"Domain with ID '{data.id}' not found in local db"
+            )
+            return JSONResponse(
+              content=not_found_resp.to_dict(),
+              status_code=status.HTTP_404_NOT_FOUND
+            )
+          logger.debug(f'Domain found on ID={data.id} for single resolve. Domain name={domain_record.name}')
+          domain_name = domain_record.name
+        if domain_name is None:
+          raise ValueError('Domain name is not defined')
+        #
+        result: CheckDomainResultDto = await self.__domains_resolver.resolve_once(domain_name=domain_name)
         return_data: DomainResolveResp = DomainResolveResp(
           domain=result.domain,
           results=[
