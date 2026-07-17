@@ -1,5 +1,6 @@
 from os import getpid
 from time import perf_counter
+from fastapi.routing import iter_route_contexts
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import Response
@@ -63,10 +64,10 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
 
   @staticmethod
   def get_path(request: Request) -> Tuple[str, bool]:
-    for route in request.app.routes:
-      match, child_scope = route.matches(request.scope)
+    for route in iter_route_contexts(request.app.routes):
+      match, _ = route.matches(request.scope)
       if match == Match.FULL:
-        return route.path, True
+        return route.path or request.url.path, True
     return request.url.path, False
   
   async def dispatch(self: Self, request: Request, call_next: RequestResponseEndpoint) -> Response:

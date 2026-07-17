@@ -1,3 +1,4 @@
+from pydantic import Field
 from typing import Optional, List
 
 from .base import Base, BasePayloadResp
@@ -21,3 +22,16 @@ class DomainsPayloadResp(BasePayloadResp):
   total_resolved: int = 0
   total_query: int = 0
   payload: List[DomainElementResp] = []
+
+class DnsServerResolveResultResp(Base):
+  server: str
+  server_type: str
+  ips_v4: List[str] = Field(default_factory=list)
+  ips_v6: List[str] = Field(default_factory=list)
+  cnames: List[str] = Field(default_factory=list)
+
+class DomainResolveResp(Base):
+  domain: str
+  results: List[DnsServerResolveResultResp] = Field(
+    default_factory=list
+  )

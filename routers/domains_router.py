@@ -5,15 +5,18 @@ from typing import Annotated, Self, List, Dict
 
 from logger.logger import logger
 from database.db import db
+from client.domains_resolving_client import DomainsResolver
 
 from .base_router import BaseRouter
 
+#
+from models.dto.domains_dto import CheckDomainResultDto
 # base
 from models.http.base import ErrorResp, NotFoundResp, NoDataResp, OkResp
 # request models
-from models.http.domains_req import DomainsQueryReq, DomainsSearchQueryReq, DomainsPostElementReq
+from models.http.domains_req import DomainsQueryReq, DomainsSearchQueryReq, DomainsPostElementReq, DomainResolveReq
 # response models
-from models.http.domains_resp import DomainsPayloadResp, DomainElementResp
+from models.http.domains_resp import DomainsPayloadResp, DomainElementResp, DomainResolveResp, DnsServerResolveResultResp
 
 class DomainsRouter(BaseRouter):
 
@@ -28,6 +31,8 @@ class DomainsRouter(BaseRouter):
       }
     ]
   ]
+
+  __domains_resolver: DomainsResolver = DomainsResolver()
 
   def __init__(self: Self) -> None:
     self.router: APIRouter = APIRouter(
@@ -169,6 +174,37 @@ class DomainsRouter(BaseRouter):
       try:
         background_tasks.add_task(db.put_delete_domains_to_queue)
         return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
+      except Exception as err:
+        return self.errorResp(err)
+
+    # single domain test resolver
+    @router.post(
+      path='/resolve/check',
+      name='Resolve domain once',
+      description='Resolve a domain using configured DNS servers without saving the result to the database',
+      response_model=DomainResolveResp,
+      responses={
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
+      }
+    )
+    async def resolve_domain_once(data: Annotated[DomainResolveReq, Body()]) -> JSONResponse:
+      logger.debug('Call API route: POST /domains/resolve/check')
+      try:
+        result: CheckDomainResultDto = await self.__domains_resolver.resolve_once(domain_name=data.domain)
+        return_data: DomainResolveResp = DomainResolveResp(
+          domain=result.domain,
+          results=[
+            DnsServerResolveResultResp(
+              server=item.server,
+              server_type=item.server_type,
+              ips_v4=item.ips_v4,
+              ips_v6=item.ips_v6,
+              cnames=item.cnames
+            )
+            for item in result.results
+          ]
+        )
+        return JSONResponse(content=return_data.to_dict(), status_code=status.HTTP_200_OK)
       except Exception as err:
         return self.errorResp(err)
 

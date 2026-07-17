@@ -16,9 +16,7 @@ class MetricsRouter(BaseRouter):
   '''
 
   def __init__(self: Self) -> None:
-    self.router: APIRouter = APIRouter(
-      tags=[self.tags.metrics_tag.name]
-    )
+    self.router: APIRouter = APIRouter(tags=[self.tags.metrics_tag.name])
     logger.info('MetricsRouter init')
 
   def get_router(self: Self) -> APIRouter:

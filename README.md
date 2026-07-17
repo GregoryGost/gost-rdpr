@@ -234,8 +234,7 @@ poetry add cashews
 or upgrade libs (not recomend)
 
 ```sh
-poetry update
-poetry update fastapi
+poetry add "fastapi^0.139.2"
 ```
 
 Get tree all modules

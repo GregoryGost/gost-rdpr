@@ -31,7 +31,7 @@ from utils.utils import get_ip_version
 
 from models.http.domains_req import DomainsPostElementReq
 
-from models.dto.domains_dto import DomainResult
+from models.dto.domains_dto import DomainResult, CheckDomainResultDto, DnsServerResolveResultDto
 from models.dto.dns_server_dto import DnsServerDto
 from models.dto.ip_record_dto import IpRecordDto
 
@@ -267,6 +267,72 @@ class DomainsResolver:
       except Exception as err:
         logger.error(f'[{err.__class__.__name__}] : __cname_default_resolver : {err}')
 
+  async def __resolve_once_default_server(self: Self, domain_name: str, dns_server: DnsServerDto) -> DnsServerResolveResultDto:
+    domain: DomainResult = DomainResult(
+      id=0,
+      name=domain_name
+    )
+    cname_domains: List[DomainsPostElementReq] = []
+    tasks: list[CoroutineType] = [
+      self.__default_resolver(
+        domain=domain,
+        dns_server=dns_server,
+        lookup_type=lookup_type
+      )
+      for lookup_type in self.__lookup_types
+    ]
+    tasks.append(
+      self.__cname_default_resolver(
+        domain=domain,
+        dns_server=dns_server,
+        cname_domains=cname_domains
+      )
+    )
+    await gather(*tasks)
+    return DnsServerResolveResultDto(
+      server=dns_server.server,
+      server_type='classic',
+      ips_v4=domain.result.A,
+      ips_v6=domain.result.AAAA,
+      cnames=[
+        cname.domain
+        for cname in cname_domains
+      ]
+    )
+  
+  async def __resolve_once_doh_server(self: Self, domain_name: str, doh_server: DnsServerDto) -> DnsServerResolveResultDto:
+    domain: DomainResult = DomainResult(
+      id=0,
+      name=domain_name
+    )
+    cname_domains: List[DomainsPostElementReq] = []
+    tasks: list[CoroutineType] = [
+      self.__doh_resolver(
+        domain=domain,
+        dns_server=doh_server,
+        lookup_type=lookup_type
+      )
+      for lookup_type in self.__lookup_types
+    ]
+    tasks.append(
+      self.__cname_doh_resolver(
+        domain=domain,
+        dns_server=doh_server,
+        cname_domains=cname_domains
+      )
+    )
+    await gather(*tasks)
+    return DnsServerResolveResultDto(
+      server=doh_server.server,
+      server_type='doh',
+      ips_v4=domain.result.A,
+      ips_v6=domain.result.AAAA,
+      cnames=[
+        cname.domain
+        for cname in cname_domains
+      ]
+    )
+
   # IPS
 
   async def __ips_processing(self: Self, domain: DomainResult, current_ips: List[IpRecordDto]) -> None:
@@ -335,3 +401,41 @@ class DomainsResolver:
     finally:
       await jobs_cache.set(job_mode, False)
       await jobs_cache.set(Jobs.DOMAINS_RESOLVE, False)
+
+  async def resolve_once(self: Self, domain_name: str) -> CheckDomainResultDto:
+    name: str = domain_name.strip().rstrip('.')
+    if not name:
+      raise ValueError('Domain name must not be empty')
+    domain: DomainResult = DomainResult(
+      id=0,
+      name=name
+    )
+    default_dns_servers, doh_dns_servers = await db.get_dns_servers_for_resolve()
+    #
+    tasks: list[CoroutineType] = []
+    #
+    for dns_server in default_dns_servers:
+      tasks.append(
+        self.__resolve_once_default_server(
+          domain_name=name,
+          dns_server=dns_server
+        )
+      )
+    for dns_server in doh_dns_servers:
+      tasks.append(
+        self.__resolve_once_doh_server(
+          domain_name=name,
+          doh_server=dns_server
+        )
+      )
+    if not tasks:
+      raise RuntimeError('DNS servers for resolve not found')
+    #
+    results: list[DnsServerResolveResultDto] = list(
+      await gather(*tasks)
+    )
+    #
+    return CheckDomainResultDto(
+      domain=name,
+      results=results
+    )
