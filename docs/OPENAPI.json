@@ -4158,6 +4158,10 @@
         "type": "object",
         "title": "DnsPostElementReq"
       },
+      "DnsServerId": {
+        "type": "integer",
+        "minimum": 0
+      },
       "DnsServerResolveResultResp": {
         "properties": {
           "server": {
@@ -4369,6 +4373,29 @@
             "title": "Existing domain ID",
             "examples": [
               123
+            ]
+          },
+          "dns_server_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/DnsServerId"
+                },
+                "type": "array",
+                "minItems": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "DNS server IDs",
+            "description": "Use only specified DNS servers. If omitted, all configured DNS servers are used",
+            "examples": [
+              [
+                1,
+                2,
+                5
+              ]
             ]
           }
         },
