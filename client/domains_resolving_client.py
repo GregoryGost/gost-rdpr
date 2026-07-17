@@ -30,6 +30,7 @@ from client.http_base_client import HttpClient
 from utils.utils import get_ip_version
 
 from models.http.domains_req import DomainsPostElementReq
+from models.http.domains_resp import DomainElementResp
 
 from models.dto.domains_dto import DomainResult, CheckDomainResultDto, DnsServerResolveResultDto
 from models.dto.dns_server_dto import DnsServerDto
@@ -439,3 +440,36 @@ class DomainsResolver:
       domain=name,
       results=results
     )
+
+  async def resolve_stored_domain(self: Self, domain_id: int) -> None:
+    logger.info(f'Immediate resolving stored domain ID={domain_id} - START')
+    try:
+      domain_record: DomainElementResp | None = await db.get_domain_on_id(id=domain_id)
+      if domain_record is None:
+        logger.warning(f'Domain ID={domain_id} not found for resolving')
+        return
+      domain: DomainResult = DomainResult(
+        id=domain_record.id,
+        name=domain_record.name,
+        list_id=domain_record.domains_list_id
+      )
+      #
+      default_dns, doh_dns = await db.get_dns_servers_for_resolve()
+      if not default_dns and not doh_dns:
+        raise RuntimeError('DNS servers for resolve not found')
+      #
+      cname_domains: List[DomainsPostElementReq] = await self.__dns_cname_tasker(
+        domain=domain,
+        default_dns_servers=default_dns,
+        doh_dns_servers=doh_dns
+      )
+      if cname_domains:
+        await db.put_add_domains_to_queue(domains=cname_domains)
+      #
+      await self.__dns_main_tasker(
+        domain=domain,
+        default_dns_servers=default_dns,
+        doh_dns_servers=doh_dns
+      )
+    except Exception as err:
+      logger.error(f'Resolving domain ID={domain_id} failed: [{err.__class__.__name__}]: {err}', exc_info=True)

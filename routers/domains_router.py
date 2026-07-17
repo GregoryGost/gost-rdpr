@@ -10,7 +10,7 @@ from client.domains_resolving_client import DomainsResolver
 from .base_router import BaseRouter
 
 #
-from models.dto.domains_dto import CheckDomainResultDto
+from models.dto.domains_dto import CheckDomainResultDto, DomainResult
 # base
 from models.http.base import ErrorResp, NotFoundResp, NoDataResp, OkResp
 # request models
@@ -207,5 +207,25 @@ class DomainsRouter(BaseRouter):
         return JSONResponse(content=return_data.to_dict(), status_code=status.HTTP_200_OK)
       except Exception as err:
         return self.errorResp(err)
+      
+    # resolve and save single domain
+    @router.post(
+      path='/{id}/resolve',
+      response_model=OkResp,
+      status_code=status.HTTP_202_ACCEPTED,
+      responses={
+        status.HTTP_404_NOT_FOUND: {'model': NotFoundResp},
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
+      }
+    )
+    async def resolve_domain_now(id: Annotated[int, Path(gt=0)], background_tasks: BackgroundTasks) -> JSONResponse:
+      background_tasks.add_task(
+        self.__domains_resolver.resolve_stored_domain,
+        id
+      )
+      return JSONResponse(
+        OkResp(result='Domain resolving accepted').to_dict(),
+        status.HTTP_202_ACCEPTED
+      )
 
     return router
