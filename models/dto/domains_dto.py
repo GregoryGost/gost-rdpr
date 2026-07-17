@@ -51,3 +51,16 @@ class DomainResult:
     for ip_record in ips:
       if ip_record.id != None:
         self.insert.ips_delete.append(ip_record.id)
+
+@dataclass
+class DnsServerResolveResultDto:
+  server: str
+  server_type: str
+  ips_v4: List[str] = field(default_factory=list)
+  ips_v6: List[str] = field(default_factory=list)
+  cnames: List[str] = field(default_factory=list)
+
+@dataclass
+class CheckDomainResultDto:
+  domain: str
+  results: List[DnsServerResolveResultDto] = field(default_factory=list)
