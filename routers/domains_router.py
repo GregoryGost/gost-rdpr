@@ -10,13 +10,19 @@ from client.domains_resolving_client import DomainsResolver
 from .base_router import BaseRouter
 
 #
-from models.dto.domains_dto import CheckDomainResultDto, DomainResult
+from models.dto.domains_dto import CheckDomainResultDto
 # base
 from models.http.base import ErrorResp, NotFoundResp, NoDataResp, OkResp
 # request models
 from models.http.domains_req import DomainsQueryReq, DomainsSearchQueryReq, DomainsPostElementReq, DomainResolveReq
 # response models
-from models.http.domains_resp import DomainsPayloadResp, DomainElementResp, DomainResolveResp, DnsServerResolveResultResp
+from models.http.domains_resp import (
+  DomainsPayloadResp,
+  DomainElementResp,
+  DomainResolveResp,
+  DnsServerResolveResultResp
+)
+from models.http.dns_servers_resp import DnsElementResp
 
 class DomainsRouter(BaseRouter):
 
@@ -206,8 +212,27 @@ class DomainsRouter(BaseRouter):
           domain_name = domain_record.name
         if domain_name is None:
           raise ValueError('Domain name is not defined')
+        # DNS server
+        selected_dns_servers: List[DnsElementResp] | None = None
+        if data.dns_server_ids is not None:
+          selected_dns_servers = []
+          for dns_server_id in data.dns_server_ids:
+            dns_server: DnsElementResp | None =  await db.get_dns_server_on_id(id=dns_server_id)
+            if dns_server is None:
+              not_found_resp: NotFoundResp = NotFoundResp(
+                resolution=f"DNS server ID '{dns_server_id}' not found in local db"
+              )
+              return JSONResponse(
+                content=not_found_resp.to_dict(),
+                status_code=status.HTTP_404_NOT_FOUND
+              )
+            selected_dns_servers.append(dns_server)
+          logger.debug(f'DNS servers found on IDs={data.dns_server_ids} for single domain={domain_name} resolve')
         #
-        result: CheckDomainResultDto = await self.__domains_resolver.resolve_once(domain_name=domain_name)
+        result: CheckDomainResultDto = await self.__domains_resolver.resolve_once(
+          domain_name=domain_name,
+          selected_dns_servers=selected_dns_servers
+        )
         return_data: DomainResolveResp = DomainResolveResp(
           domain=result.domain,
           results=[

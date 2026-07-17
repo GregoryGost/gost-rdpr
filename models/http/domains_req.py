@@ -32,6 +32,8 @@ class DomainsPostElementReq(BaseModel):
     examples=['discord domain']
   )] = None
 
+type DnsServerId = Annotated[int, Field(ge=0)]
+
 class DomainResolveReq(BaseModel):
   domain: Annotated[Optional[str], Field(
     title='Domain name',
@@ -45,6 +47,12 @@ class DomainResolveReq(BaseModel):
     gt=0,
     examples=[123]
   )] = None
+  dns_server_ids: Annotated[Optional[list[DnsServerId]], Field(
+    title='DNS server IDs',
+    description='Use only specified DNS servers. If omitted, all configured DNS servers are used',
+    min_length=1,
+    examples=[[1, 2, 5]]
+  )] = None
 
   @field_validator('domain')
   @classmethod
@@ -55,6 +63,15 @@ class DomainResolveReq(BaseModel):
     if not domain:
       raise ValueError('Domain name must not be empty')
     return domain
+  
+  @field_validator('dns_server_ids')
+  @classmethod
+  def validate_dns_server_ids(cls, value: list[int] | None) -> list[int] | None:
+    if value is None:
+      return None
+    if len(value) != len(set(value)):
+      raise ValueError('DNS server IDs must be unique')
+    return value
   
   @model_validator(mode='after')
   def validate_resolve_source(self: Self) -> Self:

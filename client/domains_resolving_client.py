@@ -31,6 +31,7 @@ from utils.utils import get_ip_version
 
 from models.http.domains_req import DomainsPostElementReq
 from models.http.domains_resp import DomainElementResp
+from models.http.dns_servers_resp import DnsElementResp
 
 from models.dto.domains_dto import DomainResult, CheckDomainResultDto, DnsServerResolveResultDto
 from models.dto.dns_server_dto import DnsServerDto
@@ -403,15 +404,27 @@ class DomainsResolver:
       await jobs_cache.set(job_mode, False)
       await jobs_cache.set(Jobs.DOMAINS_RESOLVE, False)
 
-  async def resolve_once(self: Self, domain_name: str) -> CheckDomainResultDto:
+  async def resolve_once(
+    self: Self,
+    domain_name: str,
+    selected_dns_servers: List[DnsElementResp] | None = None
+  ) -> CheckDomainResultDto:
     name: str = domain_name.strip().rstrip('.')
     if not name:
       raise ValueError('Domain name must not be empty')
-    domain: DomainResult = DomainResult(
-      id=0,
-      name=name
-    )
-    default_dns_servers, doh_dns_servers = await db.get_dns_servers_for_resolve()
+    #
+    default_dns_servers: List[DnsServerDto] = []
+    doh_dns_servers: List[DnsServerDto] = []
+    if selected_dns_servers is None:
+      default_dns_servers, doh_dns_servers = await db.get_dns_servers_for_resolve()
+    else:
+      for selected_dns_server in selected_dns_servers:
+        if selected_dns_server.server is not None:
+          default_dns_servers.append(DnsServerDto(server=selected_dns_server.server))
+        elif selected_dns_server.doh_server is not None:
+          doh_dns_servers.append(DnsServerDto(server=selected_dns_server.doh_server))
+        else:
+          raise RuntimeError(f'DNS server ID={selected_dns_server.id} does not contain a server address')
     #
     tasks: list[CoroutineType] = []
     #
