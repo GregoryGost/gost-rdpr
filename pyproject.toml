@@ -1,6 +1,6 @@
 [project]
 name = "gost-rdpr"
-version = "2.1.0"
+version = "2.2.0"
 description = "The utility provides parsing of domain names into IP addresses, processing of domain lists and their subsequent parsing, processing of individual IP addresses and summarized IP groups. Updates firewall address list and routing table"
 authors = [
     {name = "GregoryGost <info@gregory-gost.ru>"}
