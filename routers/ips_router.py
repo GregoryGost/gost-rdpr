@@ -175,7 +175,7 @@ class IpsRouter(BaseRouter):
       response_model=RipeStatPrefixCheckResp,
       responses={
         status.HTTP_404_NOT_FOUND: {'model': NotFoundResp},
-        status.HTTP_422_UNPROCESSABLE_ENTITY: {'model': ErrorResp},
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {'model': ErrorResp},
         status.HTTP_502_BAD_GATEWAY: {'model': ErrorResp},
         status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
       }
@@ -209,7 +209,7 @@ class IpsRouter(BaseRouter):
             )
             return JSONResponse(
               content=error.to_dict(),
-              status_code=status.HTTP_422_UNPROCESSABLE_ENTITY
+              status_code=status.HTTP_422_UNPROCESSABLE_CONTENT
             )
 
           logger.debug(

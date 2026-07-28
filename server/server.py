@@ -102,7 +102,7 @@ class AppServer:
         logger.error(
           f'RequestValidationError={str(exception)} :\n URL={unquote(request.url.__str__())} :\n bodyStr={bodyStr} :\n args={args}'
         )
-        return JSONResponse(content=jsonable_encoder(exception.errors()), status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+        return JSONResponse(content=jsonable_encoder(exception.errors()), status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
       except Exception as err:
         logger.error(err)
         return JSONResponse(

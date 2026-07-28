@@ -98,10 +98,10 @@ class RipeStatClient:
     address: str,
     cache_key: str
   ) -> RipeStatAddressPrefixDto | None:
-    if not await ripe_stat_cache.exists(cache_key):
-      return None
-
     cached_prefix = await ripe_stat_cache.get(cache_key)
+
+    if cached_prefix is None:
+      return None
 
     if not isinstance(cached_prefix, str):
       logger.warning(
