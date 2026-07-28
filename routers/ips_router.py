@@ -6,6 +6,7 @@ from typing import Annotated, Self, List, Dict
 
 from logger.logger import logger
 from database.db import db
+from cache.cache import ripe_stat_cache
 from client.ripe_stat_client import RipeStatClient, RipeStatClientError
 from utils.utils import get_ip_network_address, get_ip_version
 
@@ -117,6 +118,26 @@ class IpsRouter(BaseRouter):
           content=OkResp().to_dict(),
           status_code=status.HTTP_202_ACCEPTED
         )
+      except Exception as err:
+        return self.errorResp(err)
+
+    @router.post(
+      path='/ripe/cache/clear',
+      name='Clear RIPEstat prefix cache',
+      description=(
+        'Clears only the in-memory RIPEstat prefix cache without changing '
+        'database records'
+      ),
+      response_model=OkResp,
+      responses={
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
+      }
+    )
+    async def clear_ripe_stat_cache() -> JSONResponse:
+      logger.debug('Call API route: POST /ips/ripe/cache/clear')
+      try:
+        await ripe_stat_cache.clear()
+        return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
       except Exception as err:
         return self.errorResp(err)
 
