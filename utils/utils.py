@@ -18,9 +18,11 @@ def check_ip_allow(ip: str) -> bool:
   Allow = True  
   Block = False
   '''
-  if ip in settings.ip_not_allowed_list:
-    return False
-  return True
+  candidate_network = ip_network(ip, strict=False)
+  return not any(
+    candidate_network.overlaps(blocked_network)
+    for blocked_network in settings.ip_not_allowed_networks
+  )
 
 def get_ip_without_prefix(ip_address: str) -> str:
   try:

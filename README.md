@@ -82,6 +82,7 @@ Available environment variables
 | `DB_POOL_TIMEOUT` | int | `30` | Number of seconds to wait before giving up on getting a connection from the pool |
 | `DB_POOL_SIZE_OVERFLOW` | int | `2` | The number of connections to allow in connection pool `overflow`, that is connections that can be opened above and beyond the `db_pool_size` setting, which defaults to five |
 | `ATTEMPTS_LIMIT` | int | `5` | How many times a file must be checked with a negative result before it (and all its child entities) are deleted from the database |
+| `HTTPX_LOG_LEVEL` | str | `error` | HTTPX logging level |
 | `REQ_CONNECTION_RETRIES` | int | `3` | Requests will be retried the given number of times in case an `httpx.ConnectError` or an `httpx.ConnectTimeout` occurs, allowing smoother operation under flaky networks |
 | `REQ_TIMEOUT_DEFAULT` | float | `20.0` | General timeout for connections parameters `connect`, `read`, `write` or `pool` |
 | `REQ_TIMEOUT_CONNECT` | float | `20.0` | Individual timeout for `connect` |
@@ -89,6 +90,7 @@ Available environment variables
 | `REQ_MAX_CONNECTIONS` | int | `5` | The maximum number of allowable connections. `None` for no limits |
 | `REQ_MAX_KEEPALIVE_CONNECTIONS` | int | `30` | Number of allowable keep-alive connections. `None` to always allow |
 | `REQ_SSL_VERIFY` | bool | `True` | When making a request over HTTPS, HTTPX needs to verify the identity of the requested host. To do this, it uses a bundle of SSL certificates (a.k.a. CA bundle) delivered by a trusted certificate authority (CA). You can disable SSL verification completely and allow insecure requests |
+| `REQ_DEFAULT_LIMIT` | int | `100` | Maximum number of records returned by a paginated API request |
 | `DOMAINS_FILTERED_MIN_LEN` | int | `3` | The minimum domain length required to save it to the database. This is necessary to filter out empty domains that, for some reason, are generated in MikroTik scripts |
 | `DOMAINS_UPDATE_INTERVAL` | int | `172800` | Domain selection period. This means that if a domain has been processed, it will not be processed again until this period has passed. Specified in seconds. 172800s = 2days |
 | `DOMAINS_RESOLVE_SEMAPHORE_LIMIT` | int | `60` | Limit of concurrent domain resolving tasks |
@@ -96,8 +98,11 @@ Available environment variables
 | `DOMAINS_RESOLVE_STALE_BATCH_SIZE` | int | `2000` | Limit for sampling the number of previously processed domains |
 | `DOMAINS_BLACK_LIST` | str | `None` | Domains that should not be included in the database. Comma-separated list |
 | `LISTS_UPDATE_INTERVAL_SEC` | int | `604800` | The period after which the file must be uploaded and verified again. Specified in seconds. 604800s = 7days |
-| `IP_NOT_ALLOWED` | str | `127.0.0.1, 0.0.0.0, 0.0.0.0/0, ::, ::/0` | A list of IP addresses that should not be included in the database. Comma-separated list. |
+| `IP_NOT_ALLOWED` | str | `0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4, ::/128, ::1/128, fc00::/7, fe80::/10, ff00::/8, 2001:db8::/32` | Comma-separated CIDR networks that must not be saved in the database. |
 | `ROS_REST_API_READ_TIMEOUT` | float | `59.0` | ROS REST API server timeout = 60s |
+| `ROS_REST_API_DEFAULT_TIMEOUT` | float | `59.0` | Default timeout for RouterOS REST API requests |
+| `RIPE_STAT_BASE_URL` | str | `https://stat.ripe.net` | RIPEstat API base URL for IPv4 prefix lookups |
+| `RIPE_STAT_REQUESTS_SEMAPHORE_LIMIT` | int | `5` | Maximum number of concurrent RIPEstat prefix lookups during domain resolving |
 
 ## MikroTik RouterOS
 
