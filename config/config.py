@@ -78,6 +78,9 @@ class Settings(BaseSettings):
   # ROUTEROS section
   ros_rest_api_read_timeout: float = Field(default=59.0) # ROS REST API server read timeout = 60s
   ros_rest_api_default_timeout: float = Field(default=59.0) # ROS REST API server base default timeout = 60s
+  # RIPE
+  ripe_stat_base_url: str = Field(default='https://stat.ripe.net')
+  ripe_stat_requests_semaphore_limit: int = Field(default=5)
 
   @computed_field
   @property

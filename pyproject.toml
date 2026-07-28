@@ -11,7 +11,7 @@ homepage = "https://gregory-gost.ru"
 repository = "https://github.com/GregoryGost/gost-rdpr"
 requires-python = ">=3.13"
 dependencies = [
-    "fastapi (>=0.139.2,<0.140.0)",
+    "fastapi (>=0.140.13,<0.141.0)",
     "sqlalchemy (>=2.0.51,<3.0.0)",
     "aiosqlite (>=0.22.1,<0.23.0)",
     "dnspython (>=2.8.0,<3.0.0)",

@@ -18,7 +18,16 @@ from dns.message import QueryMessage, make_query, from_wire
 from dns.rrset import RRset
 from itertools import product
 from base64 import urlsafe_b64encode
-from httpx import AsyncClient, Response, ConnectTimeout, ReadError, RemoteProtocolError, ConnectError
+from ipaddress import IPv4Address, IPv4Network, ip_address, ip_network
+from httpx import (
+  AsyncClient,
+  Response,
+  ConnectTimeout,
+  ReadError,
+  RemoteProtocolError,
+  ConnectError,
+  HTTPError
+)
 from types import CoroutineType
 from typing import Self, List, Tuple, Dict, Literal
 
@@ -27,7 +36,8 @@ from config.config import settings
 from cache.cache import jobs_cache, Jobs
 from database.db import db
 from client.http_base_client import HttpClient
-from utils.utils import get_ip_version
+from client.ripe_stat_client import RipeStatClient, RipeStatClientError
+from utils.utils import get_ip_network_address, get_ip_version
 
 from models.http.domains_req import DomainsPostElementReq
 from models.http.domains_resp import DomainElementResp
@@ -48,6 +58,11 @@ class DomainsResolver:
   __semaphore: Semaphore = Semaphore(settings.domains_resolve_semaphore_limit)
 
   __http_client: AsyncClient = HttpClient.get_client('domains_resolver')
+
+  __ripe_stat_client: RipeStatClient = RipeStatClient()
+  __ripe_stat_semaphore: Semaphore = Semaphore(
+    settings.ripe_stat_requests_semaphore_limit
+  )
 
   domains_resolve_queue: Queue[DomainResult] = Queue(maxsize=settings.queue_max_size)
 
@@ -337,26 +352,149 @@ class DomainsResolver:
 
   # IPS
 
-  async def __ips_processing(self: Self, domain: DomainResult, current_ips: List[IpRecordDto]) -> None:
+  @staticmethod
+  def __get_current_cidr_for_resolved_ip(
+    resolved_ip: str,
+    current_ip_records: List[IpRecordDto]
+  ) -> str | None:
+    for record in current_ip_records:
+      if '/' not in record.ip_address:
+        continue
+      if get_ip_network_address(record.ip_address) == resolved_ip:
+        return record.ip_address
+    return None
+
+  async def __get_ip_address_for_storage(
+    self: Self,
+    resolved_ip: str,
+    current_ip_records: List[IpRecordDto]
+  ) -> str:
+    parsed_ip = ip_address(resolved_ip)
+
+    if not isinstance(parsed_ip, IPv4Address) or not parsed_ip.is_global:
+      return resolved_ip
+
+    if parsed_ip.packed[-1] != 0:
+      return resolved_ip
+
+    try:
+      async with self.__ripe_stat_semaphore:
+        ripe_result = await self.__ripe_stat_client.get_prefix(
+          address=resolved_ip
+        )
+
+      if ripe_result.prefix is None:
+        logger.debug(
+          f'RIPEstat prefix not found for {resolved_ip}; keep host route'
+        )
+        return resolved_ip
+
+      network = ip_network(ripe_result.prefix, strict=True)
+
+      if (
+        not isinstance(network, IPv4Network)
+        or network.prefixlen == 32
+        or network.network_address != parsed_ip
+      ):
+        logger.debug(
+          f'RIPEstat prefix rejected for {resolved_ip}: '
+          f'{ripe_result.prefix}'
+        )
+        return resolved_ip
+
+      storage_ip = str(network)
+      logger.debug(
+        f'RIPEstat prefix accepted for {resolved_ip}: {storage_ip}'
+      )
+      return storage_ip
+    except (RipeStatClientError, HTTPError, ValueError) as err:
+      current_cidr = self.__get_current_cidr_for_resolved_ip(
+        resolved_ip=resolved_ip,
+        current_ip_records=current_ip_records
+      )
+
+      if current_cidr is not None:
+        logger.warning(
+          f'RIPEstat prefix lookup failed for {resolved_ip}: '
+          f'[{err.__class__.__name__}] {err}; '
+          f'keep stored prefix {current_cidr}'
+        )
+        return current_cidr
+
+      logger.warning(
+        f'RIPEstat prefix lookup failed for {resolved_ip}: '
+        f'[{err.__class__.__name__}] {err}; keep host route'
+      )
+      return resolved_ip
+
+  async def __ips_processing(
+    self: Self,
+    domain: DomainResult,
+    current_ips: List[IpRecordDto]
+  ) -> None:
     logger.debug(f'IP prepare for {domain.name}')
     logger.debug(f'{domain=}, {current_ips=}')
     try:
-      current_ips_list: List[str] = [record.ip_address for record in current_ips]
-      resolved_ips: List[str] = []
-      new_ips: list[IpRecordDto] = []
-      remove_ips: list[IpRecordDto] = []
-      for ipv4 in domain.result.A:
-        resolved_ips.append(ipv4)
-      for ipv6 in domain.result.AAAA:
-        resolved_ips.append(ipv6)
-      # 1. Add new to DB
-      new_ips = [
-        IpRecordDto(ip_address=ip, addr_type=get_ip_version(ip))
-        for ip in resolved_ips
-        if ip not in current_ips_list
-      ]
-      # 2. Remove from DB
-      remove_ips = [record for record in current_ips if record.ip_address not in resolved_ips]
+      resolved_ips: List[str] = list(dict.fromkeys(
+        domain.result.A + domain.result.AAAA
+      ))
+      current_ips_by_network_address: Dict[str, List[IpRecordDto]] = {}
+      desired_ips_by_network_address: Dict[str, IpRecordDto] = {}
+      new_ips: List[IpRecordDto] = []
+      remove_ips: List[IpRecordDto] = []
+
+      for record in current_ips:
+        network_address = get_ip_network_address(record.ip_address)
+        if network_address not in current_ips_by_network_address:
+          current_ips_by_network_address[network_address] = []
+        current_ips_by_network_address[network_address].append(record)
+
+      for resolved_ip in resolved_ips:
+        current_ip_records = current_ips_by_network_address.get(
+          resolved_ip,
+          []
+        )
+        storage_ip = await self.__get_ip_address_for_storage(
+          resolved_ip=resolved_ip,
+          current_ip_records=current_ip_records
+        )
+        network_address = get_ip_network_address(storage_ip)
+
+        if network_address != resolved_ip:
+          logger.warning(
+            f'Invalid storage address for {resolved_ip}: {storage_ip}; '
+            f'keep original IP'
+          )
+          storage_ip = resolved_ip
+          network_address = resolved_ip
+
+        desired_ips_by_network_address[network_address] = IpRecordDto(
+          ip_address=storage_ip,
+          addr_type=get_ip_version(storage_ip)
+        )
+
+      for network_address, desired_ip in desired_ips_by_network_address.items():
+        current_ip_records = current_ips_by_network_address.pop(
+          network_address,
+          []
+        )
+        is_current_value_present = False
+
+        for current_ip in current_ip_records:
+          if (
+            not is_current_value_present
+            and current_ip.ip_address == desired_ip.ip_address
+          ):
+            is_current_value_present = True
+            continue
+          remove_ips.append(current_ip)
+
+        if not is_current_value_present:
+          new_ips.append(desired_ip)
+
+      for stale_ip_records in current_ips_by_network_address.values():
+        remove_ips.extend(stale_ip_records)
+
       if len(new_ips) > 0:
         domain.append_ips_to_insert(ips=new_ips)
       if len(remove_ips) > 0:

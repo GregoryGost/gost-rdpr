@@ -32,6 +32,13 @@ def get_ip_without_prefix(ip_address: str) -> str:
   except Exception as err:
     raise err
 
+def get_ip_network_address(ip_address: str) -> str:
+  try:
+    network = ip_network(ip_address, strict=False)
+    return str(network.network_address)
+  except Exception as err:
+    raise err
+
 def calculate_checksum(file_path: Path) -> str:
   '''Calculate checksum for file'''
   with open(file_path, 'r', encoding='utf-8') as f:
