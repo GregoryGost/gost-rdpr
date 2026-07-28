@@ -4,7 +4,7 @@
     "title": "GOST-RDPR (Resolve Domains Per Records)",
     "summary": "A utility for working with Mikrotik RouterOS and BGP protocol for announcing IP addresses",
     "description": "The utility provides parsing of domain names into IP addresses, processing of domain lists and their \n    subsequent parsing, processing of individual IP addresses and summarized IP groups. Updates firewall address list \n    and routing table",
-    "version": "2.1.0"
+    "version": "2.2.1"
   },
   "paths": {
     "/metrics": {
@@ -2575,6 +2575,70 @@
         }
       }
     },
+    "/ips/cleanup/not-allowed": {
+      "post": {
+        "tags": [
+          "IP address"
+        ],
+        "summary": "Queue Cleanup Of Ip Addresses Blocked By Ip Not Allowed",
+        "description": "Starts background cleanup of IP address records matching IP_NOT_ALLOWED; deletion is queued without direct database writes",
+        "operationId": "Queue_cleanup_of_IP_addresses_blocked_by_IP_NOT_ALLOWED_ips_cleanup_not_allowed_post",
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ips/ripe/cache/clear": {
+      "post": {
+        "tags": [
+          "IP address"
+        ],
+        "summary": "Clear Ripestat Prefix Cache",
+        "description": "Clears only the in-memory RIPEstat prefix cache without changing database records",
+        "operationId": "Clear_RIPEstat_prefix_cache_ips_ripe_cache_clear_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/ips/search": {
       "get": {
         "tags": [
@@ -2745,6 +2809,78 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ips/ripe/check": {
+      "post": {
+        "tags": [
+          "IP address"
+        ],
+        "summary": "Check Ipv4 Prefix In Ripestat",
+        "description": "Check an IPv4 address in RIPEstat without saving a record to the database",
+        "operationId": "Check_IPv4_prefix_in_RIPEstat_ips_ripe_check_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RipeStatPrefixCheckReq"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RipeStatPrefixCheckResp"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundResp"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Bad Gateway",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResp"
                 }
               }
             }
@@ -5255,6 +5391,67 @@
         },
         "type": "object",
         "title": "OkResp"
+      },
+      "RipeStatPrefixCheckReq": {
+        "properties": {
+          "address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "IPv4 address",
+            "description": "IPv4 address to check in RIPEstat without saving it to the database",
+            "examples": [
+              "8.6.112.0"
+            ]
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Existing IP address record ID",
+            "description": "Use an existing IP address record from the local database without changing it",
+            "examples": [
+              55369745
+            ]
+          }
+        },
+        "type": "object",
+        "title": "RipeStatPrefixCheckReq"
+      },
+      "RipeStatPrefixCheckResp": {
+        "properties": {
+          "address": {
+            "type": "string",
+            "title": "Address"
+          },
+          "prefix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix"
+          }
+        },
+        "type": "object",
+        "required": [
+          "address"
+        ],
+        "title": "RipeStatPrefixCheckResp"
       },
       "RosConfigElementResp": {
         "properties": {
