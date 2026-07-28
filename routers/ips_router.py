@@ -17,7 +17,10 @@ from models.http.base import ErrorResp, NotFoundResp, NoDataResp, OkResp
 from models.http.ips_req import IpsQueryReq, IpsSearchQueryReq, IpsPostElementReq
 from models.http.ripe_stat_req import RipeStatPrefixCheckReq
 # response models
-from models.http.ips_resp import IpsPayloadResp, IpsElementResp
+from models.http.ips_resp import (
+  IpsPayloadResp,
+  IpsElementResp
+)
 from models.http.ripe_stat_resp import RipeStatPrefixCheckResp
 
 class IpsRouter(BaseRouter):
@@ -88,6 +91,32 @@ class IpsRouter(BaseRouter):
           use_default_gw=query.default_gw
         )
         return JSONResponse(return_data.to_dict(), status.HTTP_200_OK)
+      except Exception as err:
+        return self.errorResp(err)
+
+    @router.post(
+      path='/cleanup/not-allowed',
+      name='Queue cleanup of IP addresses blocked by IP_NOT_ALLOWED',
+      description=(
+        'Starts background cleanup of IP address records matching '
+        'IP_NOT_ALLOWED; deletion is queued without direct database writes'
+      ),
+      response_model=OkResp,
+      status_code=status.HTTP_202_ACCEPTED,
+      responses={
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
+      }
+    )
+    async def cleanup_not_allowed_ips(
+      background_tasks: BackgroundTasks
+    ) -> JSONResponse:
+      logger.debug('Call API route: POST /ips/cleanup/not-allowed')
+      try:
+        background_tasks.add_task(db.cleanup_not_allowed_ip_records)
+        return JSONResponse(
+          content=OkResp().to_dict(),
+          status_code=status.HTTP_202_ACCEPTED
+        )
       except Exception as err:
         return self.errorResp(err)
 
