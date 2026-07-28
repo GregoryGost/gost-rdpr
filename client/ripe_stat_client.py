@@ -3,8 +3,10 @@ from typing import Any, Dict, Self
 
 from httpx import AsyncClient, Response
 
+from cache.cache import ripe_stat_cache
 from client.http_base_client import HttpClient
 from config.config import settings
+from logger.logger import logger
 from models.dto.ripe_stat_dto import RipeStatAddressPrefixDto
 
 
@@ -21,10 +23,48 @@ class RipeStatClient:
 
   async def get_prefix(self: Self, address: str) -> RipeStatAddressPrefixDto:
     normalized_address: str = str(ip_address(address))
+    cache_key: str = f'prefix:{normalized_address}'
 
+    cached_result = await self.__get_cached_prefix(
+      address=normalized_address,
+      cache_key=cache_key
+    )
+    if cached_result is not None:
+      return cached_result
+
+    async with ripe_stat_cache.lock(
+      key=f'lock:{cache_key}',
+      expire=settings.ripe_stat_cache_lock_ttl_sec
+    ):
+      cached_result = await self.__get_cached_prefix(
+        address=normalized_address,
+        cache_key=cache_key
+      )
+      if cached_result is not None:
+        return cached_result
+
+      result = await self.__get_prefix_from_ripe_stat(
+        address=normalized_address
+      )
+      cache_ttl = (
+        settings.ripe_stat_prefix_cache_ttl_sec
+        if result.prefix is not None
+        else settings.ripe_stat_empty_prefix_cache_ttl_sec
+      )
+      await ripe_stat_cache.set(
+        key=cache_key,
+        value=result.prefix or '',
+        expire=cache_ttl
+      )
+      return result
+
+  async def __get_prefix_from_ripe_stat(
+    self: Self,
+    address: str
+  ) -> RipeStatAddressPrefixDto:
     response: Response = await self.__client.get(
       url=f'{self.__base_url}/data/network-info/data.json',
-      params={'resource': normalized_address},
+      params={'resource': address},
       headers={'Accept': 'application/json'}
     )
 
@@ -33,7 +73,7 @@ class RipeStatClient:
     if not response.is_success or payload.get('status') != 'ok':
       message: str = str(payload.get('message', response.reason_phrase))
       raise RipeStatClientError(
-        f'RIPEstat network-info error for {normalized_address}: '
+        f'RIPEstat network-info error for {address}: '
         f'{message} (HTTP {response.status_code})'
       )
 
@@ -41,19 +81,38 @@ class RipeStatClient:
 
     if not isinstance(data, dict):
       raise RipeStatClientError(
-        f'RIPEstat network-info returned invalid data for {normalized_address}'
+        f'RIPEstat network-info returned invalid data for {address}'
       )
 
     prefix: Any = data.get('prefix')
 
     if prefix is not None and not isinstance(prefix, str):
       raise RipeStatClientError(
-        f'RIPEstat network-info returned invalid prefix for {normalized_address}'
+        f'RIPEstat network-info returned invalid prefix for {address}'
       )
 
+    return RipeStatAddressPrefixDto(address=address, prefix=prefix)
+
+  @staticmethod
+  async def __get_cached_prefix(
+    address: str,
+    cache_key: str
+  ) -> RipeStatAddressPrefixDto | None:
+    if not await ripe_stat_cache.exists(cache_key):
+      return None
+
+    cached_prefix = await ripe_stat_cache.get(cache_key)
+
+    if not isinstance(cached_prefix, str):
+      logger.warning(
+        f'Invalid RIPEstat cache value for {address}; refresh from RIPEstat'
+      )
+      return None
+
+    logger.debug(f'RIPEstat cache hit for {address}')
     return RipeStatAddressPrefixDto(
-      address=normalized_address,
-      prefix=prefix
+      address=address,
+      prefix=cached_prefix or None
     )
 
   @staticmethod

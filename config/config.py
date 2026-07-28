@@ -89,6 +89,10 @@ class Settings(BaseSettings):
   # RIPE
   ripe_stat_base_url: str = Field(default='https://stat.ripe.net')
   ripe_stat_requests_semaphore_limit: int = Field(default=5)
+  ripe_stat_cache_size: int = Field(default=10000)
+  ripe_stat_prefix_cache_ttl_sec: int = Field(default=28800)
+  ripe_stat_empty_prefix_cache_ttl_sec: int = Field(default=3600)
+  ripe_stat_cache_lock_ttl_sec: int = Field(default=120)
 
   @computed_field
   @property

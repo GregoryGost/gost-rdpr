@@ -4,6 +4,7 @@ from enum import StrEnum
 from typing import Any, Self
 
 from logger.logger import logger
+from config.config import settings
 
 class Jobs(StrEnum):
   LISTS_LOAD            = 'lists_load'
@@ -50,7 +51,14 @@ class Cache():
   async def set(self: Self, key: str, value: Any, expire: float | None = None) -> None:
     await self.update(key=key, value=value, expire=expire)
 
+  def lock(self: Self, key: str, expire: float, wait: bool = True) -> Any:
+    return self.cache.lock(key=key, expire=expire, wait=wait)
+
 try:
   jobs_cache: Cache = Cache('jobs_cache')
+  ripe_stat_cache: Cache = Cache(
+    'ripe_stat_cache',
+    size=settings.ripe_stat_cache_size
+  )
 except Exception as err:
   raise err
