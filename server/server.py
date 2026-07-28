@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from config.config import settings
 from logger.logger import logger
 from database.db import db
-from cache.cache import jobs_cache
+from jobs.job_registry import job_registry
 from metrics.metrics import PrometheusMiddleware
 from client.http_base_client import HttpClient
 
@@ -27,7 +27,7 @@ from routers.domains_router import DomainsRouter
 from routers.ips_lists_router import IpsListsRouter
 from routers.ips_router import IpsRouter
 from routers.ros_configs_router import RosConfigsRouter
-from routers.commands_router import CommandsRouter, Jobs
+from routers.commands_router import CommandsRouter
 from routers.statistics_router import StatisticsRouter
 
 from models.http.base import ErrorResp
@@ -67,12 +67,7 @@ class AppServer:
   @asynccontextmanager
   async def __lifespan(self: Self, app: FastAPI) -> AsyncGenerator[None, Any]:
     # first RUN BEFORE start FastAPI
-    # Cache init
-    await jobs_cache.set(key=Jobs.LISTS_LOAD, value=False)
-    await jobs_cache.set(key=Jobs.DOMAINS_RESOLVE, value=False)
-    await jobs_cache.set(key=Jobs.DOMAINS_RESOLVE_NEW, value=False)
-    await jobs_cache.set(key=Jobs.DOMAINS_RESOLVE_STALE, value=False)
-    await jobs_cache.set(key=Jobs.ROS_UPDATE, value=False)
+    await job_registry.reset()
     # Init DB
     await db.setup()
     # Domains resolver init
@@ -107,7 +102,7 @@ class AppServer:
         logger.error(
           f'RequestValidationError={str(exception)} :\n URL={unquote(request.url.__str__())} :\n bodyStr={bodyStr} :\n args={args}'
         )
-        return JSONResponse(content=jsonable_encoder(exception.errors()), status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+        return JSONResponse(content=jsonable_encoder(exception.errors()), status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
       except Exception as err:
         logger.error(err)
         return JSONResponse(

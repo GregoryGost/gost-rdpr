@@ -33,7 +33,7 @@ from typing import Self, List, Tuple, Dict, Literal
 
 from logger.logger import logger
 from config.config import settings
-from cache.cache import jobs_cache, Jobs
+from jobs.job_registry import job_registry, Jobs
 from database.db import db
 from client.http_base_client import HttpClient
 from client.ripe_stat_client import RipeStatClient, RipeStatClientError
@@ -508,7 +508,6 @@ class DomainsResolver:
   async def domains_resolve(self: Self, job_mode: Jobs) -> None:
     logger.info(f'Domains resolve mode={job_mode} - START')
     try:
-      await jobs_cache.set(job_mode, True)
       #
       match job_mode:
         case Jobs.DOMAINS_RESOLVE_NEW:
@@ -539,8 +538,7 @@ class DomainsResolver:
     except Exception as err:
       logger.error(f'Try Domains resolve mode={job_mode} failed [{err.__class__.__name__}] : {err}', exc_info=True)
     finally:
-      await jobs_cache.set(job_mode, False)
-      await jobs_cache.set(Jobs.DOMAINS_RESOLVE, False)
+      await job_registry.finish(Jobs.DOMAINS_RESOLVE)
 
   async def resolve_once(
     self: Self,

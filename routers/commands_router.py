@@ -5,7 +5,7 @@ from typing import Annotated, Self
 
 from logger.logger import logger
 from database.db import db
-from cache.cache import jobs_cache, Jobs
+from jobs.job_registry import job_registry, Jobs
 from client.domains_resolving_client import DomainsResolver
 from client.ros_updater_client import RosClient
 
@@ -46,10 +46,12 @@ class CommandsRouter(BaseRouter):
     ) -> JSONResponse:
       logger.debug(f'Call API route: POST /commands/lists/load')
       try:
-        job_status: bool | None = await jobs_cache.get(Jobs.LISTS_LOAD)
-        if job_status != True:
-          await jobs_cache.set(Jobs.LISTS_LOAD, True)
-          background_tasks.add_task(db.lists_load, query.forced)
+        if await job_registry.try_start(Jobs.LISTS_LOAD):
+          try:
+            background_tasks.add_task(db.lists_load, query.forced)
+          except Exception:
+            await job_registry.finish(Jobs.LISTS_LOAD)
+            raise
         else:
           return JSONResponse(
             OkResp(result=f'Job {Jobs.LISTS_LOAD} is Run').to_dict(),
@@ -72,13 +74,15 @@ class CommandsRouter(BaseRouter):
     async def domains_resolve_new_command(background_tasks: BackgroundTasks) -> JSONResponse:
       logger.debug(f'Call API route: POST /commands/domains/resolve/new')
       try:
-        job_status: bool | None = await jobs_cache.get(Jobs.DOMAINS_RESOLVE)
-        if job_status != True:
-          await jobs_cache.set(Jobs.DOMAINS_RESOLVE, True)
-          background_tasks.add_task(
-            self.domains_resolver.domains_resolve,
-            Jobs.DOMAINS_RESOLVE_NEW
-          )
+        if await job_registry.try_start(Jobs.DOMAINS_RESOLVE):
+          try:
+            background_tasks.add_task(
+              self.domains_resolver.domains_resolve,
+              Jobs.DOMAINS_RESOLVE_NEW
+            )
+          except Exception:
+            await job_registry.finish(Jobs.DOMAINS_RESOLVE)
+            raise
         else:
           return JSONResponse(
             OkResp(result=f'Job [{Jobs.DOMAINS_RESOLVE}] is now active').to_dict(),
@@ -100,13 +104,15 @@ class CommandsRouter(BaseRouter):
     async def domains_resolve_stale_command(background_tasks: BackgroundTasks) -> JSONResponse:
       logger.debug(f'Call API route: POST /commands/domains/resolve/stale')
       try:
-        job_status: bool | None = await jobs_cache.get(Jobs.DOMAINS_RESOLVE)
-        if job_status != True:
-          await jobs_cache.set(Jobs.DOMAINS_RESOLVE, True)
-          background_tasks.add_task(
-            self.domains_resolver.domains_resolve,
-            Jobs.DOMAINS_RESOLVE_STALE
-          )
+        if await job_registry.try_start(Jobs.DOMAINS_RESOLVE):
+          try:
+            background_tasks.add_task(
+              self.domains_resolver.domains_resolve,
+              Jobs.DOMAINS_RESOLVE_STALE
+            )
+          except Exception:
+            await job_registry.finish(Jobs.DOMAINS_RESOLVE)
+            raise
         else:
           return JSONResponse(
             OkResp(result=f'Job [{Jobs.DOMAINS_RESOLVE}] is now active').to_dict(),
@@ -138,10 +144,12 @@ class CommandsRouter(BaseRouter):
             ).to_dict(),
             status.HTTP_400_BAD_REQUEST
           )
-        job_status: bool | None = await jobs_cache.get(Jobs.ROS_UPDATE)
-        if job_status != True:
-          await jobs_cache.set(Jobs.ROS_UPDATE, True)
-          background_tasks.add_task(self.__ros_client.update, query.type)
+        if await job_registry.try_start(Jobs.ROS_UPDATE):
+          try:
+            background_tasks.add_task(self.__ros_client.update, query.type)
+          except Exception:
+            await job_registry.finish(Jobs.ROS_UPDATE)
+            raise
         else:
           return JSONResponse(
             OkResp(result=f'Job [{Jobs.ROS_UPDATE}] is now active').to_dict(),
