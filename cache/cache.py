@@ -1,17 +1,9 @@
 from cashews import cache
 from cashews.backends.interface import Backend
-from enum import StrEnum
 from typing import Any, Self
 
 from logger.logger import logger
 from config.config import settings
-
-class Jobs(StrEnum):
-  LISTS_LOAD            = 'lists_load'
-  DOMAINS_RESOLVE   = 'domains_resolve' # for check job
-  DOMAINS_RESOLVE_NEW   = 'domains_resolve_new'
-  DOMAINS_RESOLVE_STALE = 'domains_resolve_stale'
-  ROS_UPDATE            = 'ros_update'
 
 class Cache():
   '''
@@ -55,7 +47,6 @@ class Cache():
     return self.cache.lock(key=key, expire=expire, wait=wait)
 
 try:
-  jobs_cache: Cache = Cache('jobs_cache')
   ripe_stat_cache: Cache = Cache(
     'ripe_stat_cache',
     size=settings.ripe_stat_cache_size

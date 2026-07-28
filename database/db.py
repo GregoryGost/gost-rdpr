@@ -86,7 +86,7 @@ from models.dto.ip_record_dto import IpRecordDto
 from models.dto.ros_config_dto import RosConfigDto
 from models.dto.migrations_dto import MigrationsDto
 
-from cache.cache import jobs_cache, Jobs
+from jobs.job_registry import job_registry, Jobs
 
 class DataBase:
   '''
@@ -1479,8 +1479,9 @@ class DataBase:
 
   async def lists_load(self: Self, forced: bool) -> None:
     logger.info(f'Lists load - START {forced=}')
+    db_session: AsyncSession | None = None
     try:
-      db_session: AsyncSession = await self.__read_connect()
+      db_session = await self.__read_connect()
       domains_lists_total: int = await DomainsListsDbo.get_total(db_session=db_session)
       ips_lists_total: int = await IpsListsDbo.get_total(db_session=db_session)
       if domains_lists_total > 0:
@@ -1551,10 +1552,14 @@ class DataBase:
           await self.update_ips_lists(ips_lists=active_ips_lists)
     except Exception as err:
       logger.error(f'Try Lists load failed : {err}', exc_info=True)
-      await db_session.rollback()
+      if db_session is not None:
+        await db_session.rollback()
     finally:
-      await db_session.close()
-      await jobs_cache.set(Jobs.LISTS_LOAD, False)
+      try:
+        if db_session is not None:
+          await db_session.close()
+      finally:
+        await job_registry.finish(Jobs.LISTS_LOAD)
 
   # Stats
 

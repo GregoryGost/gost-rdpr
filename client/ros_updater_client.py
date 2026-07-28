@@ -9,7 +9,7 @@ from .http_base_client import HttpClient
 from logger.logger import logger
 from config.config import settings
 from database.db import db
-from cache.cache import jobs_cache, Jobs
+from jobs.job_registry import job_registry, Jobs
 
 from models.dto.ip_record_dto import IpRecordDto
 from models.dto.ros_config_dto import RosConfigDto, RosAction
@@ -571,4 +571,4 @@ class RosClient:
     except Exception as err:
       logger.error(f'Update ROS configs failed: [{err.__class__.__name__}] : {err}', exc_info=True)
     finally:
-      await jobs_cache.set(Jobs.ROS_UPDATE, False)
+      await job_registry.finish(Jobs.ROS_UPDATE)
