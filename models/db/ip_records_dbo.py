@@ -185,6 +185,21 @@ class IpRecordsDbo(Dbo):
       raise err
 
   @classmethod
+  async def get_all_ids_and_addresses(
+    cls: type[Self],
+    db_session: AsyncSession
+  ) -> Sequence[Row[Tuple[int, str]]]:
+    try:
+      select_stmt: Select[Tuple[int, str]] = select(
+        cls.id,
+        cls.ip_address
+      ).order_by(cls.id)
+      result: Result[Tuple[int, str]] = await db_session.execute(select_stmt)
+      return result.fetchall()
+    except Exception as err:
+      raise err
+
+  @classmethod
   async def get_ips_on_domain_id_extend(
     cls: type[Self],
     db_session: AsyncSession,

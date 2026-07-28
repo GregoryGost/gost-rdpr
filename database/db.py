@@ -3,6 +3,7 @@ from asyncio import (
   sleep,
   wait_for,
   create_task,
+  to_thread,
   Queue,
   QueueFull,
   TimeoutError,
@@ -35,7 +36,7 @@ from config.config import settings
 from logger.logger import logger, Logger
 from client.file_loader_client import FileLoaderClient
 
-from utils.utils import get_ip_version, calculate_checksum
+from utils.utils import check_ip_allow, get_ip_version, calculate_checksum
 
 from models.db.dns_servers_dbo import DnsServersDbo
 from models.db.domains_lists_dbo import DomainsListsDbo
@@ -1142,6 +1143,37 @@ class DataBase:
     finally:
       await db_session.close()
 
+  async def get_not_allowed_ip_record_ids(self: Self) -> List[int]:
+    logger.debug('Try get IP address records blocked by IP_NOT_ALLOWED ...')
+    db_session: AsyncSession | None = None
+    try:
+      db_session = await self.__read_connect()
+      ip_records: Sequence[Row[Tuple[int, str]]] = \
+        await IpRecordsDbo.get_all_ids_and_addresses(db_session=db_session)
+      result = await to_thread(
+        lambda: [
+          record[0]
+          for record in ip_records
+          if not check_ip_allow(record[1])
+        ]
+      )
+      logger.debug(
+        f'IP address records blocked by IP_NOT_ALLOWED: {len(result)}'
+      )
+      return result
+    except Exception as err:
+      logger.error(
+        'Try get IP address records blocked by IP_NOT_ALLOWED failed : '
+        f'{err}',
+        exc_info=True
+      )
+      if db_session is not None:
+        await db_session.rollback()
+      raise err
+    finally:
+      if db_session is not None:
+        await db_session.close()
+
   async def put_add_ips_to_queue(self: Self, ips: List[IpsPostElementReq]) -> None:
     logger.debug(f'Try send Ips to Queue ...')
     try:
@@ -1194,6 +1226,51 @@ class DataBase:
       logger.error(f'Queue is full for try send deleted Domains to Queue')
     except Exception as err:
       logger.error(f'Unexpected error - Try send deleted Domains to Queue : {err}', exc_info=True)
+
+  async def put_delete_ip_records_to_queue(self: Self, ids: List[int]) -> bool:
+    logger.debug('Try send IP address records for deletion to Queue ...')
+    if len(ids) < 1:
+      return True
+    if self.db_save_queue.full():
+      logger.error('Queue is full for IP address records deletion')
+      return False
+    try:
+      ips_element: QueueElementDto = QueueElementDto(
+        target=TargetAction.IPS_DELETE_ID,
+        elements=ids
+      )
+      logger.debug(
+        f'Put IP address records for deletion to Queue: {len(ids)}'
+      )
+      self.db_save_queue.put_nowait(item=ips_element)
+      return True
+    except QueueFull:
+      logger.error('Queue is full for IP address records deletion')
+      return False
+    except Exception as err:
+      logger.error(
+        'Unexpected error - Try send IP address records for deletion to '
+        f'Queue : {err}',
+        exc_info=True
+      )
+      return False
+
+  async def cleanup_not_allowed_ip_records(self: Self) -> None:
+    logger.debug('Start cleanup of IP address records blocked by IP_NOT_ALLOWED')
+    try:
+      ids: List[int] = await self.get_not_allowed_ip_record_ids()
+      is_queued: bool = await self.put_delete_ip_records_to_queue(ids)
+      if is_queued:
+        logger.info(
+          'IP address records blocked by IP_NOT_ALLOWED queued for '
+          f'deletion: {len(ids)}'
+        )
+    except Exception as err:
+      logger.error(
+        'Cleanup of IP address records blocked by IP_NOT_ALLOWED failed : '
+        f'{err}',
+        exc_info=True
+      )
 
   async def get_all_ips_for_domain(self: Self, domain_id: int) -> List[IpRecordDto]:
     logger.debug(f'Try get all IP address records for Domain {domain_id=} ...')

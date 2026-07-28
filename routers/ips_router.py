@@ -1,10 +1,14 @@
 from fastapi import APIRouter, status, BackgroundTasks, Query, Path, Body
 from fastapi.responses import JSONResponse
+from httpx import HTTPError
 from time import monotonic
 from typing import Annotated, Self, List, Dict
 
 from logger.logger import logger
 from database.db import db
+from cache.cache import ripe_stat_cache
+from client.ripe_stat_client import RipeStatClient, RipeStatClientError
+from utils.utils import get_ip_network_address, get_ip_version
 
 from .base_router import BaseRouter
 
@@ -12,8 +16,13 @@ from .base_router import BaseRouter
 from models.http.base import ErrorResp, NotFoundResp, NoDataResp, OkResp
 # request models
 from models.http.ips_req import IpsQueryReq, IpsSearchQueryReq, IpsPostElementReq
+from models.http.ripe_stat_req import RipeStatPrefixCheckReq
 # response models
-from models.http.ips_resp import IpsPayloadResp, IpsElementResp
+from models.http.ips_resp import (
+  IpsPayloadResp,
+  IpsElementResp
+)
+from models.http.ripe_stat_resp import RipeStatPrefixCheckResp
 
 class IpsRouter(BaseRouter):
 
@@ -47,6 +56,8 @@ class IpsRouter(BaseRouter):
       }
     ]
   ]
+
+  __ripe_stat_client: RipeStatClient = RipeStatClient()
 
   def __init__(self: Self) -> None:
     self.router: APIRouter = APIRouter(
@@ -84,6 +95,52 @@ class IpsRouter(BaseRouter):
       except Exception as err:
         return self.errorResp(err)
 
+    @router.post(
+      path='/cleanup/not-allowed',
+      name='Queue cleanup of IP addresses blocked by IP_NOT_ALLOWED',
+      description=(
+        'Starts background cleanup of IP address records matching '
+        'IP_NOT_ALLOWED; deletion is queued without direct database writes'
+      ),
+      response_model=OkResp,
+      status_code=status.HTTP_202_ACCEPTED,
+      responses={
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
+      }
+    )
+    async def cleanup_not_allowed_ips(
+      background_tasks: BackgroundTasks
+    ) -> JSONResponse:
+      logger.debug('Call API route: POST /ips/cleanup/not-allowed')
+      try:
+        background_tasks.add_task(db.cleanup_not_allowed_ip_records)
+        return JSONResponse(
+          content=OkResp().to_dict(),
+          status_code=status.HTTP_202_ACCEPTED
+        )
+      except Exception as err:
+        return self.errorResp(err)
+
+    @router.post(
+      path='/ripe/cache/clear',
+      name='Clear RIPEstat prefix cache',
+      description=(
+        'Clears only the in-memory RIPEstat prefix cache without changing '
+        'database records'
+      ),
+      response_model=OkResp,
+      responses={
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
+      }
+    )
+    async def clear_ripe_stat_cache() -> JSONResponse:
+      logger.debug('Call API route: POST /ips/ripe/cache/clear')
+      try:
+        await ripe_stat_cache.clear()
+        return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
+      except Exception as err:
+        return self.errorResp(err)
+
     @router.get(
       path='/search',
       name='Find Ips address by text',
@@ -108,6 +165,83 @@ class IpsRouter(BaseRouter):
           use_default_gw=query.default_gw
         )
         return JSONResponse(return_data.to_dict(), status.HTTP_200_OK)
+      except Exception as err:
+        return self.errorResp(err)
+
+    @router.post(
+      path='/ripe/check',
+      name='Check IPv4 prefix in RIPEstat',
+      description='Check an IPv4 address in RIPEstat without saving a record to the database',
+      response_model=RipeStatPrefixCheckResp,
+      responses={
+        status.HTTP_404_NOT_FOUND: {'model': NotFoundResp},
+        status.HTTP_422_UNPROCESSABLE_ENTITY: {'model': ErrorResp},
+        status.HTTP_502_BAD_GATEWAY: {'model': ErrorResp},
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
+      }
+    )
+    async def check_ip_prefix_in_ripe_stat(
+      data: Annotated[RipeStatPrefixCheckReq, Body()]
+    ) -> JSONResponse:
+      logger.debug('Call API route: POST /ips/ripe/check')
+      try:
+        address: str | None = data.address
+
+        if data.id is not None:
+          ip_record: IpsElementResp | None = await db.get_ip_record_on_id(
+            data.id
+          )
+
+          if ip_record is None:
+            not_found_resp = NotFoundResp(
+              resolution=f"IP address with ID '{data.id}' not found in local db"
+            )
+            return JSONResponse(
+              content=not_found_resp.to_dict(),
+              status_code=status.HTTP_404_NOT_FOUND
+            )
+
+          address = get_ip_network_address(ip_record.addr)
+
+          if get_ip_version(address) != 4:
+            error = ErrorResp(
+              error='Only IPv4 addresses are supported by this check'
+            )
+            return JSONResponse(
+              content=error.to_dict(),
+              status_code=status.HTTP_422_UNPROCESSABLE_ENTITY
+            )
+
+          logger.debug(
+            f'IP address found on ID={data.id} for RIPEstat prefix check: '
+            f'{address}'
+          )
+
+        if address is None:
+          raise ValueError('IP address is not defined')
+
+        ripe_result = await self.__ripe_stat_client.get_prefix(address=address)
+        return_data = RipeStatPrefixCheckResp(
+          address=ripe_result.address,
+          prefix=ripe_result.prefix
+        )
+        return JSONResponse(
+          content=return_data.to_dict(),
+          status_code=status.HTTP_200_OK
+        )
+      except (RipeStatClientError, HTTPError) as err:
+        logger.error(
+          f'RIPEstat prefix check failed for {address}: '
+          f'[{err.__class__.__name__}] {err}'
+        )
+        error = ErrorResp(
+          error='RIPEstat prefix check failed',
+          resolution=str(err)
+        )
+        return JSONResponse(
+          content=error.to_dict(),
+          status_code=status.HTTP_502_BAD_GATEWAY
+        )
       except Exception as err:
         return self.errorResp(err)
 

@@ -1,5 +1,6 @@
 from os import getcwd
 from os.path import normpath, join
+from ipaddress import IPv4Network, IPv6Network, ip_network
 from pydantic import Field, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
@@ -74,10 +75,24 @@ class Settings(BaseSettings):
   # Lists section
   lists_update_interval_sec: int = Field(default=604800) # default 7 days
   # IP address section
-  ip_not_allowed: str = Field(default='127.0.0.1, 0.0.0.0, 0.0.0.0/0, ::, ::/0')
+  ip_not_allowed: str = Field(default=(
+    '0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, '
+    '169.254.0.0/16, 172.16.0.0/12, 192.0.2.0/24, '
+    '192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, '
+    '198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, '
+    '240.0.0.0/4, ::/128, ::1/128, fc00::/7, fe80::/10, '
+    'ff00::/8, 2001:db8::/32'
+  ))
   # ROUTEROS section
   ros_rest_api_read_timeout: float = Field(default=59.0) # ROS REST API server read timeout = 60s
   ros_rest_api_default_timeout: float = Field(default=59.0) # ROS REST API server base default timeout = 60s
+  # RIPE
+  ripe_stat_base_url: str = Field(default='https://stat.ripe.net')
+  ripe_stat_requests_semaphore_limit: int = Field(default=5)
+  ripe_stat_cache_size: int = Field(default=10000)
+  ripe_stat_prefix_cache_ttl_sec: int = Field(default=28800)
+  ripe_stat_empty_prefix_cache_ttl_sec: int = Field(default=3600)
+  ripe_stat_cache_lock_ttl_sec: int = Field(default=120)
 
   @computed_field
   @property
@@ -93,7 +108,14 @@ class Settings(BaseSettings):
   @computed_field
   @property
   def ip_not_allowed_list(self: Self) -> List[str]:
-    return self.ip_not_allowed.split(',')
+    return [value.strip() for value in self.ip_not_allowed.split(',') if value.strip()]
+
+  @property
+  def ip_not_allowed_networks(self: Self) -> List[IPv4Network | IPv6Network]:
+    return [
+      ip_network(value, strict=False)
+      for value in self.ip_not_allowed_list
+    ]
 
   @computed_field
   @property
