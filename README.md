@@ -167,12 +167,15 @@ How to alt install python 3.14 in WSL Debian
 
 ```sh
 sudo apt update
-sudo apt install pkg-config build-essential zlib1g-dev libncurses5-dev libgdbm-dev libnss3-dev libssl-dev libreadline-dev libffi-dev libsqlite3-dev -y
+sudo apt install pkg-config build-essential zlib1g-dev libncurses5-dev libgdbm-dev \
+  libnss3-dev libssl-dev libreadline-dev libffi-dev libsqlite3-dev -y
 wget https://www.python.org/ftp/python/3.14.0/Python-3.14.0.tgz
 tar -xzvf Python-3.14.0.tgz
 cd Python-3.14.0
 dpkg-architecture --query DEB_BUILD_GNU_TYPE # use in --build next ./configure
-./configure --build="x86_64-linux-gnu" --prefix=/usr/local --enable-optimizations --enable-loadable-sqlite-extensions --enable-option-checking=fatal --enable-shared LDFLAGS="-Wl,-rpath /usr/local/lib" --with-ensurepip
+./configure --build="x86_64-linux-gnu" --prefix=/usr/local --enable-optimizations \
+  --enable-loadable-sqlite-extensions --enable-option-checking=fatal --enable-shared \
+  LDFLAGS="-Wl,-rpath /usr/local/lib" --with-ensurepip
 nproc # if output 20 CPUS use 18
 sudo make -j 18
 sudo make altinstall
@@ -272,11 +275,13 @@ docker buildx use build-container
 # PROD
 docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push -t gregorygost/gost-rdpr .
 # Spec PROD version
-docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push -t gregorygost/gost-rdpr:latest -t gregorygost/gost-rdpr:2.0.1 .
+docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push \
+  -t gregorygost/gost-rdpr:latest -t gregorygost/gost-rdpr:2.0.1 .
 # DEV
 docker buildx build --no-cache --platform linux/amd64,linux/arm64 --push -t gregorygost/gost-rdpr:dev .
 # TEST in builder
-docker buildx build --no-cache --progress=plain --platform linux/amd64 --load -t gregorygost/gost-rdpr:dev --builder=build-container .
+docker buildx build --no-cache --progress=plain --platform linux/amd64 --load \
+  -t gregorygost/gost-rdpr:dev --builder=build-container .
 
 # Local build (only one platform amd64 or arm64 ... etc.)
 docker buildx build --no-cache --platform linux/amd64 --output=type=docker -t gregorygost/gost-rdpr:dev .
@@ -285,7 +290,8 @@ docker save gregorygost/gost-rdpr:dev > gost-rdpr_amd64_2.0.9-dev.tar
 
 ```shell
 # run docker after build
-docker run --name gost-rdpr -p 8080:80 -p 5000:4000 -e LOG_LEVEL='debug' --memory=1024m --cpus="1" --restart unless-stopped -d gregorygost/gost-rdpr
+docker run --name gost-rdpr -p 8080:80 -p 5000:4000 -e LOG_LEVEL='debug' \
+  --memory=1024m --cpus="1" --restart unless-stopped -d gregorygost/gost-rdpr
 # simple
 docker run --name gost-rdpr-dev -p 8080:80 -p 5000:4000 -d gregorygost/gost-rdpr:dev
 # enter in docker shell
