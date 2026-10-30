@@ -1,96 +1,90 @@
 import logging
 from asyncio import (
-  sleep,
-  wait_for,
-  create_task,
-  to_thread,
+  CancelledError,
   Queue,
   QueueFull,
   QueueShutDown,
   Task,
+  create_task,
   shield,
-  TimeoutError,
-  CancelledError
+  sleep,
+  to_thread,
+  wait_for,
 )
-from sqlalchemy import (
-  __version__ as sqlalchemy_version,
-  func,
-  text,
-  insert,
-  delete,
-  update,
-  Result,
-  Row
-)
-from aiosqlite import __version__ as aiosqlite_version
-from sqlalchemy.pool import NullPool, AsyncAdaptedQueuePool
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine, async_sessionmaker, AsyncSession, AsyncConnection
 from datetime import datetime, timezone
-from time import monotonic
 from enum import StrEnum
-from sqlite3 import SQLITE_BUSY, SQLITE_LOCKED, Error as SQLiteError
-from pathlib import Path
-from json import loads
-from importlib.util import spec_from_file_location, module_from_spec
 from importlib.machinery import ModuleSpec
-from typing import Self, Tuple, Optional, Dict, List, Sequence, Any
+from importlib.util import module_from_spec, spec_from_file_location
+from json import loads
+from pathlib import Path
+from sqlite3 import SQLITE_BUSY, SQLITE_LOCKED
+from sqlite3 import Error as SQLiteError
+from time import monotonic
 from types import ModuleType
+from typing import Any, Dict, List, Optional, Self, Sequence, Tuple
 
-from config.config import settings
-from logger.logger import logger, Logger
+from aiosqlite import __version__ as aiosqlite_version
+from sqlalchemy import Result, Row, delete, func, insert, text, update
+from sqlalchemy import __version__ as sqlalchemy_version
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool
+
 from client.file_loader_client import FileLoaderClient
-
-from utils.utils import check_ip_allow, get_ip_version, calculate_checksum
-
+from config.config import settings
+from jobs.job_registry import Jobs, job_registry
+from logger.logger import Logger, logger
 from models.db.dns_servers_dbo import DnsServersDbo
-from models.db.domains_lists_dbo import DomainsListsDbo
-from models.db.ips_lists_dbo import IpsListsDbo
 from models.db.domains_dbo import DomainsDbo
+from models.db.domains_lists_dbo import DomainsListsDbo
 from models.db.ip_records_dbo import IpRecordsDbo
-from models.db.ros_configs_dbo import RosConfigsDbo
+from models.db.ips_lists_dbo import IpsListsDbo
 from models.db.migrations_dbo import MigrationsDbo
-
+from models.db.ros_configs_dbo import RosConfigsDbo
+from models.dto.dns_server_dto import DnsServerDto, DnsServerType
+from models.dto.domains_dto import DomainResult
+from models.dto.domains_lists_dto import DomainsListDto
+from models.dto.ip_record_dto import IpRecordDto
+from models.dto.ips_lists_dto import IpsListDto
+from models.dto.migrations_dto import MigrationsDto
+from models.dto.queue_dto import QueueElementDto, TargetAction
+from models.dto.ros_config_dto import RosConfigDto
 from models.http.dns_servers_req import DnsPostElementReq
-from models.http.dns_servers_resp import DnsPayloadResp, DnsElementResp
+from models.http.dns_servers_resp import DnsElementResp, DnsPayloadResp
+
 #
 from models.http.domains_lists_req import DomainsListsPostElementReq
-from models.http.domains_lists_resp import DomainsListsPayloadResp, DomainsListElementResp
-from models.dto.domains_lists_dto import DomainsListDto
+from models.http.domains_lists_resp import DomainsListElementResp, DomainsListsPayloadResp
+
 #
 from models.http.domains_req import DomainsPostElementReq
-from models.http.domains_resp import DomainsPayloadResp, DomainElementResp
+from models.http.domains_resp import DomainElementResp, DomainsPayloadResp
+
 #
 from models.http.ips_lists_req import IpsListsPostElementReq
-from models.http.ips_lists_resp import IpsListsPayloadResp, IpsListElementResp
-from models.dto.ips_lists_dto import IpsListDto
+from models.http.ips_lists_resp import IpsListElementResp, IpsListsPayloadResp
+
 #
 from models.http.ips_req import IpsPostElementReq
-from models.http.ips_resp import IpsPayloadResp, IpsElementResp
+from models.http.ips_resp import IpsElementResp, IpsPayloadResp
+
 #
 from models.http.ros_configs_req import RosConfigsPostElementReq
-from models.http.ros_configs_resp import RosConfigPayloadResp, RosConfigElementResp
+from models.http.ros_configs_resp import RosConfigElementResp, RosConfigPayloadResp
+
 #
-from models.http.statistics_req import DATE_FORMAT, GrowthEntity, GrowthGranularity, GrowthDateField
+from models.http.statistics_req import DATE_FORMAT, GrowthDateField, GrowthEntity, GrowthGranularity
 from models.http.statistics_resp import (
-  StatsResp,
   StatsDnsData,
   StatsDomainsData,
   StatsDomainsListItem,
+  StatsGrowthPoint,
+  StatsGrowthResp,
   StatsIpsData,
   StatsIpsListItem,
+  StatsResp,
   StatsRosData,
-  StatsGrowthResp,
-  StatsGrowthPoint
 )
-
-from models.dto.queue_dto import QueueElementDto, TargetAction
-from models.dto.domains_dto import DomainResult
-from models.dto.dns_server_dto import DnsServerType, DnsServerDto
-from models.dto.ip_record_dto import IpRecordDto
-from models.dto.ros_config_dto import RosConfigDto
-from models.dto.migrations_dto import MigrationsDto
-
-from jobs.job_registry import job_registry, Jobs
+from utils.utils import calculate_checksum, check_ip_allow, get_ip_version
 
 
 class DomainIpReadError(RuntimeError):
@@ -101,8 +95,14 @@ class DatabaseWriteError(RuntimeError):
   """A sanitized failure of database initialization or queued persistence."""
 
   def __init__(
-    self, message: str, *, retryable: bool = False, committed: bool = False,
-    outcome_unknown: bool = False, pending_count: int = 0, unknown_count: int = 0,
+    self,
+    message: str,
+    *,
+    retryable: bool = False,
+    committed: bool = False,
+    outcome_unknown: bool = False,
+    pending_count: int = 0,
+    unknown_count: int = 0,
   ) -> None:
     super().__init__(message)
     self.retryable = retryable
@@ -176,28 +176,20 @@ class DataBase:
       pool_recycle=settings.db_pool_recycle,
       max_overflow=settings.db_pool_size_overflow,
       poolclass=AsyncAdaptedQueuePool,
-      pool_pre_ping=True
+      pool_pre_ping=True,
     )
     self.__write_engine: AsyncEngine = create_async_engine(
-      url=settings.db_connection,
-      connect_args={'timeout': settings.db_timeout},
-      poolclass=NullPool
+      url=settings.db_connection, connect_args={'timeout': settings.db_timeout}, poolclass=NullPool
     )
     self.__read_engine.dialect.identifier_preparer.initial_quote = ''
     self.__read_engine.dialect.identifier_preparer.final_quote = ''
     self.__write_engine.dialect.identifier_preparer.initial_quote = ''
     self.__write_engine.dialect.identifier_preparer.final_quote = ''
     self.__read_session_factory = async_sessionmaker(
-      bind=self.__read_engine,
-      expire_on_commit=False,
-      autocommit=False,
-      autoflush=True
+      bind=self.__read_engine, expire_on_commit=False, autocommit=False, autoflush=True
     )
     self.__write_session_factory = async_sessionmaker(
-      bind=self.__write_engine,
-      expire_on_commit=False,
-      autocommit=False,
-      autoflush=True
+      bind=self.__write_engine, expire_on_commit=False, autocommit=False, autoflush=True
     )
     self.file_loader_client: FileLoaderClient = FileLoaderClient()
     logger.debug(f'{self.__class__.__name__} INIT OK')
@@ -234,7 +226,7 @@ class DataBase:
   @property
   def unknown_count(self) -> int:
     return self.__unknown_count
-  
+
   #
 
   async def __session_tune(self: Self, session: AsyncSession):
@@ -257,23 +249,17 @@ class DataBase:
         await conn.run_sync(MigrationsDbo.metadata.create_all)
         await conn.run_sync(DnsServersDbo.metadata.create_all)
         await conn.execute(
-          insert(DnsServersDbo).prefix_with('OR IGNORE').values(
-            id=0,
-            server='1.1.1.1',
-            description='Cloudflare DNS - Default'
-          )
+          insert(DnsServersDbo)
+          .prefix_with('OR IGNORE')
+          .values(id=0, server='1.1.1.1', description='Cloudflare DNS - Default')
         )
         await conn.run_sync(DomainsListsDbo.metadata.create_all)
         await conn.run_sync(IpsListsDbo.metadata.create_all)
         await conn.run_sync(DomainsDbo.metadata.create_all)
         await conn.execute(
-          insert(DomainsDbo).prefix_with('OR IGNORE').values(
-            id=0,
-            resolved=True,
-            name='default',
-            ros_comment='Default Domain',
-            last_resolved_at=func.now()
-          )
+          insert(DomainsDbo)
+          .prefix_with('OR IGNORE')
+          .values(id=0, resolved=True, name='default', ros_comment='Default Domain', last_resolved_at=func.now())
         )
         await conn.run_sync(IpRecordsDbo.metadata.create_all)
         await conn.run_sync(RosConfigsDbo.metadata.create_all)
@@ -322,16 +308,22 @@ class DataBase:
       if db_session is not None:
         try:
           await db_session.close()
-        except (Exception, CancelledError):
+        except Exception, CancelledError:
           self.__session_cleanup_failed = True
-          logger.error('Database initialization session cleanup failed')
+          logger.error(
+            'Database initialization session cleanup failed',
+            exc_info=DatabaseWriteError('Database initialization session cleanup failed'),
+          )
       failure = WriterFailedError('Database initialization failed', pending_count=self.pending_count)
       self.__fail_writer(failure)
       if not self.__session_cleanup_failed:
         try:
           await self.__dispose_engines()
-        except (Exception, CancelledError):
-          logger.error('Database initialization engine cleanup failed')
+        except Exception, CancelledError:
+          logger.error(
+            'Database initialization engine cleanup failed',
+            exc_info=DatabaseWriteError('Database initialization engine cleanup failed'),
+          )
       if isinstance(err, CancelledError):
         raise
       raise DatabaseWriteError('Database initialization failed') from err
@@ -343,7 +335,14 @@ class DataBase:
     if self.__writer_state == WriterState.RUNNING:
       return
     if self.__writer_state == WriterState.FAILED:
-      raise self.__writer_failure
+      if self.__writer_failure is not None:
+        raise self.__writer_failure
+      raise WriterFailedError(
+        'Database writer has failed',
+        pending_count=self.pending_count,
+        unknown_count=self.unknown_count,
+        outcome_unknown=bool(self.unknown_count),
+      )
     if self.__writer_state == WriterState.STOPPING or not self.__state:
       raise WriterClosedError('Database writer is not ready to start')
     if self.__writer_state == WriterState.STOPPED:
@@ -352,23 +351,27 @@ class DataBase:
       self.db_save_queue = Queue(maxsize=settings.queue_max_size)
       self.__close_task = None
     self.__writer_state = WriterState.RUNNING
-    self.__writer_task = create_task(
-      self.__task_process_commit_db_from_queue(), name='database_writer'
-    )
+    self.__writer_task = create_task(self.__task_process_commit_db_from_queue(), name='database_writer')
     self.__writer_task.add_done_callback(self.__observe_writer)
 
   def __observe_writer(self, task: Task[None]) -> None:
     if task.cancelled() or task.exception() is not None:
-      self.__fail_writer(WriterFailedError(
-        'Database writer terminated unexpectedly', pending_count=self.pending_count,
-        unknown_count=self.unknown_count, outcome_unknown=bool(self.unknown_count),
-      ))
+      self.__fail_writer(
+        WriterFailedError(
+          'Database writer terminated unexpectedly',
+          pending_count=self.pending_count,
+          unknown_count=self.unknown_count,
+          outcome_unknown=bool(self.unknown_count),
+        )
+      )
 
   def __check_admission(self) -> None:
     if self.__writer_state == WriterState.FAILED:
       raise WriterFailedError(
-        'Database writer has failed', pending_count=self.pending_count,
-        unknown_count=self.unknown_count, outcome_unknown=bool(self.unknown_count),
+        'Database writer has failed',
+        pending_count=self.pending_count,
+        unknown_count=self.unknown_count,
+        outcome_unknown=bool(self.unknown_count),
       )
     if self.__writer_state not in (WriterState.NEW, WriterState.RUNNING):
       raise WriterClosedError('Database writer is closed', pending_count=self.pending_count)
@@ -394,9 +397,7 @@ class DataBase:
     if self.__writer_failure is None:
       self.__writer_failure = failure
     self.db_save_queue.shutdown(immediate=False)
-    logger.error(
-      f'Database writer failed; pending={self.pending_count}, unknown={self.unknown_count}'
-    )
+    logger.error(f'Database writer failed; pending={self.pending_count}, unknown={self.unknown_count}')
 
   async def __dispose_engines(self) -> None:
     try:
@@ -411,15 +412,21 @@ class DataBase:
           await self.__writer_task
         except CancelledError:
           if self.__writer_failure is None:
-            self.__fail_writer(WriterFailedError(
-              'Database writer was cancelled', pending_count=self.pending_count,
-              unknown_count=self.unknown_count,
-            ))
+            self.__fail_writer(
+              WriterFailedError(
+                'Database writer was cancelled',
+                pending_count=self.pending_count,
+                unknown_count=self.unknown_count,
+              )
+            )
       if self.__writer_failure is None:
         if self.pending_count:
-          self.__fail_writer(WriterFailedError(
-            'Database writer stopped with pending commands', pending_count=self.pending_count,
-          ))
+          self.__fail_writer(
+            WriterFailedError(
+              'Database writer stopped with pending commands',
+              pending_count=self.pending_count,
+            )
+          )
         else:
           await self.db_save_queue.join()
       if self.__writer_failure is not None:
@@ -430,9 +437,12 @@ class DataBase:
         try:
           await self.__dispose_engines()
         except Exception:
-          self.__fail_writer(WriterFailedError(
-            'Database engine cleanup failed', pending_count=self.pending_count,
-          ))
+          failure = WriterFailedError(
+            'Database engine cleanup failed',
+            pending_count=self.pending_count,
+          )
+          logger.error('Database engine cleanup failed', exc_info=failure)
+          self.__fail_writer(failure)
       if self.__writer_failure is None:
         self.__writer_state = WriterState.STOPPED
 
@@ -465,7 +475,8 @@ class DataBase:
         self.__unknown_count = len(self.__pending_batch)
       failure = DatabaseShutdownError(
         'Database shutdown did not confirm a complete drain',
-        pending_count=self.pending_count, unknown_count=self.unknown_count,
+        pending_count=self.pending_count,
+        unknown_count=self.unknown_count,
         outcome_unknown=bool(self.unknown_count),
       )
       self.__fail_writer(failure)
@@ -489,7 +500,7 @@ class DataBase:
       return migration_files
     except Exception as err:
       raise err
-    
+
   async def __get_all_applied_migrations(self: Self, conn: AsyncConnection) -> List[MigrationsDto]:
     logger.debug(f'Try get applied migrations ...')
     applied_migrations: List[MigrationsDto] = []
@@ -540,16 +551,21 @@ class DataBase:
       for migration in target_migrations:
         migration_state: bool = await self.__run_migration(migration_file=migration, conn=conn)
         if migration_state == True:
-          await conn.execute(insert(MigrationsDbo).prefix_with('OR IGNORE').values(
-            name=migration.name,
-            checksum=calculate_checksum(file_path=migration),
-            applied_at=datetime.now(timezone.utc)
-          ))
+          await conn.execute(
+            insert(MigrationsDbo)
+            .prefix_with('OR IGNORE')
+            .values(
+              name=migration.name,
+              checksum=calculate_checksum(file_path=migration),
+              applied_at=datetime.now(timezone.utc),
+            )
+          )
         if migration_state == False:
-          await conn.execute(insert(MigrationsDbo).prefix_with('OR IGNORE').values(
-            name=migration.name,
-            checksum=calculate_checksum(file_path=migration)
-          ))
+          await conn.execute(
+            insert(MigrationsDbo)
+            .prefix_with('OR IGNORE')
+            .values(name=migration.name, checksum=calculate_checksum(file_path=migration))
+          )
     except Exception as err:
       self.__initialization_failed = True
       logger.error(f'Migrations failed : {err}', exc_info=True)
@@ -646,10 +662,7 @@ class DataBase:
   async def put_add_dns_servers_to_queue(self: Self, dns_servers: List[DnsPostElementReq]) -> None:
     logger.debug(f'Try send DNS servers to Queue ...')
     try:
-      dns_server_element: QueueElementDto = QueueElementDto(
-        target=TargetAction.DNS_SERVERS_ADD,
-        elements=dns_servers
-      )
+      dns_server_element: QueueElementDto = QueueElementDto(target=TargetAction.DNS_SERVERS_ADD, elements=dns_servers)
       await self.__put_write(item=dns_server_element)
     except DatabaseWriteError:
       raise
@@ -663,15 +676,9 @@ class DataBase:
     try:
       if id != None:
         logger.debug(f'Once DNS server delete {id=}')
-        dns_server_element: QueueElementDto = QueueElementDto(
-          target=TargetAction.DNS_SERVERS_DELETE,
-          elements=[id]
-        )
+        dns_server_element: QueueElementDto = QueueElementDto(target=TargetAction.DNS_SERVERS_DELETE, elements=[id])
       else:
-        dns_server_element: QueueElementDto = QueueElementDto(
-          target=TargetAction.DNS_SERVERS_DELETE_ALL,
-          elements=[]
-        )
+        dns_server_element: QueueElementDto = QueueElementDto(target=TargetAction.DNS_SERVERS_DELETE_ALL, elements=[])
       await self.__put_write(item=dns_server_element)
     except DatabaseWriteError:
       raise
@@ -805,8 +812,7 @@ class DataBase:
     logger.debug(f'Try send Domains lists to Queue ...')
     try:
       domains_lists_element: QueueElementDto = QueueElementDto(
-        target=TargetAction.DOMAINS_LISTS_ADD,
-        elements=domains_lists
+        target=TargetAction.DOMAINS_LISTS_ADD, elements=domains_lists
       )
       await self.__put_write(item=domains_lists_element)
     except DatabaseWriteError:
@@ -821,14 +827,10 @@ class DataBase:
     try:
       if id != None:
         logger.debug(f'One Domains list delete {id=}')
-        domains_list_element: QueueElementDto = QueueElementDto(
-          target=TargetAction.DOMAINS_LISTS_DELETE,
-          elements=[id]
-        )
+        domains_list_element: QueueElementDto = QueueElementDto(target=TargetAction.DOMAINS_LISTS_DELETE, elements=[id])
       else:
         domains_list_element: QueueElementDto = QueueElementDto(
-          target=TargetAction.DOMAINS_LISTS_DELETE_ALL,
-          elements=[]
+          target=TargetAction.DOMAINS_LISTS_DELETE_ALL, elements=[]
         )
       await self.__put_write(item=domains_list_element)
     except DatabaseWriteError:
@@ -843,8 +845,7 @@ class DataBase:
     try:
       logger.debug(f'One Domains lists update {domains_lists=}')
       domains_list_element: QueueElementDto = QueueElementDto(
-        target=TargetAction.DOMAINS_LISTS_UPDATE,
-        elements=domains_lists
+        target=TargetAction.DOMAINS_LISTS_UPDATE, elements=domains_lists
       )
       await self.__put_write(item=domains_list_element)
     except DatabaseWriteError:
@@ -965,25 +966,15 @@ class DataBase:
     logger.debug(f'Try send Domains to Queue ...')
     try:
       filtered_domains: List[DomainsPostElementReq] = [
-        domain
-        for domain in domains
-        if len(domain.domain) > settings.domains_filtered_min_len
+        domain for domain in domains if len(domain.domain) > settings.domains_filtered_min_len
       ]
       if settings.domains_not_allowed_pattern != None:
         clear_domains: List[DomainsPostElementReq] = [
-          domain
-          for domain in filtered_domains
-          if settings.domains_not_allowed_pattern.search(domain.domain) == None
+          domain for domain in filtered_domains if settings.domains_not_allowed_pattern.search(domain.domain) == None
         ]
-        domains_element: QueueElementDto = QueueElementDto(
-          target=TargetAction.DOMAINS_ADD,
-          elements=clear_domains
-        )
+        domains_element: QueueElementDto = QueueElementDto(target=TargetAction.DOMAINS_ADD, elements=clear_domains)
       else:
-        domains_element: QueueElementDto = QueueElementDto(
-          target=TargetAction.DOMAINS_ADD,
-          elements=filtered_domains
-        )
+        domains_element: QueueElementDto = QueueElementDto(target=TargetAction.DOMAINS_ADD, elements=filtered_domains)
       await self.__put_write(item=domains_element)
     except DatabaseWriteError:
       raise
@@ -997,15 +988,9 @@ class DataBase:
     try:
       if id != None:
         logger.debug(f'One Domains delete {id=}')
-        domains_element: QueueElementDto = QueueElementDto(
-          target=TargetAction.DOMAINS_DELETE,
-          elements=[id]
-        )
+        domains_element: QueueElementDto = QueueElementDto(target=TargetAction.DOMAINS_DELETE, elements=[id])
       else:
-        domains_element: QueueElementDto = QueueElementDto(
-          target=TargetAction.DOMAINS_DELETE_ALL,
-          elements=[]
-        )
+        domains_element: QueueElementDto = QueueElementDto(target=TargetAction.DOMAINS_DELETE_ALL, elements=[])
       await self.__put_write(item=domains_element)
     except DatabaseWriteError:
       raise
@@ -1074,8 +1059,7 @@ class DataBase:
     logger.debug(f'Try send insert ips, delete ips, update domains to Queue ...')
     try:
       domains_resolved_element: QueueElementDto = QueueElementDto(
-        target=TargetAction.DOMAINS_RESOLVED,
-        elements=[domain]
+        target=TargetAction.DOMAINS_RESOLVED, elements=[domain]
       )
       await self.__put_write(item=domains_resolved_element)
     except DatabaseWriteError:
@@ -1185,10 +1169,7 @@ class DataBase:
   async def put_add_ips_lists_to_queue(self: Self, ips_lists: List[IpsListsPostElementReq]) -> None:
     logger.debug(f'Try send Ips lists to Queue ...')
     try:
-      ips_lists_element: QueueElementDto = QueueElementDto(
-        target=TargetAction.IPS_LISTS_ADD,
-        elements=ips_lists
-      )
+      ips_lists_element: QueueElementDto = QueueElementDto(target=TargetAction.IPS_LISTS_ADD, elements=ips_lists)
       await self.__put_write(item=ips_lists_element)
     except DatabaseWriteError:
       raise
@@ -1202,15 +1183,9 @@ class DataBase:
     try:
       if id != None:
         logger.debug(f'One Ips list delete {id=}')
-        ips_list_element: QueueElementDto = QueueElementDto(
-          target=TargetAction.IPS_LISTS_DELETE,
-          elements=[id]
-        )
+        ips_list_element: QueueElementDto = QueueElementDto(target=TargetAction.IPS_LISTS_DELETE, elements=[id])
       else:
-        ips_list_element: QueueElementDto = QueueElementDto(
-          target=TargetAction.IPS_LISTS_DELETE_ALL,
-          elements=[]
-        )
+        ips_list_element: QueueElementDto = QueueElementDto(target=TargetAction.IPS_LISTS_DELETE_ALL, elements=[])
       await self.__put_write(item=ips_list_element)
     except DatabaseWriteError:
       raise
@@ -1223,10 +1198,7 @@ class DataBase:
     logger.debug(f'Try send update Ips lists to Queue ...')
     try:
       logger.debug(f'One Ips lists update {ips_lists=}')
-      ips_list_element: QueueElementDto = QueueElementDto(
-        target=TargetAction.IPS_LISTS_UPDATE,
-        elements=ips_lists
-      )
+      ips_list_element: QueueElementDto = QueueElementDto(target=TargetAction.IPS_LISTS_UPDATE, elements=ips_lists)
       await self.__put_write(item=ips_list_element)
     except DatabaseWriteError:
       raise
@@ -1369,10 +1341,7 @@ class DataBase:
   async def put_add_ips_to_queue(self: Self, ips: List[IpsPostElementReq]) -> None:
     logger.debug(f'Try send Ips to Queue ...')
     try:
-      ips_element: QueueElementDto = QueueElementDto(
-        target=TargetAction.IPS_ADD,
-        elements=ips
-      )
+      ips_element: QueueElementDto = QueueElementDto(target=TargetAction.IPS_ADD, elements=ips)
       await self.__put_write(item=ips_element)
     except DatabaseWriteError:
       raise
@@ -1387,26 +1356,18 @@ class DataBase:
       if id_or_ip != None:
         try:
           id: int = int(id_or_ip)
-          logger.debug(f'IP address delete is ID {id=}')
-          ips_element: QueueElementDto = QueueElementDto(
-            target=TargetAction.IPS_DELETE_ID,
-            elements=[id]
-          )
-        except:
+        except TypeError, ValueError:
           try:
             get_ip_version(str(id_or_ip))
-            logger.debug(f'IP address delete is ADDRESS {id_or_ip=}')
-            ips_element: QueueElementDto = QueueElementDto(
-              target=TargetAction.IPS_DELETE_ADDR,
-              elements=[id_or_ip]
-            )
-          except:
-            pass
+          except ValueError:
+            return
+          logger.debug(f'IP address delete is ADDRESS {id_or_ip=}')
+          ips_element = QueueElementDto(target=TargetAction.IPS_DELETE_ADDR, elements=[id_or_ip])
+        else:
+          logger.debug(f'IP address delete is ID {id=}')
+          ips_element = QueueElementDto(target=TargetAction.IPS_DELETE_ID, elements=[id])
       else:
-        ips_element: QueueElementDto = QueueElementDto(
-          target=TargetAction.IPS_DELETE_ALL,
-          elements=[]
-        )
+        ips_element: QueueElementDto = QueueElementDto(target=TargetAction.IPS_DELETE_ALL, elements=[])
       await self.__put_write(item=ips_element)
     except DatabaseWriteError:
       raise
@@ -1420,24 +1381,15 @@ class DataBase:
     if len(ids) < 1:
       return True
     try:
-      ips_element: QueueElementDto = QueueElementDto(
-        target=TargetAction.IPS_DELETE_ID,
-        elements=ids
-      )
-      logger.debug(
-        f'Put IP address records for deletion to Queue: {len(ids)}'
-      )
+      ips_element: QueueElementDto = QueueElementDto(target=TargetAction.IPS_DELETE_ID, elements=ids)
+      logger.debug(f'Put IP address records for deletion to Queue: {len(ids)}')
       self.__put_write_nowait(item=ips_element)
       return True
-    except (QueueFull, DatabaseWriteError):
+    except QueueFull, DatabaseWriteError:
       logger.error('Queue is full for IP address records deletion')
       return False
     except Exception as err:
-      logger.error(
-        'Unexpected error - Try send IP address records for deletion to '
-        f'Queue : {err}',
-        exc_info=True
-      )
+      logger.error(f'Unexpected error - Try send IP address records for deletion to Queue : {err}', exc_info=True)
       return False
 
   async def cleanup_not_allowed_ip_records(self: Self) -> None:
@@ -1617,10 +1569,7 @@ class DataBase:
   async def put_add_ros_configs_to_queue(self: Self, ros_configs: List[RosConfigsPostElementReq]) -> None:
     logger.debug(f'Try send RoS configs to Queue ...')
     try:
-      ros_configs_element: QueueElementDto = QueueElementDto(
-        target=TargetAction.ROS_CONFIG_ADD,
-        elements=ros_configs
-      )
+      ros_configs_element: QueueElementDto = QueueElementDto(target=TargetAction.ROS_CONFIG_ADD, elements=ros_configs)
       await self.__put_write(item=ros_configs_element)
     except DatabaseWriteError:
       raise
@@ -1634,15 +1583,9 @@ class DataBase:
     try:
       if id != None:
         logger.debug(f'One Router OS config delete {id=}')
-        ros_configs_element: QueueElementDto = QueueElementDto(
-          target=TargetAction.ROS_CONFIG_DELETE,
-          elements=[id]
-        )
+        ros_configs_element: QueueElementDto = QueueElementDto(target=TargetAction.ROS_CONFIG_DELETE, elements=[id])
       else:
-        ros_configs_element: QueueElementDto = QueueElementDto(
-          target=TargetAction.ROS_CONFIG_DELETE_ALL,
-          elements=[]
-        )
+        ros_configs_element: QueueElementDto = QueueElementDto(target=TargetAction.ROS_CONFIG_DELETE_ALL, elements=[])
       await self.__put_write(item=ros_configs_element)
     except DatabaseWriteError:
       raise
@@ -1683,8 +1626,12 @@ class DataBase:
         domains_lists: List[DomainsListDto] = await DomainsListsDbo.get_for_update(db_session=db_session, forced=forced)
         logger.debug(f'{domains_lists=}')
         await self.file_loader_client.get_domains_from_lists(lists=domains_lists)
-        unactive_domains_lists: List[DomainsListDto] = [list for list in domains_lists if list.attempts >= settings.attempts_limit]
-        active_domains_lists: List[DomainsListDto] = [list for list in domains_lists if list.attempts < settings.attempts_limit]
+        unactive_domains_lists: List[DomainsListDto] = [
+          list for list in domains_lists if list.attempts >= settings.attempts_limit
+        ]
+        active_domains_lists: List[DomainsListDto] = [
+          list for list in domains_lists if list.attempts < settings.attempts_limit
+        ]
         # delete unactive domains lists
         if len(unactive_domains_lists) > 0:
           for list in unactive_domains_lists:
@@ -1694,7 +1641,8 @@ class DataBase:
           domains_add: List[DomainsPostElementReq] = []
           domains_delete: List[DomainResult] = []
           for list in active_domains_lists:
-            if list.found_elements == None: continue # if hash not change in get_domains_from_lists - found_elements is None
+            if list.found_elements == None:
+              continue  # if hash not change in get_domains_from_lists - found_elements is None
             current_domains: List[DomainResult] = await self.get_all_domains_on_domains_list(domains_list_id=list.id)
             current_domains_list: List[str] = [domain.name for domain in current_domains]
             [
@@ -1702,11 +1650,7 @@ class DataBase:
               for domain in list.found_elements
               if domain not in current_domains_list
             ]
-            [
-              domains_delete.append(domain)
-              for domain in current_domains
-              if domain.name not in list.found_elements
-            ]
+            [domains_delete.append(domain) for domain in current_domains if domain.name not in list.found_elements]
           await self.put_add_domains_to_queue(domains=domains_add)
           for domain in domains_delete:
             await self.put_delete_domains_to_queue(id=domain.id)
@@ -1727,7 +1671,8 @@ class DataBase:
           ips_add: List[IpsPostElementReq] = []
           ips_delete: List[IpRecordDto] = []
           for list in active_ips_lists:
-            if list.found_elements == None: continue # if hash not change in get_ips_from_lists - found_elements is None
+            if list.found_elements == None:
+              continue  # if hash not change in get_ips_from_lists - found_elements is None
             current_ips: List[IpRecordDto] = await self.get_all_ips_on_ips_list(ips_list_id=list.id)
             current_ips_list: List[str] = [ip.ip_address for ip in current_ips]
             [
@@ -1735,11 +1680,7 @@ class DataBase:
               for ip in list.found_elements
               if ip not in current_ips_list
             ]
-            [
-              ips_delete.append(ip)
-              for ip in current_ips
-              if ip.ip_address not in list.found_elements
-            ]
+            [ips_delete.append(ip) for ip in current_ips if ip.ip_address not in list.found_elements]
           await self.put_add_ips_to_queue(ips=ips_add)
           for ip in ips_delete:
             await self.put_delete_ips_to_queue(id_or_ip=ip.id)
@@ -1908,16 +1849,24 @@ class DataBase:
     except CancelledError:
       # Native SQLite work may continue after cancellation of its awaiter.
       self.__unknown_count = len(self.__pending_batch)
-      self.__fail_writer(WriterFailedError(
-        'Database writer was cancelled', pending_count=self.pending_count,
-        unknown_count=self.unknown_count, outcome_unknown=True,
-      ))
+      self.__fail_writer(
+        WriterFailedError(
+          'Database writer was cancelled',
+          pending_count=self.pending_count,
+          unknown_count=self.unknown_count,
+          outcome_unknown=True,
+        )
+      )
       while not self.__batch_task.done():
         try:
           await shield(self.__batch_task)
         except CancelledError:
-          continue
+          pass
         except Exception:
+          logger.error(
+            'Database batch failed during writer cancellation',
+            exc_info=DatabaseWriteError('Database batch failed during writer cancellation'),
+          )
           break
       try:
         self.__batch_task.result()
@@ -1926,10 +1875,14 @@ class DataBase:
           self.__acknowledge_batch()
         elif not err.outcome_unknown:
           self.__unknown_count = 0
-          self.__writer_failure.outcome_unknown = False
-          self.__writer_failure.unknown_count = 0
-      except (Exception, CancelledError):
-        pass
+          if self.__writer_failure is not None:
+            self.__writer_failure.outcome_unknown = False
+            self.__writer_failure.unknown_count = 0
+      except Exception, CancelledError:
+        logger.error(
+          'Database batch outcome could not be confirmed after cancellation',
+          exc_info=DatabaseWriteError('Database batch outcome could not be confirmed after cancellation'),
+        )
       else:
         self.__acknowledge_batch()
       raise
@@ -1944,49 +1897,58 @@ class DataBase:
 
   async def __task_process_commit_db_from_queue(self: Self) -> None:
     logger.info('Database writer started')
-    deadline: float | None = None
+    deadline = 0.0
     try:
       while self.__writer_state != WriterState.FAILED:
         if self.__pending_batch and (
-          len(self.__pending_batch) >= max(1, settings.db_save_batch_size)
-          or monotonic() >= deadline
+          len(self.__pending_batch) >= max(1, settings.db_save_batch_size) or monotonic() >= deadline
         ):
           await self.__flush_pending()
-          deadline = None
+          deadline = 0.0
         try:
           if self.__pending_batch:
-            queue_element = await wait_for(
-              self.db_save_queue.get(), timeout=max(0.0, deadline - monotonic())
-            )
+            queue_element = await wait_for(self.db_save_queue.get(), timeout=max(0.0, deadline - monotonic()))
           else:
             queue_element = await self.db_save_queue.get()
         except TimeoutError:
           await self.__flush_pending()
-          deadline = None
+          deadline = 0.0
           continue
         except QueueShutDown:
           await self.__flush_pending()
           break
         self.__pending_batch.append(queue_element)
-        if deadline is None:
+        if len(self.__pending_batch) == 1:
           deadline = monotonic() + settings.db_save_batch_timeout
     except CancelledError:
-      self.__fail_writer(WriterFailedError(
-        'Database writer was cancelled', pending_count=self.pending_count,
-        unknown_count=self.unknown_count, outcome_unknown=bool(self.unknown_count),
-      ))
+      self.__fail_writer(
+        WriterFailedError(
+          'Database writer was cancelled',
+          pending_count=self.pending_count,
+          unknown_count=self.unknown_count,
+          outcome_unknown=bool(self.unknown_count),
+        )
+      )
       raise
     except DatabaseWriteError as err:
-      self.__fail_writer(WriterFailedError(
-        'Database batch persistence failed', pending_count=self.pending_count,
-        unknown_count=self.unknown_count, outcome_unknown=bool(self.unknown_count),
-        committed=err.committed,
-      ))
+      self.__fail_writer(
+        WriterFailedError(
+          'Database batch persistence failed',
+          pending_count=self.pending_count,
+          unknown_count=self.unknown_count,
+          outcome_unknown=bool(self.unknown_count),
+          committed=err.committed,
+        )
+      )
     except Exception:
-      self.__fail_writer(WriterFailedError(
-        'Database writer failed unexpectedly', pending_count=self.pending_count,
-        unknown_count=self.unknown_count, outcome_unknown=bool(self.unknown_count),
-      ))
+      failure = WriterFailedError(
+        'Database writer failed unexpectedly',
+        pending_count=self.pending_count,
+        unknown_count=self.unknown_count,
+        outcome_unknown=bool(self.unknown_count),
+      )
+      logger.error('Database writer failed unexpectedly', exc_info=failure)
+      self.__fail_writer(failure)
     finally:
       if self.__writer_state != WriterState.FAILED:
         self.__writer_state = WriterState.STOPPED
@@ -2008,7 +1970,7 @@ class DataBase:
         {
           DnsServersDbo.server.property.key: item.server,
           DnsServersDbo.doh_server.property.key: item.doh_server,
-          DnsServersDbo.description.property.key: item.description
+          DnsServersDbo.description.property.key: item.description,
         }
         for queue_element in queue_elements
         if queue_element.target == TargetAction.DNS_SERVERS_ADD
@@ -2021,16 +1983,14 @@ class DataBase:
         for item in queue_element.elements
       ]
       dns_servers_delete_all: list[QueueElementDto] = [
-        queue_element
-        for queue_element in queue_elements
-        if queue_element.target == TargetAction.DNS_SERVERS_DELETE_ALL
+        queue_element for queue_element in queue_elements if queue_element.target == TargetAction.DNS_SERVERS_DELETE_ALL
       ]
       # DOMAINS LISTS
       domains_lists_add: List[Dict[str, str | None]] = [
         {
           DomainsListsDbo.name.property.key: item.name,
           DomainsListsDbo.url.property.key: item.url,
-          DomainsListsDbo.description.property.key: item.description
+          DomainsListsDbo.description.property.key: item.description,
         }
         for queue_element in queue_elements
         if queue_element.target == TargetAction.DOMAINS_LISTS_ADD
@@ -2054,7 +2014,7 @@ class DataBase:
           DomainsListsDbo.url.property.key: item.url,
           DomainsListsDbo.description.property.key: item.description,
           DomainsListsDbo.hash.property.key: item.hash,
-          DomainsListsDbo.attempts.property.key: item.attempts
+          DomainsListsDbo.attempts.property.key: item.attempts,
         }
         for queue_element in queue_elements
         if queue_element.target == TargetAction.DOMAINS_LISTS_UPDATE
@@ -2065,7 +2025,7 @@ class DataBase:
         {
           DomainsDbo.name.property.key: item.domain,
           DomainsDbo.domain_list_id.property.key: item.list_id,
-          DomainsDbo.ros_comment.property.key: item.ros_comment
+          DomainsDbo.ros_comment.property.key: item.ros_comment,
         }
         for queue_element in queue_elements
         if queue_element.target == TargetAction.DOMAINS_ADD
@@ -2078,19 +2038,17 @@ class DataBase:
         for item in queue_element.elements
       ]
       domains_delete_all: list[QueueElementDto] = [
-        queue_element
-        for queue_element in queue_elements
-        if queue_element.target == TargetAction.DOMAINS_DELETE_ALL
+        queue_element for queue_element in queue_elements if queue_element.target == TargetAction.DOMAINS_DELETE_ALL
       ]
       domains_resolved_update: List[Dict[str, int | bool | datetime]] = [
         {
           DomainsDbo.id.property.key: domain.id,
           DomainsDbo.resolved.property.key: True,
-          DomainsDbo.last_resolved_at.property.key: datetime.now(timezone.utc)
+          DomainsDbo.last_resolved_at.property.key: datetime.now(timezone.utc),
         }
         for queue_element in queue_elements
         if queue_element.target == TargetAction.DOMAINS_RESOLVED
-        for domain in queue_element.elements # item = DomainResult
+        for domain in queue_element.elements  # item = DomainResult
         if domain.resolution_complete
       ]
       # IPS LISTS
@@ -2098,7 +2056,7 @@ class DataBase:
         {
           IpsListsDbo.name.property.key: item.name,
           IpsListsDbo.url.property.key: item.url,
-          IpsListsDbo.description.property.key: item.description
+          IpsListsDbo.description.property.key: item.description,
         }
         for queue_element in queue_elements
         if queue_element.target == TargetAction.IPS_LISTS_ADD
@@ -2111,9 +2069,7 @@ class DataBase:
         for item in queue_element.elements
       ]
       ips_lists_delete_all: list[QueueElementDto] = [
-        queue_element
-        for queue_element in queue_elements
-        if queue_element.target == TargetAction.IPS_LISTS_DELETE_ALL
+        queue_element for queue_element in queue_elements if queue_element.target == TargetAction.IPS_LISTS_DELETE_ALL
       ]
       ips_lists_update: List[Dict[str, str | int | None]] = [
         {
@@ -2122,7 +2078,7 @@ class DataBase:
           IpsListsDbo.url.property.key: item.url,
           IpsListsDbo.description.property.key: item.description,
           IpsListsDbo.hash.property.key: item.hash,
-          IpsListsDbo.attempts.property.key: item.attempts
+          IpsListsDbo.attempts.property.key: item.attempts,
         }
         for queue_element in queue_elements
         if queue_element.target == TargetAction.IPS_LISTS_UPDATE
@@ -2136,30 +2092,30 @@ class DataBase:
           IpRecordsDbo.domain_id.property.key: item.domain_id,
           IpRecordsDbo.addr_type.property.key: get_ip_version(item.addr),
           IpRecordsDbo.ros_comment.property.key: item.ros_comment,
-          IpRecordsDbo.use_default_gw.property.key: item.use_default_gw
+          IpRecordsDbo.use_default_gw.property.key: item.use_default_gw,
         }
         for queue_element in queue_elements
         if queue_element.target == TargetAction.IPS_ADD
-        for item in queue_element.elements # item = IpsPostElementReq
+        for item in queue_element.elements  # item = IpsPostElementReq
       ]
       ips_resolved_add: List[Dict[str, str | int]] = [
         {
           IpRecordsDbo.ip_address.property.key: ip_record.ip_address,
           IpRecordsDbo.domain_id.property.key: domain_result.id,
-          IpRecordsDbo.addr_type.property.key: ip_record.addr_type
+          IpRecordsDbo.addr_type.property.key: ip_record.addr_type,
         }
         for queue_element in queue_elements
         if queue_element.target == TargetAction.DOMAINS_RESOLVED
-        for domain_result in queue_element.elements # item = DomainResult
-        for ip_record in domain_result.insert.ips_insert # ip_record = IpRecordDto
+        for domain_result in queue_element.elements  # item = DomainResult
+        for ip_record in domain_result.insert.ips_insert  # ip_record = IpRecordDto
       ]
       ips_resolved_delete: List[int] = [
         ip_id
         for queue_element in queue_elements
         if queue_element.target == TargetAction.DOMAINS_RESOLVED
-        for domain_result in queue_element.elements # item = DomainResult
+        for domain_result in queue_element.elements  # item = DomainResult
         if domain_result.resolution_complete
-        for ip_id in domain_result.insert.ips_delete # ip_id = int
+        for ip_id in domain_result.insert.ips_delete  # ip_id = int
       ]
       ips_id_delete: List[int] = [
         item
@@ -2174,9 +2130,7 @@ class DataBase:
         for item in queue_element.elements
       ]
       ips_delete_all: list[QueueElementDto] = [
-        queue_element
-        for queue_element in queue_elements
-        if queue_element.target == TargetAction.IPS_DELETE_ALL
+        queue_element for queue_element in queue_elements if queue_element.target == TargetAction.IPS_DELETE_ALL
       ]
       # ROS CONFIGS
       ros_configs_add: List[Dict[str, str | None]] = [
@@ -2185,11 +2139,11 @@ class DataBase:
           RosConfigsDbo.user.property.key: item.user,
           RosConfigsDbo.passwd.property.key: item.user_password,
           RosConfigsDbo.bgp_list_name.property.key: item.bgp_list_name,
-          RosConfigsDbo.description.property.key: item.description
+          RosConfigsDbo.description.property.key: item.description,
         }
         for queue_element in queue_elements
         if queue_element.target == TargetAction.ROS_CONFIG_ADD
-        for item in queue_element.elements # item = RosConfigsPostElementReq
+        for item in queue_element.elements  # item = RosConfigsPostElementReq
       ]
       ros_configs_delete: List[int] = [
         item
@@ -2198,9 +2152,7 @@ class DataBase:
         for item in queue_element.elements
       ]
       ros_configs_delete_all: list[QueueElementDto] = [
-        queue_element
-        for queue_element in queue_elements
-        if queue_element.target == TargetAction.ROS_CONFIG_DELETE_ALL
+        queue_element for queue_element in queue_elements if queue_element.target == TargetAction.ROS_CONFIG_DELETE_ALL
       ]
       #
       #
@@ -2218,7 +2170,7 @@ class DataBase:
       # DOMAINS LISTS
       if len(domains_lists_add) > 0:
         await DomainsListsDbo.add_batch(db_session=db_session, items=domains_lists_add)
-      if len(domains_lists_delete) > 0: # ATTEMPTS
+      if len(domains_lists_delete) > 0:  # ATTEMPTS
         await db_session.execute(delete(DomainsListsDbo).where(DomainsListsDbo.id.in_(domains_lists_delete)))
       if len(domains_lists_delete_all) > 0:
         await db_session.execute(delete(DomainsListsDbo).where(DomainsListsDbo.id > 0))
@@ -2227,7 +2179,7 @@ class DataBase:
       # IPS LISTS
       if len(ips_lists_add) > 0:
         await IpsListsDbo.add_batch(db_session=db_session, items=ips_lists_add)
-      if len(ips_lists_delete) > 0: # ATTEMPTS
+      if len(ips_lists_delete) > 0:  # ATTEMPTS
         await db_session.execute(delete(IpsListsDbo).where(IpsListsDbo.id.in_(ips_lists_delete)))
       if len(ips_lists_delete_all) > 0:
         await db_session.execute(delete(IpsListsDbo).where(IpsListsDbo.id > 0))
@@ -2272,9 +2224,12 @@ class DataBase:
       if db_session is not None:
         try:
           await db_session.rollback()
-        except (Exception, CancelledError):
+        except Exception, CancelledError:
           rollback_ok = False
-          logger.error('Database batch rollback failed')
+          logger.error(
+            'Database batch rollback failed',
+            exc_info=DatabaseWriteError('Database batch rollback failed'),
+          )
     finally:
       if db_session is not None:
         try:
@@ -2284,23 +2239,30 @@ class DataBase:
           self.__session_cleanup_failed = True
           if failure is None:
             failure = err
-          logger.error('Database batch session cleanup failed')
+          logger.error(
+            'Database batch session cleanup failed',
+            exc_info=DatabaseWriteError('Database batch session cleanup failed'),
+          )
     if failure is not None:
       # SQLite extended result codes retain the primary code in the low byte.
       original = getattr(failure, 'orig', failure)
       sqlite_code = getattr(original, 'sqlite_errorcode', None)
       retryable = (
-        not commit_started and rollback_ok and release_ok
+        not commit_started
+        and rollback_ok
+        and release_ok
         and isinstance(original, SQLiteError)
         and isinstance(sqlite_code, int)
-        and sqlite_code & 0xff in (SQLITE_BUSY, SQLITE_LOCKED)
+        and sqlite_code & 0xFF in (SQLITE_BUSY, SQLITE_LOCKED)
         and not isinstance(failure, CancelledError)
       )
       raise BatchWriteError(
         'Database batch cleanup failed after commit' if committed else 'Database batch could not be committed',
-        retryable=retryable, committed=committed,
+        retryable=retryable,
+        committed=committed,
         outcome_unknown=commit_started and not committed,
       ) from failure
+
 
 # Init DataBase
 try:

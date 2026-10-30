@@ -631,8 +631,11 @@ async def test_terminal_write_failure_retains_work_and_never_replays_ambiguity(
   assert await stored_names(app, store) == (['failed.example.test'] if stage == 'after_commit' else [])
   with pytest.raises(app.database.WriterFailedError):
     await store.close(timeout=2)
-  with pytest.raises(app.database.WriterFailedError):
+  with pytest.raises(app.database.WriterFailedError) as restart_failure:
     await store.start_writer()
+  assert restart_failure.value.pending_count == store.pending_count == 2
+  assert restart_failure.value.unknown_count == store.unknown_count
+  assert restart_failure.value.outcome_unknown is bool(store.unknown_count)
   with pytest.raises(app.database.WriterFailedError):
     await enqueue_names(app, store, ['late.example.test'])
   assert await store.put_delete_ip_records_to_queue([10]) is False
@@ -640,14 +643,14 @@ async def test_terminal_write_failure_retains_work_and_never_replays_ambiguity(
 
 
 @pytest.mark.parametrize('cleanup_stage', ['rollback', 'close'])
-async def test_failed_precommit_cleanup_prevents_lock_retry(app, store, monkeypatch, cleanup_stage):
+async def test_failed_precommit_cleanup_prevents_lock_retry(app, store, monkeypatch, caplog, cleanup_stage):
   monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
 
   async def fault(stage, evidence):
     if stage == 'begin':
       raise lock_error()
     if stage == cleanup_stage:
-      raise RuntimeError('synthetic cleanup failure')
+      raise lock_error()
 
   evidence = instrument_sessions(store, monkeypatch, fault=fault)
   await enqueue_names(app, store, ['cleanup.example.test'])
@@ -658,14 +661,18 @@ async def test_failed_precommit_cleanup_prevents_lock_retry(app, store, monkeypa
   assert store.writer_state == 'FAILED'
   assert store.pending_count == 1
   assert await stored_names(app, store) == []
+  assert 'Database batch' in caplog.text
+  assert 'synthetic private SQL payload' not in caplog.text
+  assert 'synthetic private SQL statement' not in caplog.text
+  assert 'synthetic private' not in str(store.writer_failure)
 
 
-async def test_known_commit_with_close_failure_is_acknowledged_without_replay(app, store, monkeypatch):
+async def test_known_commit_with_close_failure_is_acknowledged_without_replay(app, store, monkeypatch, caplog):
   monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
 
   async def fault(stage, evidence):
     if stage == 'close':
-      raise RuntimeError('synthetic close failure')
+      raise lock_error()
 
   evidence = instrument_sessions(store, monkeypatch, fault=fault)
   await enqueue_names(app, store, ['committed.example.test'])
@@ -678,6 +685,9 @@ async def test_known_commit_with_close_failure_is_acknowledged_without_replay(ap
   assert store.unknown_count == 0
   await asyncio.wait_for(store.db_save_queue.join(), timeout=2)
   assert store.writer_failure.committed is True
+  assert 'Database batch session cleanup failed' in caplog.text
+  assert 'synthetic private' not in caplog.text
+  assert 'synthetic private' not in str(store.writer_failure)
   with pytest.raises(app.database.WriterFailedError):
     await store.close(timeout=2)
   assert evidence.commits == 1
@@ -711,6 +721,71 @@ async def test_setup_failure_never_starts_writer_and_keeps_original_cause(app, s
   assert store.writer_task is None
   assert store.writer_state == 'FAILED'
   assert 'private' not in str(failure.value)
+
+
+@pytest.mark.parametrize('cleanup_stage', ['session', 'engine'])
+async def test_initialization_cleanup_diagnostics_hide_native_errors(app, store, monkeypatch, caplog, cleanup_stage):
+  class FailingReadSession(AsyncSession):
+    async def execute(self, *args, **kwargs):
+      await super().execute(*args, **kwargs)
+      raise lock_error()
+
+    async def close(self):
+      await super().close()
+      if cleanup_stage == 'session':
+        raise lock_error()
+
+  with monkeypatch.context() as startup_patch:
+    startup_patch.setattr(
+      store,
+      '_DataBase__read_session_factory',
+      async_sessionmaker(bind=store._DataBase__read_engine, class_=FailingReadSession),
+    )
+    if cleanup_stage == 'engine':
+      engine_type = type(store._DataBase__write_engine)
+      original_dispose = engine_type.dispose
+
+      async def fail_dispose(engine, *args, **kwargs):
+        await original_dispose(engine, *args, **kwargs)
+        if engine is store._DataBase__write_engine:
+          raise lock_error()
+
+      startup_patch.setattr(engine_type, 'dispose', fail_dispose)
+
+    # Existing isolated tables are sufficient; this fault belongs to startup cleanup.
+    async def ready_tables():
+      pass
+
+    startup_patch.setattr(store, '_DataBase__create_tables', ready_tables)
+    with pytest.raises(app.database.DatabaseWriteError) as failure:
+      await store.setup()
+  assert store.writer_state == 'FAILED'
+  assert store.writer_task is None
+  assert store.pending_count == store.unknown_count == 0
+  assert isinstance(failure.value.__cause__, OperationalError)
+  assert 'synthetic private' not in str(failure.value)
+  assert f'Database initialization {cleanup_stage} cleanup failed' in caplog.text
+  assert 'synthetic private' not in caplog.text
+
+
+async def test_shutdown_engine_cleanup_diagnostics_hide_native_errors(app, store, monkeypatch, caplog):
+  engine_type = type(store._DataBase__write_engine)
+  original_dispose = engine_type.dispose
+
+  async def fail_dispose(engine, *args, **kwargs):
+    await original_dispose(engine, *args, **kwargs)
+    if engine is store._DataBase__write_engine:
+      raise lock_error()
+
+  with monkeypatch.context() as cleanup_patch:
+    cleanup_patch.setattr(engine_type, 'dispose', fail_dispose)
+    with pytest.raises(app.database.WriterFailedError) as failure:
+      await store.close(timeout=2)
+  assert store.writer_state == 'FAILED'
+  assert store.pending_count == store.unknown_count == 0
+  assert 'Database engine cleanup failed' in caplog.text
+  assert 'synthetic private' not in caplog.text
+  assert 'synthetic private' not in str(failure.value)
 
 
 async def test_lock_after_insert_rolls_back_before_retrying(app, store, monkeypatch):
@@ -895,6 +970,35 @@ async def test_nonblocking_deletion_acknowledges_admission_before_commit(app, st
     13: '8.8.8.0',
     14: '8.8.8.0/25',
   }
+
+
+@pytest.mark.parametrize(
+  ('selector', 'removed_ids'),
+  [
+    (10, {10}),
+    ('10', {10}),
+    ('9.9.9.9', {10}),
+    ('2001:4860:4860::8888', {11}),
+    ('8.8.8.0/24', {12}),
+    (None, {10, 11, 12, 13, 14}),
+    ('', set()),
+    ('invalid-address', set()),
+    ('9.9.9.999', set()),
+  ],
+)
+async def test_ip_deletion_selectors_admit_only_valid_commands(app, store, caplog, selector, removed_ids):
+  await seed(app, store)
+  before_domain, before_ips = await snapshot(app, store)
+  await store.put_delete_ips_to_queue(selector)
+  assert store.pending_count == int(bool(removed_ids))
+  assert await snapshot(app, store) == (before_domain, before_ips)
+  await store.close(timeout=2)
+  assert await snapshot(app, store) == (
+    before_domain,
+    {key: value for key, value in before_ips.items() if key not in removed_ids},
+  )
+  assert store.pending_count == 0
+  assert 'UnboundLocalError' not in caplog.text
 
 
 async def test_idle_writer_waits_for_queue_without_opening_sessions(app, store, monkeypatch):
@@ -1147,11 +1251,11 @@ async def test_setup_observes_runner_failures_and_preserves_migration_history(
     assert [row.applied_at is None for row in history] == [bool(failure_stage)] * 2
 
 
-async def test_lifespan_database_error_keeps_priority_when_http_cleanup_also_fails(app, monkeypatch):
+async def test_lifespan_database_error_keeps_priority_when_http_cleanup_also_fails(app, monkeypatch, caplog):
   server = importlib.import_module('server.server')
   events = []
   database_failure = app.database.DatabaseShutdownError('synthetic database shutdown failure')
-  http_failure = RuntimeError('synthetic HTTP cleanup failure')
+  http_failure = RuntimeError('synthetic private HTTP payload')
 
   async def setup():
     events.append('setup')
@@ -1173,6 +1277,9 @@ async def test_lifespan_database_error_keeps_priority_when_http_cleanup_also_fai
         events.append('body')
   assert raised.value is database_failure
   assert events == ['setup', 'body', 'database_close', 'http_close']
+  assert 'HTTP client cleanup failed during database shutdown failure' in caplog.text
+  assert 'synthetic private HTTP payload' not in caplog.text
+  assert 'synthetic private HTTP payload' not in str(raised.value)
 
 
 async def configure_public_domain(service, *, resolved=True):

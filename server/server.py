@@ -1,37 +1,37 @@
-from re import sub
 from asyncio import CancelledError
-from uvicorn import Config, Server
-from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.exceptions import RequestValidationError
-from fastapi.encoders import jsonable_encoder
-from fastapi.datastructures import QueryParams
-from urllib.parse import unquote
-from typing import Self, Any, AsyncGenerator
 from contextlib import asynccontextmanager
+from re import sub
+from typing import Any, AsyncGenerator, Self
+from urllib.parse import unquote
 
+from fastapi import FastAPI, Request, status
+from fastapi.datastructures import QueryParams
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from uvicorn import Config, Server
+
+from client.http_base_client import HttpClient
 from config.config import settings
-from logger.logger import logger
 from database.db import db
 from jobs.job_registry import job_registry
+from logger.logger import logger
 from metrics.metrics import PrometheusMiddleware
-from client.http_base_client import HttpClient
-
-from .tags_metadata import TagsMetadata
-
-from routers.metrics_router import MetricsRouter
-from routers.home_router import HomeRouter
+from models.http.base import ErrorResp
+from routers.commands_router import CommandsRouter
 from routers.dns_servers_router import DnsServersRouter
 from routers.domains_lists_router import DomainsListsRouter
 from routers.domains_router import DomainsRouter
+from routers.home_router import HomeRouter
 from routers.ips_lists_router import IpsListsRouter
 from routers.ips_router import IpsRouter
+from routers.metrics_router import MetricsRouter
 from routers.ros_configs_router import RosConfigsRouter
-from routers.commands_router import CommandsRouter
 from routers.statistics_router import StatisticsRouter
 
-from models.http.base import ErrorResp
+from .tags_metadata import TagsMetadata
+
 
 class AppServer:
 
@@ -74,11 +74,14 @@ class AppServer:
     finally:
       try:
         await db.close()
-      except (Exception, CancelledError):
+      except Exception, CancelledError:
         try:
           await HttpClient.close()
-        except (Exception, CancelledError):
-          logger.error('HTTP client cleanup failed during database shutdown failure')
+        except Exception, CancelledError:
+          logger.error(
+            'HTTP client cleanup failed during database shutdown failure',
+            exc_info=RuntimeError('HTTP client cleanup failed during database shutdown failure'),
+          )
         raise
       else:
         await HttpClient.close()
