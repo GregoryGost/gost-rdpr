@@ -11,12 +11,13 @@ from asyncio import (
   to_thread,
   wait_for,
 )
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from enum import StrEnum
 from importlib.machinery import ModuleSpec
 from importlib.util import module_from_spec, spec_from_file_location
 from json import loads
 from pathlib import Path
+from re import findall
 from sqlite3 import SQLITE_BUSY, SQLITE_LOCKED
 from sqlite3 import Error as SQLiteError
 from time import monotonic
@@ -24,10 +25,11 @@ from types import ModuleType
 from typing import Any, Dict, List, Optional, Self, Sequence, Tuple
 
 from aiosqlite import __version__ as aiosqlite_version
-from sqlalchemy import Result, Row, delete, func, insert, text, update
+from sqlalchemy import Result, Row, delete, func, insert, select, text, update
 from sqlalchemy import __version__ as sqlalchemy_version
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool
+from sqlalchemy.schema import CreateIndex, CreateTable
 
 from client.file_loader_client import FileLoaderClient
 from config.config import settings
@@ -85,6 +87,21 @@ from models.http.statistics_resp import (
   StatsRosData,
 )
 from utils.utils import calculate_checksum, check_ip_allow, get_ip_version
+
+LEGACY_IMPORT_MIGRATION = 'migration_202511031501.py'
+GATEWAY_MIGRATION = 'migration_202618042122.py'
+STARTUP_MIGRATION_CHECKSUMS = {
+  LEGACY_IMPORT_MIGRATION: '293ddda35db4553c0174d8ecb07902add5bb664a7137e0ce6f36a05899b83fa7',
+  GATEWAY_MIGRATION: '563a6f0d402a11b7e044b60ec29a64cf81f3216f00f3aacc5da2da82cf72e80c',
+}
+LEGACY_BUSINESS_COLUMNS = {
+  'dns_servers': ('id', 'server', 'doh_server', 'description', 'created_at'),
+  'ros_configs': ('id', 'host', 'user', 'pass', 'bgp_list_name', 'description', 'created_at'),
+  'domains_lists': ('id', 'name', 'url', 'description', 'hash', 'created_at', 'updated_at'),
+  'ip_lists': ('id', 'name', 'url', 'description', 'hash', 'created_at', 'updated_at'),
+  'domains': ('id', 'domain_list_id', 'resolved', 'name', 'ros_comment', 'created_at', 'updated_at'),
+  'ip_records': ('id', 'ip_list_id', 'domain_id', 'addr_type', 'ip_address', 'ros_comment', 'created_at'),
+}
 
 
 class DomainIpReadError(RuntimeError):
@@ -242,33 +259,222 @@ class DataBase:
     return session
 
   async def __create_tables(self: Self) -> None:
-    logger.debug('Try create all tables ...')
+    """Initialize schema, migrations, imported data and defaults atomically."""
     self.__initialization_failed = False
-    async with self.__write_engine.begin() as conn:
+    # NullPool closes this dedicated connection, including its temporary FK mode.
+    async with self.__write_engine.connect() as conn:
       try:
+        await conn.execute(text('PRAGMA foreign_keys=OFF'))
+        if (await conn.execute(text('PRAGMA foreign_keys'))).scalar_one() != 0:
+          raise DatabaseWriteError('Cannot configure schema initialization')
+        # Driver legacy transaction control does not begin transactions for DDL.
+        await conn.execute(text('BEGIN IMMEDIATE'))
+        original_schema = {
+          row.name: (row.type, row.sql)
+          for row in (
+            await conn.execute(text("SELECT name, type, sql FROM sqlite_master WHERE type IN ('table', 'view')"))
+          )
+        }
+        applied = (
+          await self.__get_all_applied_migrations(conn) if MigrationsDbo.__tablename__ in original_schema else []
+        )
+        completed = {migration.name for migration in applied if migration.applied_at is not None}
+        if GATEWAY_MIGRATION in completed:
+          if IpRecordsDbo.__tablename__ not in original_schema or not await self.__gateway_effect(conn):
+            raise DatabaseWriteError('Completed gateway migration has an incompatible schema')
+        legacy_counts, remap_default_domain = await self.__startup_legacy_preflight(conn, original_schema, completed)
         await conn.run_sync(MigrationsDbo.metadata.create_all)
-        await conn.run_sync(DnsServersDbo.metadata.create_all)
-        await conn.execute(
-          insert(DnsServersDbo)
-          .prefix_with('OR IGNORE')
-          .values(id=0, server='1.1.1.1', description='Cloudflare DNS - Default')
+        await self.__main_migrations(
+          conn,
+          completed=completed,
+          legacy_counts=legacy_counts,
+          remap_default_domain=remap_default_domain,
         )
-        await conn.run_sync(DomainsListsDbo.metadata.create_all)
-        await conn.run_sync(IpsListsDbo.metadata.create_all)
-        await conn.run_sync(DomainsDbo.metadata.create_all)
-        await conn.execute(
-          insert(DomainsDbo)
-          .prefix_with('OR IGNORE')
-          .values(id=0, resolved=True, name='default', ros_comment='Default Domain', last_resolved_at=func.now())
-        )
-        await conn.run_sync(IpRecordsDbo.metadata.create_all)
-        await conn.run_sync(RosConfigsDbo.metadata.create_all)
-        # Run migrations
-        await self.__main_migrations(conn=conn)
+        if not (await conn.execute(select(DnsServersDbo.id).where(DnsServersDbo.id == 0))).first():
+          await conn.execute(
+            insert(DnsServersDbo).values(id=0, server='1.1.1.1', description='Cloudflare DNS - Default')
+          )
+        if not (await conn.execute(select(DomainsDbo.id).where(DomainsDbo.id == 0))).first():
+          await conn.execute(
+            insert(DomainsDbo).values(
+              id=0, resolved=True, name='default', ros_comment='Default Domain', last_resolved_at=func.now()
+            )
+          )
+        await self.__check_startup_foreign_keys(conn)
         await conn.commit()
       except BaseException:
-        # The connection context owns rollback and release on startup failure.
+        self.__initialization_failed = True
+        # Release rolls back pre-commit failures; commit errors can have unknown outcomes.
+        logger.error('Database schema initialization failed')
         raise
+
+  @staticmethod
+  def __startup_identifier(name: str) -> str:
+    """Quote an internal SQLite identifier independently of engine formatting."""
+    return '"' + name.replace('"', '""') + '"'
+
+  @staticmethod
+  def __startup_sql_tokens(sql: str) -> list[str]:
+    """Compare conservative DDL signatures without changing string literals."""
+    tokens = findall(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|\w+|[^\s]", sql)
+    return [token if token.startswith("'") else token.lower() for token in tokens]
+
+  @staticmethod
+  def __legacy_targets() -> dict[str, str]:
+    return {
+      'dns_servers': DnsServersDbo.__tablename__,
+      'ros_configs': RosConfigsDbo.__tablename__,
+      'domains_lists': DomainsListsDbo.__tablename__,
+      'ip_lists': IpsListsDbo.__tablename__,
+      'domains': DomainsDbo.__tablename__,
+      'ip_records': IpRecordsDbo.__tablename__,
+    }
+
+  async def __compatible_current_table(self, conn: AsyncConnection, name: str, sql: str | None) -> bool:
+    table = MigrationsDbo.metadata.tables[name]
+    if sql is None or self.__startup_sql_tokens(sql) != self.__startup_sql_tokens(
+      str(CreateTable(table).compile(dialect=conn.dialect))
+    ):
+      return False
+    expected_unique_indexes = {
+      tuple(self.__startup_sql_tokens(str(CreateIndex(index).compile(dialect=conn.dialect))))
+      for index in table.indexes
+      if index.unique
+    }
+    indexes = (
+      await conn.execute(text('SELECT name, origin FROM pragma_index_list(:name) WHERE "unique" = 1'), {'name': name})
+    ).all()
+    actual_unique_indexes = set()
+    for index in indexes:
+      if index.origin == 'u':
+        # Inline UNIQUE constraints are already covered by the exact table DDL.
+        continue
+      index_sql = (
+        await conn.execute(
+          text("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = :name"), {'name': index.name}
+        )
+      ).scalar_one()
+      if index_sql is None:
+        return False
+      actual_unique_indexes.add(tuple(self.__startup_sql_tokens(index_sql)))
+    return actual_unique_indexes == expected_unique_indexes
+
+  async def __startup_legacy_preflight(
+    self,
+    conn: AsyncConnection,
+    original_schema: dict[str, tuple[str, str | None]],
+    completed: set[str],
+  ) -> tuple[dict[str, int], bool]:
+    targets = self.__legacy_targets()
+    sources = set(LEGACY_BUSINESS_COLUMNS) | {'jobs'}
+    present = sources & original_schema.keys()
+    overlap = sources & set(targets.values())
+    if overlap:
+      # Current names alone cannot establish the presence of old source data.
+      if present - overlap:
+        raise DatabaseWriteError('Legacy source and target tables overlap')
+      for name in present:
+        kind, sql = original_schema[name]
+        if kind != 'table' or not await self.__compatible_current_table(conn, name, sql):
+          raise DatabaseWriteError('Overlapping schema cannot be identified safely')
+      return {}, False
+    if not present:
+      return {}, False
+    if present != sources or any(original_schema[name][0] != 'table' for name in sources):
+      raise DatabaseWriteError('Legacy schema is incomplete or unsupported')
+    if LEGACY_IMPORT_MIGRATION in completed:
+      raise DatabaseWriteError('Completed legacy migration still has source tables')
+    for name, columns in LEGACY_BUSINESS_COLUMNS.items():
+      shape = (await conn.execute(text('SELECT * FROM pragma_table_xinfo(:name)'), {'name': name})).all()
+      if {column.name for column in shape} != set(columns) or any(column.hidden for column in shape):
+        raise DatabaseWriteError('Legacy business columns are unsupported')
+      for column in shape:
+        expected_type = (
+          'INTEGER'
+          if column.name in {'id', 'domain_list_id', 'ip_list_id', 'domain_id', 'resolved', 'addr_type'}
+          else 'TIMESTAMP'
+          if column.name in {'created_at', 'updated_at'}
+          else 'TEXT'
+        )
+        if column.type.upper() != expected_type or column.pk != (1 if column.name == 'id' else 0):
+          raise DatabaseWriteError('Legacy business column format is unsupported')
+      # Source identities must remain real integers rather than generated target IDs.
+      invalid_ids_query = (
+        'SELECT 1 FROM ' + self.__startup_identifier(name) + " WHERE typeof(id) != 'integer' LIMIT 1"  # noqa: S608
+      )
+      invalid_ids = await conn.execute(text(invalid_ids_query))
+      if invalid_ids.first():
+        raise DatabaseWriteError('Legacy business identities are unsupported')
+    for query in (
+      'SELECT 1 FROM domains c WHERE c.domain_list_id IS NOT NULL AND NOT EXISTS '
+      '(SELECT 1 FROM domains_lists p WHERE p.id = c.domain_list_id) LIMIT 1',
+      'SELECT 1 FROM ip_records c WHERE c.domain_id IS NULL OR NOT EXISTS '
+      '(SELECT 1 FROM domains p WHERE p.id = c.domain_id) LIMIT 1',
+      'SELECT 1 FROM ip_records c WHERE c.ip_list_id IS NOT NULL AND NOT EXISTS '
+      '(SELECT 1 FROM ip_lists p WHERE p.id = c.ip_list_id) LIMIT 1',
+      'SELECT 1 FROM domains WHERE id = -1 AND domain_list_id IS NOT NULL LIMIT 1',
+    ):
+      if (await conn.execute(text(query))).first():
+        raise DatabaseWriteError('Legacy parent identities are inconsistent')
+    for name in ('dns_servers', 'domains'):
+      query = 'SELECT count(*) FROM ' + self.__startup_identifier(name) + ' WHERE id IN (-1, 0)'  # noqa: S608
+      result = await conn.execute(text(query))
+      if result.scalar_one() == 2:
+        raise DatabaseWriteError('Legacy default identities conflict')
+    affected = sources | set(targets.values())
+    triggers = (await conn.execute(text("SELECT tbl_name FROM sqlite_master WHERE type = 'trigger'"))).scalars()
+    if any(name in affected for name in triggers):
+      raise DatabaseWriteError('Legacy import cannot preserve data with table triggers')
+    for name in targets.values():
+      if name in original_schema:
+        kind, sql = original_schema[name]
+        if kind != 'table' or not await self.__compatible_current_table(conn, name, sql):
+          raise DatabaseWriteError('Legacy target schema is incompatible')
+        if await self.__startup_count(conn, name):
+          raise DatabaseWriteError('Legacy import requires empty target tables')
+    counts = {name: await self.__startup_count(conn, name) for name in targets}
+    remap_default_domain = (await conn.execute(text('SELECT 1 FROM domains WHERE id = -1'))).first() is not None
+    return counts, remap_default_domain
+
+  async def __startup_count(self, conn: AsyncConnection, name: str) -> int:
+    # The name comes from the fixed source map or ORM metadata and is quoted.
+    query = 'SELECT count(*) FROM ' + self.__startup_identifier(name)  # noqa: S608
+    result = await conn.execute(text(query))
+    return result.scalar_one()
+
+  async def __check_startup_foreign_keys(self, conn: AsyncConnection) -> None:
+    for name in self.__legacy_targets().values():
+      result = await conn.execute(text('SELECT * FROM pragma_foreign_key_check(:name)'), {'name': name})
+      if result.first() is not None:
+        raise DatabaseWriteError('Managed database foreign key integrity check failed')
+
+  async def __gateway_effect(self, conn: AsyncConnection) -> bool:
+    table = await conn.execute(
+      text("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = :name"),
+      {'name': IpRecordsDbo.__tablename__},
+    )
+    if table.first() is None:
+      return False
+    result = await conn.execute(
+      text('SELECT type, "notnull", dflt_value, pk, hidden FROM pragma_table_xinfo(:name) WHERE name = :column'),
+      {'name': IpRecordsDbo.__tablename__, 'column': 'use_default_gw'},
+    )
+    column = result.one_or_none()
+    if column is None:
+      return False
+    default = str(column.dflt_value).strip()
+    # SQLite preserves parentheses and quoting in reflected defaults.
+    while default.startswith('(') and default.endswith(')'):
+      default = default[1:-1].strip()
+    if (
+      column.type.upper() != 'BOOLEAN'
+      or column.notnull != 1
+      or column.pk
+      or column.hidden
+      or default not in {'0', "'0'", '"0"'}
+    ):
+      raise DatabaseWriteError('Gateway column has an incompatible contract')
+    return True
 
   async def __read_connect(self: Self) -> AsyncSession:
     if self.__state == False: raise Exception('Database not ready to work')
@@ -501,74 +707,68 @@ class DataBase:
     except Exception as err:
       raise err
 
-  async def __get_all_applied_migrations(self: Self, conn: AsyncConnection) -> List[MigrationsDto]:
-    logger.debug(f'Try get applied migrations ...')
-    applied_migrations: List[MigrationsDto] = []
-    try:
-      migrations: Sequence[Row[Tuple[int, str, str, datetime]]] = await MigrationsDbo.get_all(conn=conn)
-      applied_migrations = [
-        MigrationsDto(id=migration[0], name=migration[1], checksum=migration[2], applied_at=migration[3])
-        for migration in migrations
-      ]
-      return applied_migrations
-    except Exception as err:
-      self.__initialization_failed = True
-      logger.error(f'Try get applied migrations failed : {err}', exc_info=True)
-      await conn.rollback()
-      return applied_migrations
+  async def __get_all_applied_migrations(self: Self, conn: AsyncConnection) -> list[MigrationsDto]:
+    migrations = await MigrationsDbo.get_all(conn=conn)
+    return [
+      MigrationsDto(id=migration[0], name=migration[1], checksum=migration[2], applied_at=migration[3])
+      for migration in migrations
+    ]
 
   async def __run_migration(self: Self, migration_file: Path, conn: AsyncConnection) -> bool:
-    logger.debug(f'Run migration "{migration_file.name}" ...')
-    try:
-      spec: ModuleSpec | None = spec_from_file_location(name=migration_file.stem, location=migration_file)
-      if spec != None:
-        migration_module: ModuleType = module_from_spec(spec=spec)
-        if spec.loader != None:
-          spec.loader.exec_module(module=migration_module)
-          if hasattr(migration_module, 'upgrade'):
-            await migration_module.upgrade(conn=conn)
-          if hasattr(migration_module, 'downgrade'):
-            await migration_module.downgrade(conn=conn)
-      return True
-    except Exception as err:
-      self.__initialization_failed = True
-      logger.error(f'Try run migration "{migration_file.name}" failed : {err}', exc_info=True)
-      return False
+    spec: ModuleSpec | None = spec_from_file_location(name=migration_file.stem, location=migration_file)
+    if spec is None or spec.loader is None:
+      raise DatabaseWriteError('Migration module cannot be loaded')
+    migration_module: ModuleType = module_from_spec(spec=spec)
+    spec.loader.exec_module(module=migration_module)
+    if hasattr(migration_module, 'upgrade'):
+      await migration_module.upgrade(conn=conn)
+    if hasattr(migration_module, 'downgrade'):
+      await migration_module.downgrade(conn=conn)
+    return True
 
-  async def __main_migrations(self: Self, conn: AsyncConnection) -> None:
-    logger.debug(f'Start migrations ...')
-    try:
-      # get applied migrations
-      applied_migrations: List[MigrationsDto] = await self.__get_all_applied_migrations(conn=conn)
-      # get migrations files
-      migration_files: List[Path] = await self.__get_migrations_files()
-      # filter migrations
-      target_migrations: List[Path] = [
-        migration
-        for migration in migration_files
-        if migration.name not in [migration.name for migration in applied_migrations if migration.applied_at != None]
-      ]
-      for migration in target_migrations:
-        migration_state: bool = await self.__run_migration(migration_file=migration, conn=conn)
-        if migration_state == True:
-          await conn.execute(
-            insert(MigrationsDbo)
-            .prefix_with('OR IGNORE')
-            .values(
-              name=migration.name,
-              checksum=calculate_checksum(file_path=migration),
-              applied_at=datetime.now(timezone.utc),
+  async def __main_migrations(
+    self,
+    conn: AsyncConnection,
+    *,
+    completed: set[str],
+    legacy_counts: dict[str, int],
+    remap_default_domain: bool,
+  ) -> None:
+    migration_files = await self.__get_migrations_files()
+    if legacy_counts and LEGACY_IMPORT_MIGRATION not in {migration.name for migration in migration_files}:
+      raise DatabaseWriteError('Legacy import migration is unavailable')
+    for migration in migration_files:
+      if migration.name in completed:
+        continue
+      checksum = calculate_checksum(file_path=migration)
+      expected_checksum = STARTUP_MIGRATION_CHECKSUMS.get(migration.name)
+      if expected_checksum is not None and checksum != expected_checksum:
+        raise DatabaseWriteError('Known startup migration source has changed')
+      if migration.name == LEGACY_IMPORT_MIGRATION:
+        if legacy_counts:
+          await self.__run_migration(migration_file=migration, conn=conn)
+          if remap_default_domain:
+            await conn.execute(
+              update(IpRecordsDbo).where(IpRecordsDbo.domain_id == -1).values(domain_id=0, updated_at=None)
             )
-          )
-        if migration_state == False:
-          await conn.execute(
-            insert(MigrationsDbo)
-            .prefix_with('OR IGNORE')
-            .values(name=migration.name, checksum=calculate_checksum(file_path=migration))
-          )
-    except Exception as err:
-      self.__initialization_failed = True
-      logger.error(f'Migrations failed : {err}', exc_info=True)
+          for source, target in self.__legacy_targets().items():
+            if await self.__startup_count(conn, target) != legacy_counts[source]:
+              raise DatabaseWriteError('Legacy import did not preserve every business row')
+          await self.__check_startup_foreign_keys(conn)
+      elif migration.name == GATEWAY_MIGRATION:
+        if not await self.__gateway_effect(conn):
+          await self.__run_migration(migration_file=migration, conn=conn)
+        if not await self.__gateway_effect(conn):
+          raise DatabaseWriteError('Gateway migration did not establish its column')
+      else:
+        await self.__run_migration(migration_file=migration, conn=conn)
+      await conn.execute(
+        insert(MigrationsDbo).values(
+          name=migration.name,
+          checksum=checksum,
+          applied_at=datetime.now(UTC),
+        )
+      )
 
   # DNS servers
 

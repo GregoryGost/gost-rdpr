@@ -2,10 +2,12 @@
 
 import asyncio
 import importlib
+import shutil
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
 from hashlib import sha256
+from pathlib import Path
 from types import SimpleNamespace
 
 import dns.rdatatype
@@ -19,6 +21,158 @@ pytestmark = pytest.mark.integration
 
 # SQLite persists UTC timestamps without a timezone component.
 STALE_CHECKPOINT = datetime(2000, 1, 1, tzinfo=UTC).replace(tzinfo=None)
+
+
+def sqlite_snapshot(path):
+  """Capture physical schema and data, including every historical row."""
+  with closing(sqlite3.connect(path)) as connection:
+    return tuple(connection.iterdump())
+
+
+def create_history(connection):
+  connection.execute("""
+    CREATE TABLE rdpr_migrations (
+      id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL CHECK (name != ''),
+      checksum TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+      applied_at TIMESTAMP
+    )
+  """)
+
+
+def create_legacy_database(path):
+  """Represent the complete business schema of the historical dbInit contract."""
+  with closing(sqlite3.connect(path)) as connection, connection:
+    connection.executescript("""
+      CREATE TABLE dns_servers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, server TEXT UNIQUE CHECK (server != ''),
+        doh_server TEXT UNIQUE CHECK (doh_server != ''), description TEXT,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE ros_configs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT NOT NULL UNIQUE CHECK (host != ''),
+        user TEXT NOT NULL CHECK (user != ''), pass TEXT NOT NULL,
+        bgp_list_name TEXT NOT NULL CHECK (bgp_list_name != ''), description TEXT,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE domains_lists (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE CHECK (name != ''),
+        url TEXT NOT NULL CHECK (url != ''), description TEXT, hash TEXT,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP
+      );
+      CREATE TABLE ip_lists (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE CHECK (name != ''),
+        url TEXT NOT NULL CHECK (url != ''), description TEXT, hash TEXT,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP
+      );
+      CREATE TABLE domains (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, domain_list_id INTEGER,
+        resolved INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL UNIQUE CHECK (name != ''),
+        ros_comment TEXT, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP,
+        FOREIGN KEY (domain_list_id) REFERENCES domains_lists(id) ON DELETE CASCADE
+      );
+      CREATE TABLE ip_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ip_list_id INTEGER, domain_id INTEGER NOT NULL,
+        addr_type INTEGER NOT NULL, ip_address TEXT NOT NULL UNIQUE CHECK (ip_address != ''),
+        ros_comment TEXT, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (domain_id) REFERENCES domains(id) ON DELETE CASCADE,
+        FOREIGN KEY (ip_list_id) REFERENCES ip_lists(id) ON DELETE CASCADE
+      );
+      CREATE TABLE jobs (
+        job_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL CHECK (name != ''),
+        started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, end_at TIMESTAMP
+      );
+      INSERT INTO dns_servers VALUES (-1, '9.9.9.9', NULL, 'custom default', '2001-02-03 04:05:06');
+      INSERT INTO dns_servers VALUES (4, NULL, 'https://dns.example.test/query', 'DoH', '2001-02-03 04:05:06');
+      INSERT INTO ros_configs VALUES (6, 'router.example.test', 'dummy-user', 'dummy-password',
+                                     'routes', 'router', '2001-02-03 04:05:06');
+      INSERT INTO domains_lists VALUES (5, 'domains', 'https://lists.example.test/domains',
+                                       'domain list', 'domain-hash', '2001-02-03 04:05:06', '2002-03-04 05:06:07');
+      INSERT INTO ip_lists VALUES (8, 'ips', 'https://lists.example.test/ips',
+                                  'ip list', 'ip-hash', '2001-02-03 04:05:06', '2002-03-04 05:06:07');
+      INSERT INTO domains VALUES (-1, NULL, 1, 'default', 'custom domain', '2001-02-03 04:05:06', NULL);
+      INSERT INTO domains VALUES (7, 5, 1, 'legacy.example.test', 'domain comment',
+                                  '2001-02-03 04:05:06', '2002-03-04 05:06:07');
+      INSERT INTO ip_records VALUES (11, 8, -1, 4, '8.8.8.8', 'default link', '2001-02-03 04:05:06');
+      INSERT INTO ip_records VALUES (12, NULL, 7, 6, '2001:4860:4860::8888', 'domain link', '2001-02-03 04:05:06');
+      INSERT INTO jobs (name) VALUES ('retired historical job');
+    """)
+
+
+def assert_legacy_import(path):
+  with closing(sqlite3.connect(path)) as connection:
+    assert connection.execute(
+      'SELECT id, server, doh_server, description, created_at, updated_at FROM rdpr_dns_servers ORDER BY id'
+    ).fetchall() == [
+      (0, '9.9.9.9', None, 'custom default', '2001-02-03 04:05:06', None),
+      (4, None, 'https://dns.example.test/query', 'DoH', '2001-02-03 04:05:06', None),
+    ]
+    assert connection.execute(
+      'SELECT id, domain_list_id, resolved, name, ros_comment, created_at, updated_at, last_resolved_at '
+      'FROM rdpr_domains ORDER BY id'
+    ).fetchall() == [
+      (0, None, 1, 'default', 'custom domain', '2001-02-03 04:05:06', None, None),
+      (
+        7,
+        5,
+        1,
+        'legacy.example.test',
+        'domain comment',
+        '2001-02-03 04:05:06',
+        '2002-03-04 05:06:07',
+        '2002-03-04 05:06:07',
+      ),
+    ]
+    assert connection.execute(
+      'SELECT id, ip_list_id, domain_id, addr_type, ip_address, ros_comment, use_default_gw, created_at, updated_at '
+      'FROM rdpr_ip_records ORDER BY id'
+    ).fetchall() == [
+      (11, 8, 0, 4, '8.8.8.8', 'default link', 0, '2001-02-03 04:05:06', None),
+      (12, None, 7, 6, '2001:4860:4860::8888', 'domain link', 0, '2001-02-03 04:05:06', None),
+    ]
+    for query, expected in [
+      (
+        'SELECT id, name, url, description, hash, attempts, created_at, updated_at FROM rdpr_domains_lists',
+        (5, 'domains', 'https://lists.example.test/domains', 'domain list', 'domain-hash'),
+      ),
+      (
+        'SELECT id, name, url, description, hash, attempts, created_at, updated_at FROM rdpr_ips_lists',
+        (8, 'ips', 'https://lists.example.test/ips', 'ip list', 'ip-hash'),
+      ),
+    ]:
+      assert connection.execute(query).fetchall() == [(*expected, 0, '2001-02-03 04:05:06', '2002-03-04 05:06:07')]
+    assert connection.execute(
+      'SELECT id, host, user, passwd, bgp_list_name, description, created_at, updated_at FROM rdpr_ros_configs'
+    ).fetchall() == [
+      (6, 'router.example.test', 'dummy-user', 'dummy-password', 'routes', 'router', '2001-02-03 04:05:06', None)
+    ]
+    assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
+    assert (
+      connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+        "('dns_servers','ros_configs','domains_lists','ip_lists','domains','ip_records','jobs')"
+      ).fetchall()
+      == []
+    )
+
+
+@pytest.fixture
+async def startup_store(app, tmp_path):
+  """Do not precreate tables or mark storage ready before the real setup."""
+  root = Path(__file__).resolve().parents[2]
+  shutil.copytree(
+    root / 'migrations', tmp_path / 'migrations', dirs_exist_ok=True, ignore=shutil.ignore_patterns('__pycache__')
+  )
+  database = app.database.DataBase()
+  try:
+    yield database
+  finally:
+    try:
+      await database.close(timeout=2)
+    except app.database.DatabaseWriteError:
+      assert database.writer_task is None or database.writer_task.done()
+    finally:
+      await database._DataBase__read_engine.dispose()
+      await database._DataBase__write_engine.dispose()
 
 
 @pytest.fixture
@@ -1228,7 +1382,7 @@ async def test_setup_observes_runner_failures_and_preserves_migration_history(
     assert store.writer_task is None
     assert store.writer_state == 'FAILED'
     assert store.pending_count == store.unknown_count == 0
-  if failure_stage in {None, 'migration'}:
+  if failure_stage is None:
     async with store._DataBase__read_engine.connect() as connection:
       steps = (await connection.execute(text('SELECT step FROM migration_steps ORDER BY rowid'))).scalars().all()
       history = (
@@ -1241,14 +1395,18 @@ async def test_setup_observes_runner_failures_and_preserves_migration_history(
         )
       ).all()
     assert steps == [
-      f'{name}:{direction}'
-      for name in ['migration_a.py', 'migration_b.py']
-      for direction in (['up'] if failure_stage else ['up', 'down'])
+      f'{name}:{direction}' for name in ['migration_a.py', 'migration_b.py'] for direction in ['up', 'down']
     ]
     assert [(row.name, row.checksum) for row in history] == [
       (path.name, app.database.calculate_checksum(file_path=path)) for path in sorted(paths)
     ]
-    assert [row.applied_at is None for row in history] == [bool(failure_stage)] * 2
+    assert all(row.applied_at is not None for row in history)
+  else:
+    # Failed startup must not commit earlier hooks, history, defaults, or DDL.
+    async with store._DataBase__read_engine.connect() as connection:
+      assert (await connection.execute(text('SELECT step FROM migration_steps'))).all() == []
+      assert (await connection.execute(select(app.database.MigrationsDbo.id))).all() == []
+      assert (await connection.execute(select(app.database.DomainsDbo.id))).all() == []
 
 
 async def test_lifespan_database_error_keeps_priority_when_http_cleanup_also_fails(app, monkeypatch, caplog):
@@ -1480,3 +1638,442 @@ async def test_public_queue_tail_is_persisted_by_real_lifespan_shutdown(e2e_serv
     assert connection.execute('SELECT name FROM rdpr_domains WHERE name=?', ('tail.example.test',)).fetchall() == [
       ('tail.example.test',),
     ]
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+@pytest.mark.parametrize('prefix', ['rdpr_', ''])
+async def test_public_empty_startup_and_restart_preserve_schema_defaults_and_history(e2e_service, prefix):
+  service = e2e_service
+  service.environment['DB_TABLE_PREFIX'] = prefix
+  with closing(sqlite3.connect(service.db_path)) as connection:
+    assert connection.execute('SELECT name FROM sqlite_master').fetchall() == []
+  await service.start()
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    assert (await client.get('/health')).status_code == 200
+    dns_servers = await client.get('/dns')
+    assert dns_servers.status_code == 200
+    assert [(row['id'], row['server']) for row in dns_servers.json()['payload']] == [(0, '1.1.1.1')]
+    response = await client.post('/domains', json=[{'domain': 'persisted.example.test'}])
+    assert response.status_code == 200, response.text
+  await service.stop()
+  with closing(sqlite3.connect(service.db_path)) as connection:
+    columns = [
+      row for row in connection.execute(f'PRAGMA table_info({prefix}ip_records)') if row[1] == 'use_default_gw'
+    ]
+    assert [row[2:] for row in columns] == [('BOOLEAN', 1, '0', 0)]
+    history_query, domain_query = {
+      'rdpr_': (
+        'SELECT name, checksum, applied_at FROM rdpr_migrations ORDER BY name',
+        'SELECT name FROM rdpr_domains ORDER BY id',
+      ),
+      '': ('SELECT name, checksum, applied_at FROM migrations ORDER BY name', 'SELECT name FROM domains ORDER BY id'),
+    }[prefix]
+    history = connection.execute(history_query).fetchall()
+    assert [(row[0], row[1]) for row in history] == [
+      (path.name, sha256(path.read_text(encoding='utf-8').encode()).hexdigest())
+      for path in sorted((service.root / 'migrations').glob('migration_*.py'))
+    ]
+    assert all(row[2] is not None for row in history)
+    assert connection.execute(domain_query).fetchall() == [
+      ('default',),
+      ('persisted.example.test',),
+    ]
+    assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
+  before = sqlite_snapshot(service.db_path)
+  await service.start()
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    domains = await client.get('/domains')
+    assert domains.status_code == 200
+    assert 'persisted.example.test' in {row['name'] for row in domains.json()['payload']}
+  await service.stop()
+  assert sqlite_snapshot(service.db_path) == before
+  assert service.providers.requests == []
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+async def test_public_historical_gateway_upgrade_preserves_old_data_and_all_history(e2e_service):
+  service = e2e_service
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    connection.executescript("""
+      CREATE TABLE rdpr_dns_servers (
+        id INTEGER NOT NULL PRIMARY KEY, server TEXT UNIQUE, doh_server TEXT UNIQUE, description TEXT,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP
+      );
+      CREATE TABLE rdpr_domains (
+        id INTEGER NOT NULL PRIMARY KEY, domain_list_id INTEGER, resolved BOOLEAN NOT NULL,
+        name TEXT NOT NULL UNIQUE, ros_comment TEXT, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP, last_resolved_at TIMESTAMP,
+        FOREIGN KEY (domain_list_id) REFERENCES rdpr_domains_lists(id) ON DELETE CASCADE
+      );
+      CREATE TABLE rdpr_ip_records (
+        id INTEGER NOT NULL PRIMARY KEY, ip_list_id INTEGER, domain_id INTEGER NOT NULL,
+        addr_type INTEGER NOT NULL, ip_address TEXT NOT NULL UNIQUE CHECK (ip_address != ''), ros_comment TEXT,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP,
+        FOREIGN KEY (ip_list_id) REFERENCES rdpr_ips_lists(id) ON DELETE CASCADE,
+        FOREIGN KEY (domain_id) REFERENCES rdpr_domains(id) ON DELETE CASCADE
+      );
+      INSERT INTO rdpr_dns_servers VALUES (0, '9.9.9.9', NULL, 'custom', '2001-02-03 04:05:06', NULL);
+      INSERT INTO rdpr_domains VALUES (7, NULL, 1, 'historical.example.test', 'historical domain',
+                                      '2001-02-03 04:05:06', '2002-03-04 05:06:07', '2002-03-04 05:06:07');
+      INSERT INTO rdpr_ip_records VALUES (17, NULL, 7, 4, '8.8.8.8', 'historical IP', '2001-02-03 04:05:06', NULL);
+    """)
+    create_history(connection)
+    connection.executemany(
+      'INSERT INTO rdpr_migrations VALUES (?, ?, ?, ?, ?)',
+      [
+        (31, 'migration_202511031501.py', 'stored-original-checksum', '2001-02-03 04:05:06', '2001-02-04 04:05:06'),
+        (32, 'migration_202618042122.py', 'failed-checksum-a', '2002-03-04 05:06:07', None),
+        (33, 'migration_202618042122.py', 'failed-checksum-b', '2003-04-05 06:07:08', None),
+        (34, 'retired-migration.py', 'unrelated-checksum', '2004-05-06 07:08:09', '2004-05-07 07:08:09'),
+      ],
+    )
+    old_history = connection.execute('SELECT * FROM rdpr_migrations ORDER BY id').fetchall()
+    old_ip = connection.execute('SELECT * FROM rdpr_ip_records').fetchone()
+    old_domain = connection.execute('SELECT * FROM rdpr_domains').fetchone()
+  await service.start()
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    response = await client.get('/domains/7')
+    assert response.status_code == 200, response.text
+    assert response.json()['ips_v4'] == ['8.8.8.8']
+  await service.stop()
+  with closing(sqlite3.connect(service.db_path)) as connection:
+    assert connection.execute('SELECT * FROM rdpr_migrations WHERE id<=34 ORDER BY id').fetchall() == old_history
+    assert connection.execute('SELECT * FROM rdpr_domains WHERE id=7').fetchone() == old_domain
+    assert connection.execute('SELECT * FROM rdpr_ip_records WHERE id=17').fetchone() == (*old_ip, 0)
+    assert connection.execute('SELECT server, description FROM rdpr_dns_servers WHERE id=0').fetchone() == (
+      '9.9.9.9',
+      'custom',
+    )
+    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations').fetchone() == (6,)
+  before = sqlite_snapshot(service.db_path)
+  await service.start()
+  await service.stop()
+  assert sqlite_snapshot(service.db_path) == before
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+async def test_public_legacy_import_failure_rolls_back_and_fresh_process_recovers(e2e_service):
+  service = e2e_service
+  create_legacy_database(service.db_path)
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    create_history(connection)
+    connection.executemany(
+      'INSERT INTO rdpr_migrations VALUES (?, ?, ?, ?, NULL)',
+      [
+        (41, 'migration_202511031501.py', 'old-failure-a', '2001-02-03 04:05:06'),
+        (42, 'migration_202511031501.py', 'old-failure-b', '2002-03-04 05:06:07'),
+      ],
+    )
+    old_history = connection.execute('SELECT * FROM rdpr_migrations ORDER BY id').fetchall()
+  failed_migration = service.directory / 'migrations' / 'migration_999999999999.py'
+  failed_migration.write_text(
+    'from sqlalchemy import text\n'
+    'async def upgrade(conn):\n'
+    '  await conn.execute(text("CREATE TABLE incomplete_startup (value TEXT)"))\n'
+    '  await conn.execute(text("INSERT INTO incomplete_startup VALUES (\'uncommitted\')"))\n'
+    '  raise RuntimeError("synthetic final migration failure")\n',
+    encoding='utf-8',
+  )
+  before = sqlite_snapshot(service.db_path)
+  for _ in range(2):
+    with pytest.raises(AssertionError, match='Application exited before readiness'):
+      await service.start()
+    assert sqlite_snapshot(service.db_path) == before
+    assert service.process is None
+  failed_migration.unlink()
+  await service.start()
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    response = await client.get('/domains/7')
+    assert response.status_code == 200, response.text
+    assert response.json()['ips_v6'] == ['2001:4860:4860::8888']
+  await service.stop()
+  assert_legacy_import(service.db_path)
+  with closing(sqlite3.connect(service.db_path)) as connection:
+    assert connection.execute('SELECT * FROM rdpr_migrations WHERE id<=42 ORDER BY id').fetchall() == old_history
+    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations').fetchone() == (5,)
+  recovered = sqlite_snapshot(service.db_path)
+  await service.start()
+  await service.stop()
+  assert sqlite_snapshot(service.db_path) == recovered
+
+
+@pytest.mark.parametrize('failure_kind', ['exception', 'cancellation', 'invalid_module'])
+async def test_startup_failure_physically_rolls_back_schema_rows_and_history(
+  app, startup_store, tmp_path, failure_kind
+):
+  store = startup_store
+  path = Path(app.settings.db_path)
+  with closing(sqlite3.connect(path)) as connection, connection:
+    connection.execute('CREATE TABLE preserved (value TEXT NOT NULL)')
+    connection.execute("INSERT INTO preserved VALUES ('original')")
+  before = sqlite_snapshot(path)
+  migration = tmp_path / 'migrations' / 'migration_000000000000.py'
+  migration.write_text(
+    'from sqlalchemy import text\n'
+    'async def upgrade(conn):\n'
+    '  await conn.execute(text("CREATE TABLE startup_probe (value TEXT)"))\n'
+    '  await conn.execute(text("INSERT INTO startup_probe VALUES (\'uncommitted\')"))\n'
+    '  await conn.execute(text("UPDATE preserved SET value=\'changed\'"))\n',
+    encoding='utf-8',
+  )
+  failure = tmp_path / 'migrations' / 'migration_999999999999.py'
+  failure.write_text(
+    'invalid syntax !'
+    if failure_kind == 'invalid_module'
+    else 'from asyncio import CancelledError\n'
+    'async def upgrade(conn):\n'
+    + (
+      '  raise CancelledError()\n' if failure_kind == 'cancellation' else '  raise RuntimeError("synthetic failure")\n'
+    ),
+    encoding='utf-8',
+  )
+  later_marker = tmp_path / 'later-migration-ran'
+  (tmp_path / 'migrations' / 'migration_9999999999999.py').write_text(
+    f'from pathlib import Path\nasync def upgrade(conn):\n  Path({str(later_marker)!r}).touch()\n',
+    encoding='utf-8',
+  )
+  expected = asyncio.CancelledError if failure_kind == 'cancellation' else app.database.DatabaseWriteError
+  with pytest.raises(expected):
+    await asyncio.wait_for(store.setup(), timeout=5)
+  assert store.writer_task is None
+  assert store.writer_state == 'FAILED'
+  assert store.pending_count == store.unknown_count == 0
+  assert sqlite_snapshot(path) == before
+  assert not later_marker.exists()
+
+
+@pytest.mark.parametrize(
+  'gateway_shape',
+  [
+    'use_default_gw INTEGER NOT NULL DEFAULT 0',
+    'use_default_gw BOOLEAN DEFAULT 0',
+    'use_default_gw BOOLEAN NOT NULL DEFAULT 1',
+    'use_default_gw BOOLEAN NOT NULL',
+  ],
+)
+async def test_startup_refuses_incompatible_existing_gateway_without_repair(
+  app,
+  startup_store,
+  gateway_shape,
+):
+  path = Path(app.settings.db_path)
+  with closing(sqlite3.connect(path)) as connection, connection:
+    connection.execute(f'CREATE TABLE rdpr_ip_records (id INTEGER PRIMARY KEY, {gateway_shape})')
+    connection.execute('INSERT INTO rdpr_ip_records VALUES (17, 1)')
+  before = sqlite_snapshot(path)
+  with pytest.raises(app.database.DatabaseWriteError, match='Database initialization failed'):
+    await startup_store.setup()
+  assert startup_store.writer_task is None
+  assert sqlite_snapshot(path) == before
+
+
+@pytest.mark.parametrize('missing_effect', ['table', 'column'])
+async def test_completed_gateway_history_cannot_mask_missing_original_effect(app, startup_store, missing_effect):
+  path = Path(app.settings.db_path)
+  with closing(sqlite3.connect(path)) as connection, connection:
+    create_history(connection)
+    connection.execute(
+      'INSERT INTO rdpr_migrations VALUES (31, ?, ?, ?, ?)',
+      ('migration_202618042122.py', 'preserved-checksum', '2001-02-03 04:05:06', '2001-02-04 04:05:06'),
+    )
+    if missing_effect == 'column':
+      connection.execute('CREATE TABLE rdpr_ip_records (id INTEGER PRIMARY KEY)')
+  before = sqlite_snapshot(path)
+  with pytest.raises(app.database.DatabaseWriteError):
+    await startup_store.setup()
+  assert sqlite_snapshot(path) == before
+
+
+@pytest.mark.parametrize('migration_name', ['migration_202511031501.py', 'migration_202618042122.py'])
+async def test_modified_known_migration_never_receives_checksum_compatibility_bypass(
+  app,
+  startup_store,
+  tmp_path,
+  migration_name,
+):
+  migration = tmp_path / 'migrations' / migration_name
+  # Modified source cannot receive the pinned compatibility bypass or a success stamp.
+  migration.write_text(
+    migration.read_text(encoding='utf-8') + '\nraise RuntimeError("modified migration must not be stamped")\n',
+    encoding='utf-8',
+  )
+  path = Path(app.settings.db_path)
+  before = sqlite_snapshot(path)
+  with pytest.raises(app.database.DatabaseWriteError):
+    await startup_store.setup()
+  assert sqlite_snapshot(path) == before
+
+
+@pytest.mark.parametrize(
+  'contradiction',
+  [
+    'incomplete',
+    'extra_column',
+    'domain_list_orphan',
+    'domain_orphan',
+    'remapped_parent_orphan',
+    'ip_list_orphan',
+    'dns_default_collision',
+    'domain_default_collision',
+    'default_domain_list',
+    'populated_target',
+    'incompatible_empty_target',
+    'copy_changing_trigger',
+    'completed_import_history',
+    'duplicate_source_value',
+  ],
+)
+async def test_legacy_contradictions_fail_without_source_or_history_changes(
+  app,
+  startup_store,
+  contradiction,
+):
+  path = Path(app.settings.db_path)
+  create_legacy_database(path)
+  if contradiction in {'populated_target', 'copy_changing_trigger'}:
+    async with startup_store._DataBase__write_engine.begin() as connection:
+      await connection.run_sync(app.database.DomainsDbo.metadata.create_all)
+  with closing(sqlite3.connect(path)) as connection, connection:
+    statements = {
+      'incomplete': 'DROP TABLE jobs',
+      'extra_column': 'ALTER TABLE domains ADD COLUMN unknown_business_data TEXT',
+      'domain_list_orphan': 'UPDATE domains SET domain_list_id=99 WHERE id=7',
+      'domain_orphan': 'UPDATE ip_records SET domain_id=99 WHERE id=12',
+      'remapped_parent_orphan': 'UPDATE ip_records SET domain_id=0 WHERE id=11',
+      'ip_list_orphan': 'UPDATE ip_records SET ip_list_id=99 WHERE id=11',
+      'dns_default_collision': "INSERT INTO dns_servers (id, server) VALUES (0, '1.0.0.1')",
+      'domain_default_collision': "INSERT INTO domains (id, name) VALUES (0, 'another-default')",
+      'default_domain_list': 'UPDATE domains SET domain_list_id=5 WHERE id=-1',
+      'populated_target': "INSERT INTO rdpr_domains (id, resolved, name) VALUES (55, 0, 'existing.example.test')",
+      'incompatible_empty_target': 'CREATE TABLE rdpr_dns_servers (id INTEGER PRIMARY KEY, server TEXT)',
+      'copy_changing_trigger': 'CREATE TRIGGER alter_copied_dns AFTER INSERT ON rdpr_dns_servers '
+      "BEGIN UPDATE rdpr_dns_servers SET description='changed' WHERE id=NEW.id; END",
+    }
+    if contradiction in statements:
+      connection.execute(statements[contradiction])
+    elif contradiction == 'completed_import_history':
+      create_history(connection)
+      connection.execute(
+        'INSERT INTO rdpr_migrations VALUES (31, ?, ?, ?, ?)',
+        (
+          'migration_202511031501.py',
+          'preserved-checksum',
+          '2001-02-03 04:05:06',
+          '2001-02-04 04:05:06',
+        ),
+      )
+    elif contradiction == 'duplicate_source_value':
+      # OR IGNORE must never turn two source records into one successfully imported record.
+      connection.executescript("""
+        CREATE TABLE duplicated_dns (
+          id INTEGER PRIMARY KEY, server TEXT, doh_server TEXT, description TEXT,
+          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT INTO duplicated_dns SELECT * FROM dns_servers;
+        DROP TABLE dns_servers;
+        ALTER TABLE duplicated_dns RENAME TO dns_servers;
+        INSERT INTO dns_servers SELECT 99, server, doh_server, description, created_at FROM dns_servers WHERE id=-1;
+      """)
+  before = sqlite_snapshot(path)
+  with pytest.raises(app.database.DatabaseWriteError, match='Database initialization failed'):
+    await startup_store.setup()
+  assert startup_store.writer_task is None
+  assert startup_store.writer_state == 'FAILED'
+  assert sqlite_snapshot(path) == before
+
+
+async def test_legacy_import_accepts_empty_compatible_targets_and_preserves_values(app, startup_store):
+  path = Path(app.settings.db_path)
+  create_legacy_database(path)
+  async with startup_store._DataBase__write_engine.begin() as connection:
+    await connection.run_sync(app.database.DomainsDbo.metadata.create_all)
+  await startup_store.setup()
+  assert startup_store.writer_state == 'RUNNING'
+  await startup_store.close(timeout=2)
+  assert_legacy_import(path)
+
+
+async def test_pending_gateway_reconciliation_preserves_existing_values_and_failed_history(app, startup_store):
+  store = startup_store
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.run_sync(app.database.DomainsDbo.metadata.create_all)
+    await connection.execute(insert(app.database.DomainsDbo).values(id=7, name='existing.example.test', resolved=True))
+    await connection.execute(
+      insert(app.database.IpRecordsDbo).values(
+        id=17,
+        domain_id=7,
+        addr_type=4,
+        ip_address='8.8.8.8',
+        use_default_gw=True,
+      )
+    )
+  path = Path(app.settings.db_path)
+  with closing(sqlite3.connect(path)) as connection, connection:
+    connection.executemany(
+      'INSERT INTO rdpr_migrations VALUES (?, ?, ?, ?, NULL)',
+      [
+        (41, 'migration_202618042122.py', 'old-failure-a', '2001-02-03 04:05:06'),
+        (42, 'migration_202618042122.py', 'old-failure-b', '2002-03-04 05:06:07'),
+      ],
+    )
+    old_history = connection.execute('SELECT * FROM rdpr_migrations ORDER BY id').fetchall()
+    old_ips = connection.execute('SELECT * FROM rdpr_ip_records ORDER BY id').fetchall()
+  await store.setup()
+  await store.close(timeout=2)
+  with closing(sqlite3.connect(path)) as connection:
+    assert connection.execute('SELECT * FROM rdpr_ip_records ORDER BY id').fetchall() == old_ips
+    assert connection.execute('SELECT * FROM rdpr_migrations WHERE id<=42 ORDER BY id').fetchall() == old_history
+    assert connection.execute(
+      'SELECT COUNT(*) FROM rdpr_migrations WHERE name=? AND applied_at IS NOT NULL',
+      ('migration_202618042122.py',),
+    ).fetchone() == (1,)
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+async def test_public_legacy_target_name_overlap_is_refused_without_changes(e2e_service):
+  service = e2e_service
+  service.environment['DB_TABLE_PREFIX'] = ''
+  create_legacy_database(service.db_path)
+  before = sqlite_snapshot(service.db_path)
+  with pytest.raises(AssertionError, match='Application exited before readiness'):
+    await service.start()
+  assert sqlite_snapshot(service.db_path) == before
+  assert service.process is None
+  assert service.providers.requests == []
+
+
+async def test_startup_error_after_physical_commit_keeps_writer_stopped_and_allows_fresh_recovery(
+  app,
+  startup_store,
+  monkeypatch,
+):
+  original_commit = app.database.AsyncConnection.commit
+
+  async def commit_then_fail(connection):
+    await original_commit(connection)
+    raise RuntimeError('synthetic lost commit acknowledgement')
+
+  with monkeypatch.context() as commit_patch:
+    commit_patch.setattr(app.database.AsyncConnection, 'commit', commit_then_fail)
+    with pytest.raises(app.database.DatabaseWriteError, match='Database initialization failed'):
+      await startup_store.setup()
+  assert startup_store.writer_task is None
+  assert startup_store.writer_state == 'FAILED'
+  path = Path(app.settings.db_path)
+  with closing(sqlite3.connect(path)) as connection:
+    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations WHERE applied_at IS NOT NULL').fetchone() == (3,)
+    assert connection.execute('SELECT id, name FROM rdpr_domains').fetchall() == [(0, 'default')]
+  committed = sqlite_snapshot(path)
+  recovered = app.database.DataBase()
+  try:
+    await recovered.setup()
+    assert recovered.writer_state == 'RUNNING'
+  finally:
+    await recovered.close(timeout=2)
+    await recovered._DataBase__read_engine.dispose()
+    await recovered._DataBase__write_engine.dispose()
+  assert sqlite_snapshot(path) == committed

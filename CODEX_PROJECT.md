@@ -2,7 +2,7 @@
 
 ## Execution Contract
 
-This repository consumes `agent-projects-tools` v1.13.0 in target project mode.
+This repository consumes `agent-projects-tools` v1.14.0 in target project mode.
 `AGENTS.md` defines bootstrap order; `.codex/rules/request_routing.md` is mandatory for every request.
 This profile declares capabilities and constraints; it grants no permission for side effects.
 Only exact active entries below and enabled specialized sections activate materials.
