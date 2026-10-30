@@ -8,7 +8,11 @@ This profile declares capabilities and constraints; it grants no permission for 
 Only exact active entries below and enabled specialized sections activate materials.
 Omitted optional materials are inactive. Read applicable entrypoints and validate their transitive hard dependencies
 with `.codex/rules/material_dependencies.md` before applying them.
-The FastAPI and cashews rule/skill pairs are intentional mutual dependencies; each member is explicitly active.
+The FastAPI, cashews, and Python service E2E rule/skill pairs are intentional mutual dependencies;
+each member is explicitly active.
+Select applicable engineering policies for the intended project stack even before their implementation or scenarios
+exist. Missing scenarios or tooling affect execution readiness and acceptance evidence, not policy activation.
+Do not disable a selected profile solely because its implementation, fixtures, or tests have not been written yet.
 The full source catalog and template are not active profiles.
 
 ## Project Identity
@@ -258,8 +262,11 @@ scenarios before appointed architects complete their approval.
   valid architecture gate, current evidence of any required tester/reviewer approval, and successful mandatory project
   checks.
 - For Python code, test, or quality-tool configuration changes, mandatory project checks include Ruff lint,
-  Ruff format check, Pyright, the applicable unit/integration tests, and coverage with the configured threshold.
+  Ruff format check, Pyright, the applicable unit/integration/E2E tests, and coverage with the configured threshold.
   A failed, blocked, unperformed, or stale required check prevents final ACCEPTED; passing tests alone is insufficient.
+- Require service E2E evidence when changes affect a public API flow, application startup/shutdown, or a critical
+  background-job/persistence flow that narrower tests cannot establish. An empty required E2E selection is a missing
+  check, never a pass or permission to deactivate the profile. Document task-specific applicability before execution.
 - The final acceptance report and any applicable validation handoff identify the checked snapshot, exact commands,
   scopes, exit codes, Ruff lint/format results, Pyright error/warning counts, test counts, coverage and threshold,
   independent review status, and any unavailable or failing checks. Documentation-only changes use material and
@@ -284,6 +291,7 @@ scenarios before appointed architects complete their approval.
 
 - `python-core`
 - `python-testing`
+- `python-service-e2e-testing`
 - `python-fastapi`
 - `python-cashews-cache`
 
@@ -293,10 +301,12 @@ Database and security skills are selected explicitly below; do not invent additi
 
 - Required routing rule: `.codex/rules/request_routing.md`
 - `source_code_hygiene.md`
+- `mark.md`
 - `context7_documentation.md`
 - `git.md`
 - `python_fastapi.md`
 - `python_cashews_cache.md`
+- `python_service_e2e_testing.md`
 
 Conditional bootstrap support files:
 
@@ -309,6 +319,7 @@ Conditional bootstrap support files:
 - `python-core`
 - `python-testing`
 - `python-fastapi-expert`
+- `python-service-e2e-testing`
 - `python-backend-security`
 - `python-cashews-cache`
 - `python-sqlalchemy-core`
@@ -317,7 +328,7 @@ Conditional bootstrap support files:
 
 Each skill resides under `.agents/skills/<name>/SKILL.md` with its complete package.
 Apply only skills relevant to the current authorized task.
-MySQL, NATS, Redis, frontend, Obsidian, Jira, and service E2E overlays are inactive.
+MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the selected backend stack.
 
 ## Build And Validation Commands
 
@@ -329,11 +340,14 @@ MySQL, NATS, Redis, frontend, Obsidian, Jira, and service E2E overlays are inact
 - Format check: `.\.venv\Scripts\python.exe -m ruff format --check .`.
 - Python lint: `.\.venv\Scripts\python.exe -m ruff check .`.
 - Type check / static analysis: `.\.venv\Scripts\python.exe -m pyright --project pyproject.toml`.
-- Full acceptance tests: `.\.venv\Scripts\python.exe -m pytest -n 0 -m "not e2e and not e2e_load"`.
-  The explicit marker expression overrides the configured `-m unit`, so integration and unmarked tests are included.
+- Full acceptance tests: `.\.venv\Scripts\python.exe -m pytest -n 0 -m "not e2e_load"`.
+  The explicit marker expression overrides the configured `-m unit`; unit, integration, ordinary E2E and unmarked
+  tests are included. Use the isolated E2E environment declared below when the selected tests cross service boundaries.
 - Unit tests: `.\.venv\Scripts\python.exe -m pytest -n 0 -m unit tests/unit`.
 - Integration tests: `.\.venv\Scripts\python.exe -m pytest -n 0 -m integration tests/integration`.
-- Coverage: `.\.venv\Scripts\python.exe -m pytest -n 0 -m "not e2e and not e2e_load" --cov
+- Service E2E: `.\.venv\Scripts\python.exe -m pytest -n 0 -m "e2e and not e2e_load"`.
+- Load E2E: `.\.venv\Scripts\python.exe -m pytest -n 0 -m e2e_load` for an explicitly scoped load/performance task.
+- Coverage: `.\.venv\Scripts\python.exe -m pytest -n 0 -m "not e2e_load" --cov
   --cov-config=pyproject.toml --cov-report=term-missing --cov-report=html` as one command.
   Read source packages, branch tracking, and fail-under from `[tool.coverage.*]`; do not override its source list.
 - Coverage report: `.\.venv\Scripts\python.exe -m coverage report --show-missing` with the configured fail-under.
@@ -341,8 +355,8 @@ MySQL, NATS, Redis, frontend, Obsidian, Jira, and service E2E overlays are inact
 - Parallel tests: `.\.venv\Scripts\python.exe -m pytest -m "not e2e and not e2e_load" -n auto --dist loadfile`
   only for a scope whose worker/resource isolation has been verified, after focused serial tests pass.
   Rerun parallel failures with `-n 0`; parallel execution does not replace the required serial acceptance baseline.
-- Service E2E / browser validation: not selected. Registered `e2e` and `e2e_load` markers alone do not activate a suite
-  or an absent specialist rule/skill. Define the boundary, safe environment and command before enabling those checks.
+- Service E2E policy: enabled through `python_service_e2e_testing.md` + `python-service-e2e-testing`.
+- Browser validation: outside this backend repository's selected test boundary; the UI has a separate repository.
 - Metadata validation: parse `pyproject.toml` and project agent TOML with standard-library `tomllib`.
 - Python syntax validation when Python changes: use `ast.parse` with the project interpreter for the affected files
   without importing the app. This checks syntax only and does not substitute for behavior tests.
@@ -380,8 +394,10 @@ MySQL, NATS, Redis, frontend, Obsidian, Jira, and service E2E overlays are inact
 - Pytest configuration source: `[tool.pytest.ini_options]` in `pyproject.toml`.
 - Test layout: `tests/unit/` and `tests/integration/`, separate from production code.
 - Test discovery: `test_*.py` files, `*Tests` classes, and `test_*` functions under `tests/`.
+- Service E2E scenarios use the registered `e2e` marker within the existing `tests/` structure; a new folder is not
+  required to activate the policy. Structural changes still follow the Critical rules below.
 - Default marker selection: `-m unit` from `addopts`; this is a focused development run, not full acceptance.
-  Acceptance commands explicitly select integration tests as well; do not silently inherit the unit-only filter.
+  Acceptance commands explicitly include integration and ordinary E2E tests; do not inherit the unit-only filter.
 - Pytest import mode: `importlib`.
 - Async test plugin: `pytest-asyncio`.
 - Asyncio mode: `auto`.
@@ -404,6 +420,41 @@ MySQL, NATS, Redis, frontend, Obsidian, Jira, and service E2E overlays are inact
 - Documentation/instruction-only changes use material consistency checks.
 - Functional changes require meaningful behavior, boundary, failure, and regression tests.
 - Tests and coverage commands are engineering policy; activation does not authorize dependency or environment changes.
+
+## Python Service E2E Testing Profile
+
+- Python service E2E enabled: yes.
+- Active Python service E2E rule/skill: `python_service_e2e_testing.md` + `python-service-e2e-testing`.
+- E2E boundary: backend HTTP API and critical job/queue-to-SQLite flows, exercised through public application behavior.
+- E2E command: use the dedicated serial command under Build And Validation Commands.
+- App/process start policy: prefer a subprocess running the project interpreter and `main.py` to exercise real
+  composition, router registration, lifespan, migrations and writer lifecycle. An in-process app boundary is allowed
+  only when it preserves that real composition and lifespan; do not reuse unit wiring that replaces application logic.
+- Dependency setup: disposable SQLite files and process-local cashews state; use existing declared dependencies.
+- External dependency stub policy: deterministic local protocol fakes for DNS/DoH, RIPEstat and RouterOS outside the
+  tested application boundary. Do not mock internal services, repositories, business branches or the composition root.
+- Environment policy: isolated temporary paths and settings; prevent loading local secret files and contacting real
+  routers, shared databases or uncontrolled providers. Bound startup, requests, jobs and shutdown with timeouts.
+- Data isolation policy: unique temporary database/files, cache state, test IDs and ports; run required migrations and
+  minimal seeds against disposable data only. Fixtures own cleanup of processes, tasks, clients and persistent state.
+- Parallel E2E policy: serial by default; xdist requires independently verified per-worker resource isolation.
+- Load E2E policy: active for relevant performance/resilience work, with explicit workload bounds and measurements;
+  the registered `e2e_load` marker remains a separately selected run rather than an automatic load test on every task.
+- Coverage policy: retain configured unit/integration coverage and treat service E2E as additional behavioral evidence.
+  For subprocess scenarios, verify child-process measurement and combined data before claiming application coverage.
+- Acceptance policy: activation is independent of scenario readiness. If required scenarios or their isolated
+  environment are unavailable, report the specific unperformed check and block affected acceptance without disabling
+  this profile. Pytest exit code 5 (no tests selected) never satisfies a required E2E check.
+- New dependencies, container infrastructure and project structure changes require the existing authorization gates.
+
+## Markdown Profile
+
+- Markdown rule: `mark.md`, active for non-Obsidian Markdown maintenance.
+- Markdown configuration source: repository `.markdownlint.json`; keep its configured style and file scope.
+- Validation policy: use a project-declared Markdown check command when available; otherwise review the changed
+  Markdown against that configuration and report the actual validation performed. Do not install a linter implicitly.
+- New documentation remains subject to request routing and the Markdown rule. An active profile never grants
+  permission to create unrelated documentation or directories.
 
 ## Formatting And Linting Profile
 
