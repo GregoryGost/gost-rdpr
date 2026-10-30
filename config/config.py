@@ -41,6 +41,7 @@ class Settings(BaseSettings):
   db_table_prefix: str = Field(default='rdpr_')
   db_save_batch_size: int = Field(default=1000) # for while task save to db
   db_save_batch_timeout: float = Field(default=5.0) # 5 sec // recomend time.monotonic()
+  db_shutdown_timeout: float = Field(default=20.0, gt=0)
   db_pool_size: int = Field(default=5)
   db_pool_recycle: int = Field(default=1500)
   db_pool_timeout: int = Field(default=30)

@@ -44,8 +44,8 @@ The full source catalog and template are not active profiles.
   of substituting silently.
 - Fresh thread policy: EVERY delegated assignment uses a new no-history `spawn_agent` (`fork_turns: "none"` for verified
   MultiAgentV2); never `followup_task`.
-- Subagent handoff persistence: in-session-only.
-- Local handoff persistence is disabled; `.agent-handoffs/` remains ignored if explicitly enabled later.
+- Subagent handoff persistence: local-ephemeral.
+- Local handoff persistence is enabled in `.agent-handoffs/<task_scope_id>/`; `.agent-handoffs/` remains ignored by Git.
 
 | Role | Custom agent file | Model | Effort |
 | --- | --- | --- | --- |
@@ -64,7 +64,7 @@ The full source catalog and template are not active profiles.
 
 - `.codex/rules/subagent_coordination.md` is mandatory when subagents are enabled for authorized code/test changes, even
   if not listed in Active Rules. Load it before delegation; a missing copy blocks delegation. Send a bounded task packet
-  with current verified predecessor reports, not the parent chat. Only the primary may optionally publish completed
+  with current verified predecessor reports, not the parent chat. Only the primary may publish verified completed
   handoff files.
 - Before delegating a scoped code-change workflow, the primary decides whether architecture is needed, records the
   Architecture Gate state and dependencies, determines required test/review roles based on risk and the active project
@@ -120,14 +120,17 @@ The full source catalog and template are not active profiles.
   verified contracts, and the PRIMARY integrates the current DBA assessment into Architecture Handoff and final
   validation where applicable.
 
-### Completed Subagent Reports And Optional Local Handoffs
+### Completed Subagent Reports And Local Handoffs
 
 - The primary receives each role's existing REQUIRED REPORT, verifies scope, evidence, architecture version and
   code/test snapshot, and passes only current relevant predecessor reports to downstream fresh agents.
-- Use in-session reports by default. With `Subagent handoff persistence: local-ephemeral` explicitly selected AND the
-  current request/routing gate permitting such local writes, the primary alone publishes versioned completed-stage
-  reports and a task-local `index.md` in `.agent-handoffs/<task_scope_id>/`. Do not imply permission to create other
-  task notes, Obsidian entries, worktrees or Git commits.
+- Use `local-ephemeral` persistence for authorized delegated code/test workflows. The primary alone publishes verified,
+  versioned completed-stage reports and a task-local `index.md` in `.agent-handoffs/<task_scope_id>/`, following
+  `.codex/rules/subagent_coordination.md`. Subagents return reports to the primary and do not write shared handoff files.
+- When the current request/routing gate does not permit local writes, or the handoff root is unsafe or unavailable,
+  keep reports in-session and state the persistence limitation. This setting does not authorize unrelated task notes,
+  Obsidian entries, worktrees, Git commits or external-system writes.
+- Keep `.agent-handoffs/` ignored by Git. Do not commit, push, export, sync or automatically delete its contents.
 - Reports and indexes are secondary evidence, not an authority: old/stale reports cannot satisfy Architecture Gate,
   independent tester acceptance or review. Follow `.codex/rules/subagent_coordination.md` for publication, provenance,
   safety and compaction recovery.
@@ -254,6 +257,13 @@ scenarios before appointed architects complete their approval.
   (NOT_REQUIRED/PENDING/APPROVED/REOPENED/BLOCKED) and independent review status. Overall task completion requires a
   valid architecture gate, current evidence of any required tester/reviewer approval, and successful mandatory project
   checks.
+- For Python code, test, or quality-tool configuration changes, mandatory project checks include Ruff lint,
+  Ruff format check, Pyright, the applicable unit/integration tests, and coverage with the configured threshold.
+  A failed, blocked, unperformed, or stale required check prevents final ACCEPTED; passing tests alone is insufficient.
+- The final acceptance report and any applicable validation handoff identify the checked snapshot, exact commands,
+  scopes, exit codes, Ruff lint/format results, Pyright error/warning counts, test counts, coverage and threshold,
+  independent review status, and any unavailable or failing checks. Documentation-only changes use material and
+  reference consistency checks unless they also change executable code or tool configuration.
 
 ### Agent Thread And Workspace Lifecycle
 
@@ -315,16 +325,24 @@ MySQL, NATS, Redis, frontend, Obsidian, Jira, and service E2E overlays are inact
 - Tool executable policy: use `.\.venv\Scripts\python.exe` in PowerShell.
   Use the equivalent `.venv/bin/python` only inside a verified non-Windows boundary.
 - Install dependencies: `poetry install` from the existing lockfile, only within authorized environment changes.
-- Format / format check / Python lint / type check: none configured.
-- Full tests: `.\.venv\Scripts\python.exe -m pytest --import-mode=importlib -o asyncio_mode=auto`.
-- Unit tests: append `tests/unit` to the full-test command.
-- Integration tests: append `tests/integration` to the full-test command.
-- Coverage: `.\.venv\Scripts\python.exe -m coverage run --branch` with
-  `--source=cache,client,config,database,jobs,logger,metrics,models,routers,server,utils`,
-  followed by `-m pytest --import-mode=importlib -o asyncio_mode=auto`.
-- Coverage report: `.\.venv\Scripts\python.exe -m coverage report --show-missing --fail-under=85`.
+- Format: `.\.venv\Scripts\python.exe -m ruff format <explicitly assigned Python paths>` during authorized edits.
+- Format check: `.\.venv\Scripts\python.exe -m ruff format --check .`.
+- Python lint: `.\.venv\Scripts\python.exe -m ruff check .`.
+- Type check / static analysis: `.\.venv\Scripts\python.exe -m pyright --project pyproject.toml`.
+- Full acceptance tests: `.\.venv\Scripts\python.exe -m pytest -n 0 -m "not e2e and not e2e_load"`.
+  The explicit marker expression overrides the configured `-m unit`, so integration and unmarked tests are included.
+- Unit tests: `.\.venv\Scripts\python.exe -m pytest -n 0 -m unit tests/unit`.
+- Integration tests: `.\.venv\Scripts\python.exe -m pytest -n 0 -m integration tests/integration`.
+- Coverage: `.\.venv\Scripts\python.exe -m pytest -n 0 -m "not e2e and not e2e_load" --cov
+  --cov-config=pyproject.toml --cov-report=term-missing --cov-report=html` as one command.
+  Read source packages, branch tracking, and fail-under from `[tool.coverage.*]`; do not override its source list.
+- Coverage report: `.\.venv\Scripts\python.exe -m coverage report --show-missing` with the configured fail-under.
 - Coverage HTML: `.\.venv\Scripts\python.exe -m coverage html`; inspect the generated `htmlcov/` report.
-- Parallel tests: disabled by policy. Service E2E / browser validation: not selected.
+- Parallel tests: `.\.venv\Scripts\python.exe -m pytest -m "not e2e and not e2e_load" -n auto --dist loadfile`
+  only for a scope whose worker/resource isolation has been verified, after focused serial tests pass.
+  Rerun parallel failures with `-n 0`; parallel execution does not replace the required serial acceptance baseline.
+- Service E2E / browser validation: not selected. Registered `e2e` and `e2e_load` markers alone do not activate a suite
+  or an absent specialist rule/skill. Define the boundary, safe environment and command before enabling those checks.
 - Metadata validation: parse `pyproject.toml` and project agent TOML with standard-library `tomllib`.
 - Python syntax validation when Python changes: use `ast.parse` with the project interpreter for the affected files
   without importing the app. This checks syntax only and does not substitute for behavior tests.
@@ -349,7 +367,8 @@ MySQL, NATS, Redis, frontend, Obsidian, Jira, and service E2E overlays are inact
 - Virtual environment policy: repository `.venv`.
 - Source layout: flat packages at the repository root.
 - Style: preserve the existing two-space indentation and local quoting conventions in touched Python code.
-  No formatter or type checker is configured; avoid broad style rewrites.
+  Ruff owns formatting and linting; Pyright owns static type checking, using `pyproject.toml`.
+  Keep formatter edits within the assigned paths and avoid unrelated repository-wide rewrites.
 - Active Python base skill: `python-core`.
 - Dependency versions source: constraints in `pyproject.toml`; resolved versions in `poetry.lock`.
   Recheck installed versions before version-sensitive work.
@@ -358,19 +377,26 @@ MySQL, NATS, Redis, frontend, Obsidian, Jira, and service E2E overlays are inact
 
 - Python testing enabled: yes.
 - Test runner: pytest.
-- Pytest configuration source: this profile; use the declared command-line options.
+- Pytest configuration source: `[tool.pytest.ini_options]` in `pyproject.toml`.
 - Test layout: `tests/unit/` and `tests/integration/`, separate from production code.
-- Test discovery: `test_*.py` files and `test_*` functions under `tests/`.
+- Test discovery: `test_*.py` files, `*Tests` classes, and `test_*` functions under `tests/`.
+- Default marker selection: `-m unit` from `addopts`; this is a focused development run, not full acceptance.
+  Acceptance commands explicitly select integration tests as well; do not silently inherit the unit-only filter.
 - Pytest import mode: `importlib`.
 - Async test plugin: `pytest-asyncio`.
 - Asyncio mode: `auto`.
 - Test and fixture loop scopes: function; do not share event-loop-bound clients between unrelated tests.
-- Coverage tool: `coverage.py`.
-- Coverage configuration source: this profile and its declared commands.
+- Coverage tool: `coverage.py` through the declared `pytest-cov` plugin.
+- Coverage configuration source: `[tool.coverage.run]`, `[tool.coverage.report]`, and `[tool.coverage.html]`
+  in `pyproject.toml`, including the configured `migrations` source package.
 - Coverage branch tracking: yes.
 - Coverage fail-under: 85; target 90–95% for critical domain behavior.
-- Parallel test execution enabled: no.
-- Parallel test plugin / command / distribution mode: none selected.
+- Parallel test execution enabled: yes, explicitly selected isolated scopes only; serial execution remains the baseline.
+- Parallel test plugin: `pytest-xdist`.
+- Parallel test command: use the command declared under Build And Validation Commands after focused serial tests pass.
+- xdist distribution mode: `loadfile`; serial rerun: `-n 0`.
+- Worker resource isolation policy: worker-local temporary SQLite files, directories, ports and cache state;
+  never share a writable production database or external resource. Recheck isolation after fixture or test changes.
 - Isolation: temporary SQLite files, isolated process/cache/queue state, mocked external boundaries,
   no real RouterOS changes, list downloads, DNS calls, or RIPEstat requests in ordinary tests.
 - Use the tracked `tests/` layout; the ignored `test/` directory is not the test-suite destination.
@@ -378,6 +404,21 @@ MySQL, NATS, Redis, frontend, Obsidian, Jira, and service E2E overlays are inact
 - Documentation/instruction-only changes use material consistency checks.
 - Functional changes require meaningful behavior, boundary, failure, and regression tests.
 - Tests and coverage commands are engineering policy; activation does not authorize dependency or environment changes.
+
+## Formatting And Linting Profile
+
+- Ruff enabled: yes, for linting and formatting.
+- Ruff configuration source: `[tool.ruff]`, `[tool.ruff.lint]`, and `[tool.ruff.format]` in `pyproject.toml`.
+- Ruff target: `py315`; line length: 120; indentation: two spaces; quote style: single quotes.
+- Preserve configured rule selection, ignores, per-file ignores, and formatter exclusions for `.agents/**` and `.codex/**`.
+- Pyright enabled: yes.
+- Pyright configuration source: `[tool.pyright]` in `pyproject.toml`.
+- Pyright mode: `standard`; Python version: `3.15`; environment: repository `.venv`.
+- Pyright scope: the configured production `include` paths. `tests/` is not currently included; do not describe
+  the production type-check result as type-check coverage of the test suite.
+- Acceptance uses non-mutating lint, format-check, and type-check commands. Do not run format or `--fix` during
+  verification, weaken diagnostics, change exclusions, or ignore nonzero exit codes to obtain acceptance.
+- Changes to tool policy or scope require current authorization; existing project settings remain authoritative.
 
 ## Python FastAPI Profile
 
@@ -452,8 +493,8 @@ MySQL, NATS, Redis, frontend, Obsidian, Jira, and service E2E overlays are inact
   Enqueue completion is not a commit acknowledgement and does not guarantee immediate read-after-write.
 - Deployment process/worker assumption: one Python application process per database.
   Verify again before any multi-worker/process change.
-- Current lifecycle limitations: the writer is launched with `create_task` during setup;
-  a managed shutdown drain is not wired in `AppServer.__lifespan`.
+- Writer lifecycle: `DataBase` owns its queue, pending batch and writer/cleanup tasks; setup starts one writer.
+  `AppServer.__lifespan` closes admission and awaits drain through `DataBase.close`; failures retain unresolved counts.
   This profile records the current boundary, not a claim that all reusable skill recommendations are implemented.
 - Required DBA screening: schema/migration, transaction/integrity, writer semantics, retention/privacy,
   or material query/index/performance changes follow the specialist gate above.
@@ -514,4 +555,4 @@ MySQL, NATS, Redis, frontend, Obsidian, Jira, and service E2E overlays are inact
 
 ## Critical rules
 
-- Any changes to the project’s folder and file structure must be critically justified and submitted to the user for approval. Modifying the folder and file structure on one’s own is prohibited; all core work must initially be carried out within the existing structure. Only if implementation proves impossible without altering the current structure should the user be consulted.
+- Any changes to the project’s folder and file structure must be critically justified and submitted to the user for approval. Modifying the folder and file structure on one’s own is prohibited; all core work must initially be carried out within the existing structure. Only if implementation proves impossible without altering the current structure should the user be consulted. The folder for subagent operations is not subject to these restrictions, but only insofar as it relates to the subagents' own activities, rather than the project code itself.

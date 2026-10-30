@@ -69,7 +69,8 @@ Available environment variables
 | `DB_FILE_NAME` | str | `rdpr-db.sqlite` | Database file name |
 | `DB_TABLE_PREFIX` | str | `rdpr_` | Prefix for database table names |
 | `DB_SAVE_BATCH_SIZE` | int | `1000` | The maximum number of all insert, update, and delete events in the database queue. This means we write a maximum of 1000 events to the file at a time (which can be very frequent). But you should also look at the timeout parameter |
-| `DB_SAVE_BATCH_TIMEOUT` | float | `0.5` | If we haven't accumulated a batch of the size limited by the parameter "parameter1" within the interval specified here, then we do what's already in the current batch |
+| `DB_SAVE_BATCH_TIMEOUT` | float | `5.0` | Maximum time in seconds from the first event in a pending batch until that partial batch is flushed |
+| `DB_SHUTDOWN_TIMEOUT` | float | `20.0` | Time in seconds to wait for the database writer during shutdown. Expiry reports unresolved writes; it does not imply a successful drain |
 | `DB_TUNE_JOURNAL_MODE` | str | `WAL` | Write-Ahead Logging - better concurrent access |
 | `DB_TUNE_WAL_AUTOCHECKPOINT` | int | `1000` | Initiate a checkpoint approximately every 1000 WAL pages (choose experimentally: if WAL grows too quickly, decrease it; if checkpoints interfere, increase it) |
 | `DB_TUNE_SYNCHRONOUS` | str | `NORMAL` | NORMAL - A good balance of performance and reliability for most VDS applications. `FULL`` provides maximum reliability, but is more expensive in terms of I/O. |
@@ -107,6 +108,27 @@ Available environment variables
 | `RIPE_STAT_PREFIX_CACHE_TTL_SEC` | int | `28800` | TTL in seconds for a RIPEstat result with a prefix |
 | `RIPE_STAT_EMPTY_PREFIX_CACHE_TTL_SEC` | int | `3600` | TTL in seconds for a RIPEstat result without a prefix |
 | `RIPE_STAT_CACHE_LOCK_TTL_SEC` | int | `120` | Maximum lifetime in seconds of a per-IP RIPEstat cache lock |
+
+## Database writes and shutdown
+
+Runtime database changes pass through one bounded in-memory writer queue. Enqueue success means that a command was
+accepted into memory; it does not confirm commit or immediate visibility to reads. A full batch is flushed immediately,
+and a partial batch is flushed at its deadline or during graceful shutdown.
+
+Only SQLite busy/locked failures before commit are retried, after the failed transaction has been rolled back and
+released. The same batch stays ahead of later commands, with at most three attempts and delays of 0.1 and 0.2 seconds.
+Commit errors and cancellation are not automatically replayed because their persistence outcome can be unknown.
+On a permanent failure, the writer rejects further commands and reports pending or unknown outcomes instead of
+discarding the failed batch. The nonblocking IP-record deletion API retains its boolean rejection result.
+
+The writer applies the configured SQLite settings to its active session, including foreign-key constraints and
+deletion cascades. A resolution command referencing a domain that has already been deleted fails its batch rather
+than creating orphan IP records; the normal terminal-failure policy then applies.
+
+Graceful shutdown closes queue admission, finishes accepted commands and the final partial batch, then releases the
+database engines. A deadline or forced cancellation reports unresolved work and retains ownership of any ongoing
+cleanup. `DB_SHUTDOWN_TIMEOUT` covers the database wait, not the total application or container shutdown time.
+The queue is process-local and does not recover pending commands after a crash or forced process termination.
 
 ## MikroTik RouterOS
 

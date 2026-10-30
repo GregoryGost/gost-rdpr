@@ -1,4 +1,5 @@
 from re import sub
+from asyncio import CancelledError
 from uvicorn import Config, Server
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
@@ -66,16 +67,21 @@ class AppServer:
 
   @asynccontextmanager
   async def __lifespan(self: Self, app: FastAPI) -> AsyncGenerator[None, Any]:
-    # first RUN BEFORE start FastAPI
-    await job_registry.reset()
-    # Init DB
-    await db.setup()
-    # Domains resolver init
-    # await self.commands_router.domains_resolver.setup()
-    #
-    yield
-    # next RUN AFTER stop FastAPI
-    await HttpClient.close()
+    try:
+      await job_registry.reset()
+      await db.setup()
+      yield
+    finally:
+      try:
+        await db.close()
+      except (Exception, CancelledError):
+        try:
+          await HttpClient.close()
+        except (Exception, CancelledError):
+          logger.error('HTTP client cleanup failed during database shutdown failure')
+        raise
+      else:
+        await HttpClient.close()
 
   async def run(self: Self):
     logger.debug('AppServer run ...')

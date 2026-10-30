@@ -6,6 +6,9 @@ from asyncio import (
   to_thread,
   Queue,
   QueueFull,
+  QueueShutDown,
+  Task,
+  shield,
   TimeoutError,
   CancelledError
 )
@@ -24,7 +27,8 @@ from sqlalchemy.pool import NullPool, AsyncAdaptedQueuePool
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine, async_sessionmaker, AsyncSession, AsyncConnection
 from datetime import datetime, timezone
 from time import monotonic
-from threading import Event
+from enum import StrEnum
+from sqlite3 import SQLITE_BUSY, SQLITE_LOCKED, Error as SQLiteError
 from pathlib import Path
 from json import loads
 from importlib.util import spec_from_file_location, module_from_spec
@@ -93,6 +97,45 @@ class DomainIpReadError(RuntimeError):
   """The current IP snapshot for a domain could not be read safely."""
 
 
+class DatabaseWriteError(RuntimeError):
+  """A sanitized failure of database initialization or queued persistence."""
+
+  def __init__(
+    self, message: str, *, retryable: bool = False, committed: bool = False,
+    outcome_unknown: bool = False, pending_count: int = 0, unknown_count: int = 0,
+  ) -> None:
+    super().__init__(message)
+    self.retryable = retryable
+    self.committed = committed
+    self.outcome_unknown = outcome_unknown
+    self.pending_count = pending_count
+    self.unknown_count = unknown_count
+
+
+class BatchWriteError(DatabaseWriteError):
+  """A batch failed or its committed transaction could not be cleaned up."""
+
+
+class WriterClosedError(DatabaseWriteError):
+  """The writer no longer admits commands in this lifecycle."""
+
+
+class WriterFailedError(DatabaseWriteError):
+  """The writer stopped after a terminal persistence failure."""
+
+
+class DatabaseShutdownError(WriterFailedError):
+  """Shutdown could not confirm a complete drain within its wait budget."""
+
+
+class WriterState(StrEnum):
+  NEW = 'NEW'
+  RUNNING = 'RUNNING'
+  STOPPING = 'STOPPING'
+  STOPPED = 'STOPPED'
+  FAILED = 'FAILED'
+
+
 class DataBase:
   '''
   Bulk ORM DELETE not supported right now  
@@ -104,15 +147,20 @@ class DataBase:
   __write_engine: AsyncEngine
   __read_session_factory: async_sessionmaker[AsyncSession]
   __write_session_factory: async_sessionmaker[AsyncSession]
-  __stop_db_save_event: Event = Event()
-  __queue_sleep_timeout: float = settings.queue_sleep_timeout
-  __queue_get_timeout: float = settings.queue_get_timeout
-  __task_exception_error_timeout: float = 10.0
   __migrations_path: Path = Path('migrations')
 
-  db_save_queue: Queue = Queue(maxsize=settings.queue_max_size)
-
   def __init__(self: Self) -> None:
+    self.__state = False
+    self.__initialization_failed = False
+    self.db_save_queue: Queue[QueueElementDto] = Queue(maxsize=settings.queue_max_size)
+    self.__pending_batch: list[QueueElementDto] = []
+    self.__writer_state = WriterState.NEW
+    self.__writer_task: Task[None] | None = None
+    self.__batch_task: Task[None] | None = None
+    self.__close_task: Task[None] | None = None
+    self.__writer_failure: WriterFailedError | None = None
+    self.__unknown_count = 0
+    self.__session_cleanup_failed = False
     logging.getLogger('sqlalchemy.engine').setLevel(Logger.LOGGER_LEVEL[settings.db_log_level])
     logging.getLogger('sqlalchemy.pool').setLevel(Logger.LOGGER_LEVEL[settings.db_log_level])
     #
@@ -165,6 +213,27 @@ class DataBase:
   @property
   def read_pool_status(self: Self) -> str:
     return self.__read_engine.pool.status()
+
+  @property
+  def writer_state(self) -> WriterState:
+    return self.__writer_state
+
+  @property
+  def writer_task(self) -> Task[None] | None:
+    return self.__writer_task
+
+  @property
+  def writer_failure(self) -> WriterFailedError | None:
+    return self.__writer_failure
+
+  @property
+  def pending_count(self) -> int:
+    """Count admitted commands that have not been positively committed."""
+    return self.db_save_queue.qsize() + len(self.__pending_batch)
+
+  @property
+  def unknown_count(self) -> int:
+    return self.__unknown_count
   
   #
 
@@ -182,6 +251,7 @@ class DataBase:
 
   async def __create_tables(self: Self) -> None:
     logger.debug('Try create all tables ...')
+    self.__initialization_failed = False
     async with self.__write_engine.begin() as conn:
       try:
         await conn.run_sync(MigrationsDbo.metadata.create_all)
@@ -210,11 +280,9 @@ class DataBase:
         # Run migrations
         await self.__main_migrations(conn=conn)
         await conn.commit()
-      except Exception as err:
-        logger.error(f'Try create all tables failed : {err}')
-        await conn.rollback()
-      finally:
-        await conn.close()
+      except BaseException:
+        # The connection context owns rollback and release on startup failure.
+        raise
 
   async def __read_connect(self: Self) -> AsyncSession:
     if self.__state == False: raise Exception('Database not ready to work')
@@ -229,45 +297,183 @@ class DataBase:
         await session.close()
 
   async def __write_connect(self: Self) -> AsyncSession:
-    if self.__state == False: raise Exception('Database not ready to work')
-    async with self.__db_write_session() as session:
-      try:
-        return await self.__session_tune(session)
-      except Exception as err:
-        await session.rollback()
-        logger.error(f'Try DB connect failed : {settings.db_path} : {err}')
-        raise err
-      finally:
-        await session.close()
+    if not self.__state:
+      raise DatabaseWriteError('Database is not ready for writes')
+    # The batch owns this session, including tuning failures and cancellation.
+    return self.__db_write_session()
 
   async def setup(self: Self) -> None:
-    '''
-    Table creates automatically
-    '''
-    logger.debug(f'Try SQLite setup on db link: {settings.db_connection}')
+    """Initialize storage before starting the owned writer task."""
+    if self.__writer_state == WriterState.RUNNING:
+      return
+    if self.__writer_state in (WriterState.FAILED, WriterState.STOPPING):
+      raise WriterClosedError('Database writer cannot be initialized in this state')
+    db_session: AsyncSession | None = None
     try:
       await self.__create_tables()
-      self.__state = True
-      db_session: AsyncSession = await self.__read_connect()
+      if self.__initialization_failed:
+        raise DatabaseWriteError('Database migrations did not complete')
+      db_session = self.__db_read_session()
       result: Result = await db_session.execute(text('SELECT sqlite_version() AS version'))
       logger.info(f'SQLite version="{str(result.scalar())}"')
-      logger.debug(f'SQLite pool_status="{self.read_pool_status}"')
-      #
-      logger.debug('Start tasks flows for DataBase')
-      # ONE FLOW FOR SAVE TO DB
-      self.__stop_db_save_event.clear()
-      create_task(
-        coro=self.__task_process_commit_db_from_queue(),
-        name='task_save_to_db_queue'
-      )
-      #
-      logger.debug('Setup DataBase - OK')
-    except Exception as err:
-      logger.error(f'Try DB setup failed at {settings.db_connection} : {err}')
-      await db_session.rollback()
-      raise err
-    finally:
       await db_session.close()
+      db_session = None
+    except (Exception, CancelledError) as err:
+      if db_session is not None:
+        try:
+          await db_session.close()
+        except (Exception, CancelledError):
+          self.__session_cleanup_failed = True
+          logger.error('Database initialization session cleanup failed')
+      failure = WriterFailedError('Database initialization failed', pending_count=self.pending_count)
+      self.__fail_writer(failure)
+      if not self.__session_cleanup_failed:
+        try:
+          await self.__dispose_engines()
+        except (Exception, CancelledError):
+          logger.error('Database initialization engine cleanup failed')
+      if isinstance(err, CancelledError):
+        raise
+      raise DatabaseWriteError('Database initialization failed') from err
+    self.__state = True
+    await self.start_writer()
+
+  async def start_writer(self) -> None:
+    """Start one writer after readiness; a failed lifecycle cannot restart."""
+    if self.__writer_state == WriterState.RUNNING:
+      return
+    if self.__writer_state == WriterState.FAILED:
+      raise self.__writer_failure
+    if self.__writer_state == WriterState.STOPPING or not self.__state:
+      raise WriterClosedError('Database writer is not ready to start')
+    if self.__writer_state == WriterState.STOPPED:
+      if self.pending_count or (self.__close_task is not None and not self.__close_task.done()):
+        raise WriterClosedError('Database writer has not finished shutdown')
+      self.db_save_queue = Queue(maxsize=settings.queue_max_size)
+      self.__close_task = None
+    self.__writer_state = WriterState.RUNNING
+    self.__writer_task = create_task(
+      self.__task_process_commit_db_from_queue(), name='database_writer'
+    )
+    self.__writer_task.add_done_callback(self.__observe_writer)
+
+  def __observe_writer(self, task: Task[None]) -> None:
+    if task.cancelled() or task.exception() is not None:
+      self.__fail_writer(WriterFailedError(
+        'Database writer terminated unexpectedly', pending_count=self.pending_count,
+        unknown_count=self.unknown_count, outcome_unknown=bool(self.unknown_count),
+      ))
+
+  def __check_admission(self) -> None:
+    if self.__writer_state == WriterState.FAILED:
+      raise WriterFailedError(
+        'Database writer has failed', pending_count=self.pending_count,
+        unknown_count=self.unknown_count, outcome_unknown=bool(self.unknown_count),
+      )
+    if self.__writer_state not in (WriterState.NEW, WriterState.RUNNING):
+      raise WriterClosedError('Database writer is closed', pending_count=self.pending_count)
+
+  async def __put_write(self, item: QueueElementDto) -> None:
+    self.__check_admission()
+    try:
+      await self.db_save_queue.put(item)
+    except QueueShutDown:
+      self.__check_admission()
+      raise WriterClosedError('Database writer queue is closed') from None
+
+  def __put_write_nowait(self, item: QueueElementDto) -> None:
+    self.__check_admission()
+    try:
+      self.db_save_queue.put_nowait(item)
+    except QueueShutDown:
+      self.__check_admission()
+      raise WriterClosedError('Database writer queue is closed') from None
+
+  def __fail_writer(self, failure: WriterFailedError) -> None:
+    self.__writer_state = WriterState.FAILED
+    if self.__writer_failure is None:
+      self.__writer_failure = failure
+    self.db_save_queue.shutdown(immediate=False)
+    logger.error(
+      f'Database writer failed; pending={self.pending_count}, unknown={self.unknown_count}'
+    )
+
+  async def __dispose_engines(self) -> None:
+    try:
+      await self.__read_engine.dispose()
+    finally:
+      await self.__write_engine.dispose()
+
+  async def __finish_close(self) -> None:
+    try:
+      if self.__writer_task is not None:
+        try:
+          await self.__writer_task
+        except CancelledError:
+          if self.__writer_failure is None:
+            self.__fail_writer(WriterFailedError(
+              'Database writer was cancelled', pending_count=self.pending_count,
+              unknown_count=self.unknown_count,
+            ))
+      if self.__writer_failure is None:
+        if self.pending_count:
+          self.__fail_writer(WriterFailedError(
+            'Database writer stopped with pending commands', pending_count=self.pending_count,
+          ))
+        else:
+          await self.db_save_queue.join()
+      if self.__writer_failure is not None:
+        raise self.__writer_failure
+    finally:
+      # A cancelled caller must not dispose an engine still used by the writer.
+      if not self.__session_cleanup_failed:
+        try:
+          await self.__dispose_engines()
+        except Exception:
+          self.__fail_writer(WriterFailedError(
+            'Database engine cleanup failed', pending_count=self.pending_count,
+          ))
+      if self.__writer_failure is None:
+        self.__writer_state = WriterState.STOPPED
+
+  @staticmethod
+  def __observe_close(task: Task[None]) -> None:
+    if not task.cancelled():
+      task.exception()
+
+  async def close(self, timeout: float | None = None) -> None:
+    """Stop admission, drain accepted writes and release idle engines.
+
+    A timeout reports failure immediately while the owned task finishes native
+    work and cleanup. It does not imply that in-memory commands are durable.
+    """
+    if self.__close_task is None:
+      if self.__writer_state == WriterState.NEW and self.pending_count and self.__state:
+        await self.start_writer()
+      if self.__writer_state != WriterState.FAILED:
+        self.__writer_state = WriterState.STOPPING
+      self.db_save_queue.shutdown(immediate=False)
+      self.__close_task = create_task(self.__finish_close(), name='database_close')
+      self.__close_task.add_done_callback(self.__observe_close)
+    try:
+      await wait_for(
+        shield(self.__close_task),
+        timeout=settings.db_shutdown_timeout if timeout is None else timeout,
+      )
+    except (TimeoutError, CancelledError) as err:
+      if self.__batch_task is not None and not self.__batch_task.done():
+        self.__unknown_count = len(self.__pending_batch)
+      failure = DatabaseShutdownError(
+        'Database shutdown did not confirm a complete drain',
+        pending_count=self.pending_count, unknown_count=self.unknown_count,
+        outcome_unknown=bool(self.unknown_count),
+      )
+      self.__fail_writer(failure)
+      if self.__writer_task is not None and not self.__writer_task.done():
+        self.__writer_task.cancel()
+      raise failure from err
+    if self.__writer_failure is not None:
+      raise self.__writer_failure
 
   # Migrations
 
@@ -295,6 +501,7 @@ class DataBase:
       ]
       return applied_migrations
     except Exception as err:
+      self.__initialization_failed = True
       logger.error(f'Try get applied migrations failed : {err}', exc_info=True)
       await conn.rollback()
       return applied_migrations
@@ -313,6 +520,7 @@ class DataBase:
             await migration_module.downgrade(conn=conn)
       return True
     except Exception as err:
+      self.__initialization_failed = True
       logger.error(f'Try run migration "{migration_file.name}" failed : {err}', exc_info=True)
       return False
 
@@ -343,6 +551,7 @@ class DataBase:
             checksum=calculate_checksum(file_path=migration)
           ))
     except Exception as err:
+      self.__initialization_failed = True
       logger.error(f'Migrations failed : {err}', exc_info=True)
 
   # DNS servers
@@ -437,15 +646,13 @@ class DataBase:
   async def put_add_dns_servers_to_queue(self: Self, dns_servers: List[DnsPostElementReq]) -> None:
     logger.debug(f'Try send DNS servers to Queue ...')
     try:
-      while self.db_save_queue.full():
-        await sleep(self.__queue_sleep_timeout)
-        continue
       dns_server_element: QueueElementDto = QueueElementDto(
         target=TargetAction.DNS_SERVERS_ADD,
         elements=dns_servers
       )
-      logger.debug(f'Put dns servers element {dns_server_element=} to Queue')
-      self.db_save_queue.put_nowait(item=dns_server_element)
+      await self.__put_write(item=dns_server_element)
+    except DatabaseWriteError:
+      raise
     except QueueFull:
       logger.error(f'Queue is full for try send DNS servers {dns_servers=} to Queue')
     except Exception as err:
@@ -454,9 +661,6 @@ class DataBase:
   async def put_delete_dns_servers_to_queue(self: Self, id: Optional[int] = None) -> None:
     logger.debug(f'Try send deleted DNS servers to Queue ...')
     try:
-      while self.db_save_queue.full():
-        await sleep(self.__queue_sleep_timeout)
-        continue
       if id != None:
         logger.debug(f'Once DNS server delete {id=}')
         dns_server_element: QueueElementDto = QueueElementDto(
@@ -468,8 +672,9 @@ class DataBase:
           target=TargetAction.DNS_SERVERS_DELETE_ALL,
           elements=[]
         )
-      logger.debug(f'Put delete dns servers element {dns_server_element=} to Queue')
-      self.db_save_queue.put_nowait(item=dns_server_element)
+      await self.__put_write(item=dns_server_element)
+    except DatabaseWriteError:
+      raise
     except QueueFull:
       logger.error(f'Queue is full for try send deleted DNS servers to Queue')
     except Exception as err:
@@ -599,15 +804,13 @@ class DataBase:
   async def put_add_domains_lists_to_queue(self: Self, domains_lists: List[DomainsListsPostElementReq]) -> None:
     logger.debug(f'Try send Domains lists to Queue ...')
     try:
-      while self.db_save_queue.full():
-        await sleep(self.__queue_sleep_timeout)
-        continue
       domains_lists_element: QueueElementDto = QueueElementDto(
         target=TargetAction.DOMAINS_LISTS_ADD,
         elements=domains_lists
       )
-      logger.debug(f'Put domains lists element {domains_lists_element=} to Queue')
-      self.db_save_queue.put_nowait(item=domains_lists_element)
+      await self.__put_write(item=domains_lists_element)
+    except DatabaseWriteError:
+      raise
     except QueueFull:
       logger.error(f'Queue is full for try send domains lists {domains_lists=} to Queue')
     except Exception as err:
@@ -616,9 +819,6 @@ class DataBase:
   async def put_delete_domains_list_to_queue(self: Self, id: Optional[int] = None) -> None:
     logger.debug(f'Try send deleted Domains list to Queue ...')
     try:
-      while self.db_save_queue.full():
-        await sleep(self.__queue_sleep_timeout)
-        continue
       if id != None:
         logger.debug(f'One Domains list delete {id=}')
         domains_list_element: QueueElementDto = QueueElementDto(
@@ -630,8 +830,9 @@ class DataBase:
           target=TargetAction.DOMAINS_LISTS_DELETE_ALL,
           elements=[]
         )
-      logger.debug(f'Put delete domains list element {domains_list_element=} to Queue')
-      self.db_save_queue.put_nowait(item=domains_list_element)
+      await self.__put_write(item=domains_list_element)
+    except DatabaseWriteError:
+      raise
     except QueueFull:
       logger.error(f'Queue is full for try send deleted Domains list to Queue')
     except Exception as err:
@@ -640,16 +841,14 @@ class DataBase:
   async def update_domains_lists(self: Self, domains_lists: List[DomainsListDto]) -> None:
     logger.debug(f'Try send update Domains lists to Queue ...')
     try:
-      while self.db_save_queue.full():
-        await sleep(self.__queue_sleep_timeout)
-        continue
       logger.debug(f'One Domains lists update {domains_lists=}')
       domains_list_element: QueueElementDto = QueueElementDto(
         target=TargetAction.DOMAINS_LISTS_UPDATE,
         elements=domains_lists
       )
-      logger.debug(f'Put update domains lists element {domains_list_element=} to Queue')
-      self.db_save_queue.put_nowait(item=domains_list_element)
+      await self.__put_write(item=domains_list_element)
+    except DatabaseWriteError:
+      raise
     except QueueFull:
       logger.error(f'Queue is full for try send update Domains lists to Queue')
     except Exception as err:
@@ -765,9 +964,6 @@ class DataBase:
   async def put_add_domains_to_queue(self: Self, domains: List[DomainsPostElementReq]) -> None:
     logger.debug(f'Try send Domains to Queue ...')
     try:
-      while self.db_save_queue.full():
-        await sleep(self.__queue_sleep_timeout)
-        continue
       filtered_domains: List[DomainsPostElementReq] = [
         domain
         for domain in domains
@@ -788,8 +984,9 @@ class DataBase:
           target=TargetAction.DOMAINS_ADD,
           elements=filtered_domains
         )
-      logger.debug(f'Put domains element {domains_element=} to Queue')
-      self.db_save_queue.put_nowait(item=domains_element)
+      await self.__put_write(item=domains_element)
+    except DatabaseWriteError:
+      raise
     except QueueFull:
       logger.error(f'Queue is full for try send domains {domains=} to Queue')
     except Exception as err:
@@ -798,9 +995,6 @@ class DataBase:
   async def put_delete_domains_to_queue(self: Self, id: Optional[int] = None) -> None:
     logger.debug(f'Try send deleted Domains to Queue ...')
     try:
-      while self.db_save_queue.full():
-        await sleep(self.__queue_sleep_timeout)
-        continue
       if id != None:
         logger.debug(f'One Domains delete {id=}')
         domains_element: QueueElementDto = QueueElementDto(
@@ -812,8 +1006,9 @@ class DataBase:
           target=TargetAction.DOMAINS_DELETE_ALL,
           elements=[]
         )
-      logger.debug(f'Put delete domains element {domains_element=} to Queue')
-      self.db_save_queue.put_nowait(item=domains_element)
+      await self.__put_write(item=domains_element)
+    except DatabaseWriteError:
+      raise
     except QueueFull:
       logger.error(f'Queue is full for try send deleted Domains to Queue')
     except Exception as err:
@@ -878,15 +1073,13 @@ class DataBase:
   async def put_domain_after_resolve(self: Self, domain: DomainResult) -> None:
     logger.debug(f'Try send insert ips, delete ips, update domains to Queue ...')
     try:
-      while self.db_save_queue.full():
-        await sleep(self.__queue_sleep_timeout)
-        continue
       domains_resolved_element: QueueElementDto = QueueElementDto(
         target=TargetAction.DOMAINS_RESOLVED,
         elements=[domain]
       )
-      logger.debug(f'Put domains resolved element {domains_resolved_element=} to Queue')
-      self.db_save_queue.put_nowait(item=domains_resolved_element)
+      await self.__put_write(item=domains_resolved_element)
+    except DatabaseWriteError:
+      raise
     except QueueFull:
       logger.error(f'Queue is full for try send domains {domain=} to Queue')
     except Exception as err:
@@ -992,15 +1185,13 @@ class DataBase:
   async def put_add_ips_lists_to_queue(self: Self, ips_lists: List[IpsListsPostElementReq]) -> None:
     logger.debug(f'Try send Ips lists to Queue ...')
     try:
-      while self.db_save_queue.full():
-        await sleep(self.__queue_sleep_timeout)
-        continue
       ips_lists_element: QueueElementDto = QueueElementDto(
         target=TargetAction.IPS_LISTS_ADD,
         elements=ips_lists
       )
-      logger.debug(f'Put ips lists element {ips_lists_element=} to Queue')
-      self.db_save_queue.put_nowait(item=ips_lists_element)
+      await self.__put_write(item=ips_lists_element)
+    except DatabaseWriteError:
+      raise
     except QueueFull:
       logger.error(f'Queue is full for try send ips lists {ips_lists=} to Queue')
     except Exception as err:
@@ -1009,9 +1200,6 @@ class DataBase:
   async def put_delete_ips_list_to_queue(self: Self, id: Optional[int] = None) -> None:
     logger.debug(f'Try send deleted Ips list to Queue ...')
     try:
-      while self.db_save_queue.full():
-        await sleep(self.__queue_sleep_timeout)
-        continue
       if id != None:
         logger.debug(f'One Ips list delete {id=}')
         ips_list_element: QueueElementDto = QueueElementDto(
@@ -1023,8 +1211,9 @@ class DataBase:
           target=TargetAction.IPS_LISTS_DELETE_ALL,
           elements=[]
         )
-      logger.debug(f'Put delete ips list element {ips_list_element=} to Queue')
-      self.db_save_queue.put_nowait(item=ips_list_element)
+      await self.__put_write(item=ips_list_element)
+    except DatabaseWriteError:
+      raise
     except QueueFull:
       logger.error(f'Queue is full for try send deleted Ips list to Queue')
     except Exception as err:
@@ -1033,16 +1222,14 @@ class DataBase:
   async def update_ips_lists(self: Self, ips_lists: List[IpsListDto]) -> None:
     logger.debug(f'Try send update Ips lists to Queue ...')
     try:
-      while self.db_save_queue.full():
-        await sleep(self.__queue_sleep_timeout)
-        continue
       logger.debug(f'One Ips lists update {ips_lists=}')
       ips_list_element: QueueElementDto = QueueElementDto(
         target=TargetAction.IPS_LISTS_UPDATE,
         elements=ips_lists
       )
-      logger.debug(f'Put update ips lists element {ips_list_element=} to Queue')
-      self.db_save_queue.put_nowait(item=ips_list_element)
+      await self.__put_write(item=ips_list_element)
+    except DatabaseWriteError:
+      raise
     except QueueFull:
       logger.error(f'Queue is full for try send update Ips lists to Queue')
     except Exception as err:
@@ -1182,15 +1369,13 @@ class DataBase:
   async def put_add_ips_to_queue(self: Self, ips: List[IpsPostElementReq]) -> None:
     logger.debug(f'Try send Ips to Queue ...')
     try:
-      while self.db_save_queue.full():
-        await sleep(self.__queue_sleep_timeout)
-        continue
       ips_element: QueueElementDto = QueueElementDto(
         target=TargetAction.IPS_ADD,
         elements=ips
       )
-      logger.debug(f'Put ips element {ips_element=} to Queue')
-      self.db_save_queue.put_nowait(item=ips_element)
+      await self.__put_write(item=ips_element)
+    except DatabaseWriteError:
+      raise
     except QueueFull:
       logger.error(f'Queue is full for try send ips {ips=} to Queue')
     except Exception as err:
@@ -1199,9 +1384,6 @@ class DataBase:
   async def put_delete_ips_to_queue(self: Self, id_or_ip: Optional[int | str] = None) -> None:
     logger.debug(f'Try send deleted Ips to Queue ...')
     try:
-      while self.db_save_queue.full():
-        await sleep(self.__queue_sleep_timeout)
-        continue
       if id_or_ip != None:
         try:
           id: int = int(id_or_ip)
@@ -1225,8 +1407,9 @@ class DataBase:
           target=TargetAction.IPS_DELETE_ALL,
           elements=[]
         )
-      logger.debug(f'Put delete ips element {ips_element=} to Queue')
-      self.db_save_queue.put_nowait(item=ips_element)
+      await self.__put_write(item=ips_element)
+    except DatabaseWriteError:
+      raise
     except QueueFull:
       logger.error(f'Queue is full for try send deleted Domains to Queue')
     except Exception as err:
@@ -1236,9 +1419,6 @@ class DataBase:
     logger.debug('Try send IP address records for deletion to Queue ...')
     if len(ids) < 1:
       return True
-    if self.db_save_queue.full():
-      logger.error('Queue is full for IP address records deletion')
-      return False
     try:
       ips_element: QueueElementDto = QueueElementDto(
         target=TargetAction.IPS_DELETE_ID,
@@ -1247,9 +1427,9 @@ class DataBase:
       logger.debug(
         f'Put IP address records for deletion to Queue: {len(ids)}'
       )
-      self.db_save_queue.put_nowait(item=ips_element)
+      self.__put_write_nowait(item=ips_element)
       return True
-    except QueueFull:
+    except (QueueFull, DatabaseWriteError):
       logger.error('Queue is full for IP address records deletion')
       return False
     except Exception as err:
@@ -1437,15 +1617,13 @@ class DataBase:
   async def put_add_ros_configs_to_queue(self: Self, ros_configs: List[RosConfigsPostElementReq]) -> None:
     logger.debug(f'Try send RoS configs to Queue ...')
     try:
-      while self.db_save_queue.full():
-        await sleep(self.__queue_sleep_timeout)
-        continue
       ros_configs_element: QueueElementDto = QueueElementDto(
         target=TargetAction.ROS_CONFIG_ADD,
         elements=ros_configs
       )
-      logger.debug(f'Put RoS configs element {ros_configs_element=} to Queue')
-      self.db_save_queue.put_nowait(item=ros_configs_element)
+      await self.__put_write(item=ros_configs_element)
+    except DatabaseWriteError:
+      raise
     except QueueFull:
       logger.error(f'Queue is full for try send RoS configs {ros_configs=} to Queue')
     except Exception as err:
@@ -1454,9 +1632,6 @@ class DataBase:
   async def put_delete_ros_configs_to_queue(self: Self, id: Optional[int] = None) -> None:
     logger.debug(f'Try send deleted Router OS configs to Queue ...')
     try:
-      while self.db_save_queue.full():
-        await sleep(self.__queue_sleep_timeout)
-        continue
       if id != None:
         logger.debug(f'One Router OS config delete {id=}')
         ros_configs_element: QueueElementDto = QueueElementDto(
@@ -1468,8 +1643,9 @@ class DataBase:
           target=TargetAction.ROS_CONFIG_DELETE_ALL,
           elements=[]
         )
-      logger.debug(f'Put delete Router OS configs element {ros_configs_element=} to Queue')
-      self.db_save_queue.put_nowait(item=ros_configs_element)
+      await self.__put_write(item=ros_configs_element)
+    except DatabaseWriteError:
+      raise
     except QueueFull:
       logger.error(f'Queue is full for try send deleted Router OS configs to Queue')
     except Exception as err:
@@ -1568,6 +1744,8 @@ class DataBase:
           for ip in ips_delete:
             await self.put_delete_ips_to_queue(id_or_ip=ip.id)
           await self.update_ips_lists(ips_lists=active_ips_lists)
+    except DatabaseWriteError:
+      raise
     except Exception as err:
       logger.error(f'Try Lists load failed : {err}', exc_info=True)
       if db_session is not None:
@@ -1697,62 +1875,132 @@ class DataBase:
 
   #
 
-  async def __task_process_commit_db_from_queue(self: Self) -> None:
-    # save if save batch count >= settings.db_save_batch_size (default 1000)
-    # else save timeout >= settings.db_save_batch_timeout (default 500.0 ms)
-    logger.info('STARTING A FLOW - Saving information to the database')
-    start_timer: float = 0.0
-    items_batch: List[QueueElementDto] = []
-    while not self.__stop_db_save_event.is_set():
-      if self.__state == False:
-        await sleep(self.__queue_sleep_timeout)
-        continue
+  def __acknowledge_batch(self) -> None:
+    for _ in self.__pending_batch:
+      self.db_save_queue.task_done()
+    self.__pending_batch.clear()
+    self.__unknown_count = 0
+    if self.__writer_failure is not None:
+      self.__writer_failure.committed = True
+      self.__writer_failure.outcome_unknown = False
+      self.__writer_failure.pending_count = self.pending_count
+      self.__writer_failure.unknown_count = 0
+
+  async def __commit_pending(self) -> None:
+    for attempt in range(3):
+      if self.__writer_state == WriterState.FAILED:
+        # No attempt is active; earlier retryable failures were rolled back and released.
+        raise BatchWriteError('Database batch stopped before the next write attempt')
       try:
-        # queue is empty - skip
-        if self.db_save_queue.empty():
-          # queue done
-          if (
-            len(items_batch) > 0 and len(items_batch) < settings.db_save_batch_size
-          ) and (monotonic() - start_timer) >= settings.db_save_batch_timeout:
-            # save batch if timeout
-            await self.__batch_items_commit(items_batch)
-            items_batch.clear()
-            start_timer = 0.0
-          await sleep(self.__queue_sleep_timeout)
+        await self.__batch_items_commit(self.__pending_batch)
+        return
+      except BatchWriteError as err:
+        if not err.retryable or attempt == 2:
+          raise
+        await sleep(0.1 * (attempt + 1))
+
+  async def __flush_pending(self) -> None:
+    if not self.__pending_batch:
+      return
+    self.__batch_task = create_task(self.__commit_pending(), name='database_batch')
+    try:
+      await shield(self.__batch_task)
+    except CancelledError:
+      # Native SQLite work may continue after cancellation of its awaiter.
+      self.__unknown_count = len(self.__pending_batch)
+      self.__fail_writer(WriterFailedError(
+        'Database writer was cancelled', pending_count=self.pending_count,
+        unknown_count=self.unknown_count, outcome_unknown=True,
+      ))
+      while not self.__batch_task.done():
+        try:
+          await shield(self.__batch_task)
+        except CancelledError:
           continue
-        queue_element: QueueElementDto = await wait_for(
-          self.db_save_queue.get(),
-          timeout=self.__queue_get_timeout
-        )
-        if start_timer == 0.0: start_timer = monotonic()
-        if len(items_batch) >= settings.db_save_batch_size:
-          # save batch if full count
-          await self.__batch_items_commit(items_batch)
-          items_batch.clear()
-          start_timer = 0.0
-        else:
-          items_batch.append(queue_element)
-      except TimeoutError:
-        await sleep(self.__queue_sleep_timeout)
-        continue
-      except CancelledError:
-        logger.info('A request was received to stop the flow - Saving information to the database')
-        start_timer = 0.0
-        break
-      except Exception as err:
-        logger.error(f'Unexpected error in flow - Saving information to the database : {err}', exc_info=True)
-        items_batch.clear()
-        start_timer = 0.0
-        await sleep(self.__task_exception_error_timeout)
-        continue
-    logger.warning('STOP FLOW - Saving information to the database')
+        except Exception:
+          break
+      try:
+        self.__batch_task.result()
+      except DatabaseWriteError as err:
+        if err.committed:
+          self.__acknowledge_batch()
+        elif not err.outcome_unknown:
+          self.__unknown_count = 0
+          self.__writer_failure.outcome_unknown = False
+          self.__writer_failure.unknown_count = 0
+      except (Exception, CancelledError):
+        pass
+      else:
+        self.__acknowledge_batch()
+      raise
+    except BatchWriteError as err:
+      if err.committed:
+        self.__acknowledge_batch()
+      elif err.outcome_unknown:
+        self.__unknown_count = len(self.__pending_batch)
+      raise
+    else:
+      self.__acknowledge_batch()
+
+  async def __task_process_commit_db_from_queue(self: Self) -> None:
+    logger.info('Database writer started')
+    deadline: float | None = None
+    try:
+      while self.__writer_state != WriterState.FAILED:
+        if self.__pending_batch and (
+          len(self.__pending_batch) >= max(1, settings.db_save_batch_size)
+          or monotonic() >= deadline
+        ):
+          await self.__flush_pending()
+          deadline = None
+        try:
+          if self.__pending_batch:
+            queue_element = await wait_for(
+              self.db_save_queue.get(), timeout=max(0.0, deadline - monotonic())
+            )
+          else:
+            queue_element = await self.db_save_queue.get()
+        except TimeoutError:
+          await self.__flush_pending()
+          deadline = None
+          continue
+        except QueueShutDown:
+          await self.__flush_pending()
+          break
+        self.__pending_batch.append(queue_element)
+        if deadline is None:
+          deadline = monotonic() + settings.db_save_batch_timeout
+    except CancelledError:
+      self.__fail_writer(WriterFailedError(
+        'Database writer was cancelled', pending_count=self.pending_count,
+        unknown_count=self.unknown_count, outcome_unknown=bool(self.unknown_count),
+      ))
+      raise
+    except DatabaseWriteError as err:
+      self.__fail_writer(WriterFailedError(
+        'Database batch persistence failed', pending_count=self.pending_count,
+        unknown_count=self.unknown_count, outcome_unknown=bool(self.unknown_count),
+        committed=err.committed,
+      ))
+    except Exception:
+      self.__fail_writer(WriterFailedError(
+        'Database writer failed unexpectedly', pending_count=self.pending_count,
+        unknown_count=self.unknown_count, outcome_unknown=bool(self.unknown_count),
+      ))
+    finally:
+      if self.__writer_state != WriterState.FAILED:
+        self.__writer_state = WriterState.STOPPED
+      logger.info('Database writer stopped')
 
   async def __batch_items_commit(self: Self, queue_elements: List[QueueElementDto]) -> None:
-    '''
-    INSERT, DELETE, UPDATE - only single transaction. SQLite DB !!! One file
-    '''
+    """Persist one atomic batch and translate all persistence failures."""
     logger.debug(f'Try prepare elements count={len(queue_elements)} ...')
-    logger.debug(f'DB save queue batch prepare: {queue_elements=}')
+    db_session: AsyncSession | None = None
+    commit_started = False
+    committed = False
+    failure: Exception | CancelledError | None = None
+    rollback_ok = True
+    release_ok = True
     try:
       # Prepare elements
       # DNS SERVERS
@@ -1956,94 +2204,103 @@ class DataBase:
       ]
       #
       #
-      db_session: AsyncSession = await self.__write_connect()
+      db_session = await self.__write_connect()
+      await self.__session_tune(db_session)
       # Recording with immediate write lock
       await db_session.execute(text('BEGIN IMMEDIATE'))
       # DNS SERVERS
       if len(dns_servers_add) > 0:
-        logger.debug(f'DB save queue batch prepare: {dns_servers_add=}')
         await DnsServersDbo.add_batch(db_session=db_session, items=dns_servers_add)
       if len(dns_servers_delete) > 0:
-        logger.debug(f'DB delete queue batch prepare: {dns_servers_delete=}')
         await db_session.execute(delete(DnsServersDbo).where(DnsServersDbo.id.in_(dns_servers_delete)))
       if len(dns_servers_delete_all) > 0:
-        logger.debug(f'DB delete queue batch prepare: {dns_servers_delete_all=}')
         await db_session.execute(delete(DnsServersDbo).where(DnsServersDbo.id > 0))
       # DOMAINS LISTS
       if len(domains_lists_add) > 0:
-        logger.debug(f'DB save queue batch prepare: {domains_lists_add=}')
         await DomainsListsDbo.add_batch(db_session=db_session, items=domains_lists_add)
       if len(domains_lists_delete) > 0: # ATTEMPTS
-        logger.debug(f'DB delete queue batch prepare: {domains_lists_delete=}')
         await db_session.execute(delete(DomainsListsDbo).where(DomainsListsDbo.id.in_(domains_lists_delete)))
       if len(domains_lists_delete_all) > 0:
-        logger.debug(f'DB delete queue batch prepare: {domains_lists_delete_all=}')
         await db_session.execute(delete(DomainsListsDbo).where(DomainsListsDbo.id > 0))
       if len(domains_lists_update) > 0:
-        logger.debug(f'DB update queue batch prepare: {domains_lists_update=}')
         await db_session.execute(update(DomainsListsDbo), domains_lists_update)
       # IPS LISTS
       if len(ips_lists_add) > 0:
-        logger.debug(f'DB save queue batch prepare: {ips_lists_add=}')
         await IpsListsDbo.add_batch(db_session=db_session, items=ips_lists_add)
       if len(ips_lists_delete) > 0: # ATTEMPTS
-        logger.debug(f'DB delete queue batch prepare: {ips_lists_delete=}')
         await db_session.execute(delete(IpsListsDbo).where(IpsListsDbo.id.in_(ips_lists_delete)))
       if len(ips_lists_delete_all) > 0:
-        logger.debug(f'DB delete queue batch prepare: {ips_lists_delete_all=}')
         await db_session.execute(delete(IpsListsDbo).where(IpsListsDbo.id > 0))
       if len(ips_lists_update) > 0:
-        logger.debug(f'DB update queue batch prepare: {ips_lists_update=}')
         await db_session.execute(update(IpsListsDbo), ips_lists_update)
       # IPS
       if len(ips_add) > 0:
-        logger.debug(f'DB save queue batch prepare: {ips_add=}')
         await IpRecordsDbo.add_batch(db_session=db_session, items=ips_add)
       if len(ips_resolved_add) > 0:
-        logger.debug(f'DB save queue batch prepare: {ips_resolved_add=}')
         await IpRecordsDbo.add_batch(db_session=db_session, items=ips_resolved_add)
       if len(ips_id_delete) > 0:
-        logger.debug(f'DB delete queue batch prepare: {ips_id_delete=}')
         await db_session.execute(delete(IpRecordsDbo).where(IpRecordsDbo.id.in_(ips_id_delete)))
       if len(ips_resolved_delete) > 0:
-        logger.debug(f'DB delete queue batch prepare: {ips_resolved_delete=}')
         await db_session.execute(delete(IpRecordsDbo).where(IpRecordsDbo.id.in_(ips_resolved_delete)))
       if len(ips_addr_delete) > 0:
-        logger.debug(f'DB delete queue batch prepare: {ips_addr_delete=}')
         await db_session.execute(delete(IpRecordsDbo).where(IpRecordsDbo.ip_address.in_(ips_addr_delete)))
       if len(ips_delete_all) > 0:
-        logger.debug(f'DB delete queue batch prepare: {ips_delete_all=}')
         await db_session.execute(delete(IpRecordsDbo).where(IpRecordsDbo.id > 0))
       # DOMAINS (after ips processing)
       if len(domains_add) > 0:
-        logger.debug(f'DB save queue batch prepare: {domains_add=}')
         await DomainsDbo.add_batch(db_session=db_session, items=domains_add)
       if len(domains_delete) > 0:
-        logger.debug(f'DB delete queue batch prepare: {domains_delete=}')
         await db_session.execute(delete(DomainsDbo).where(DomainsDbo.id.in_(domains_delete)))
       if len(domains_delete_all) > 0:
-        logger.debug(f'DB delete queue batch prepare: {domains_delete_all=}')
         await db_session.execute(delete(DomainsDbo).where(DomainsDbo.id > 0))
       if len(domains_resolved_update) > 0:
-        logger.debug(f'DB delete queue batch prepare: {domains_resolved_update=}')
         await db_session.execute(update(DomainsDbo), domains_resolved_update)
       # ROS CONFIGS
       if len(ros_configs_add) > 0:
-        logger.debug(f'DB save queue batch prepare: {ros_configs_add=}')
         await RosConfigsDbo.add_batch(db_session=db_session, items=ros_configs_add)
       if len(ros_configs_delete) > 0:
-        logger.debug(f'DB delete queue batch prepare: {ros_configs_delete=}')
         await db_session.execute(delete(RosConfigsDbo).where(RosConfigsDbo.id.in_(ros_configs_delete)))
       if len(ros_configs_delete_all) > 0:
-        logger.debug(f'DB delete queue batch prepare: {ros_configs_delete_all=}')
         await db_session.execute(delete(RosConfigsDbo).where(RosConfigsDbo.id > 0))
       #
+      # Any failure from commit itself has an ambiguous physical outcome.
+      commit_started = True
       await db_session.commit()
-    except Exception as err:
-      logger.error(f'Try prepare elements failed : {err}', exc_info=True)
-      await db_session.rollback()
+      committed = True
+    except (Exception, CancelledError) as err:
+      failure = err
+      if db_session is not None:
+        try:
+          await db_session.rollback()
+        except (Exception, CancelledError):
+          rollback_ok = False
+          logger.error('Database batch rollback failed')
     finally:
-      await db_session.close()
+      if db_session is not None:
+        try:
+          await db_session.close()
+        except (Exception, CancelledError) as err:
+          release_ok = False
+          self.__session_cleanup_failed = True
+          if failure is None:
+            failure = err
+          logger.error('Database batch session cleanup failed')
+    if failure is not None:
+      # SQLite extended result codes retain the primary code in the low byte.
+      original = getattr(failure, 'orig', failure)
+      sqlite_code = getattr(original, 'sqlite_errorcode', None)
+      retryable = (
+        not commit_started and rollback_ok and release_ok
+        and isinstance(original, SQLiteError)
+        and isinstance(sqlite_code, int)
+        and sqlite_code & 0xff in (SQLITE_BUSY, SQLITE_LOCKED)
+        and not isinstance(failure, CancelledError)
+      )
+      raise BatchWriteError(
+        'Database batch cleanup failed after commit' if committed else 'Database batch could not be committed',
+        retryable=retryable, committed=committed,
+        outcome_unknown=commit_started and not committed,
+      ) from failure
 
 # Init DataBase
 try:
