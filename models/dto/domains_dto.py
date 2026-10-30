@@ -1,13 +1,21 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
-from dns.rdata import Rdata
-from dns.rrset import RRset
-from dns.rdatatype import A, AAAA, RdataType
 from typing import List
 
-from utils.utils import check_ip_allow
+from dns.rdata import Rdata
+from dns.rdatatype import AAAA, A, RdataType
+from dns.rrset import RRset
 
 from models.dto.ip_record_dto import IpRecordDto
+from models.dto.queue_dto import Observation
+from utils.utils import check_ip_allow
+
+
+class ProcessingOutcome(StrEnum):
+  SUCCESS = 'success'
+  PARTIAL = 'partial'
+  FAILURE = 'failure'
+  CANCELLED = 'cancelled_processing'
 
 
 class DnsQueryStatus(StrEnum):
@@ -34,10 +42,12 @@ class DomainLookupElement:
   A: List[str] = field(default_factory=list)
   AAAA: List[str] = field(default_factory=list)
 
+
 @dataclass
 class DomainSqlData:
-  ips_insert: List[IpRecordDto] = field(default_factory=list) # [IpRecordDto, ...]
-  ips_delete: List[int] = field(default_factory=list) # [id, id, id]
+  ips_insert: List[IpRecordDto] = field(default_factory=list)  # [IpRecordDto, ...]
+  ips_delete: List[int] = field(default_factory=list)  # [id, id, id]
+
 
 @dataclass
 class DomainResult:
@@ -47,6 +57,9 @@ class DomainResult:
   insert: DomainSqlData = field(default_factory=DomainSqlData)
   list_id: int | None = None
   resolution_complete: bool = False
+  processing_outcome: ProcessingOutcome | None = None
+  observation: Observation | None = field(default=None, repr=False, compare=False)
+  admitted_at: float | None = field(default=None, repr=False, compare=False)
 
   def append_lookup(self: DomainResult, result_list: List[Rdata]) -> None:
     for result in result_list:
@@ -54,7 +67,7 @@ class DomainResult:
         self.result.A.append(result.to_text())
       if result.rdtype == AAAA:
         self.result.AAAA.append(result.to_text())
-  
+
   def append_doh_lookup(self: DomainResult, result_list: List[RRset]) -> None:
     for result in result_list:
       if result.rdtype == A:
@@ -74,6 +87,7 @@ class DomainResult:
       if ip_record.id != None:
         self.insert.ips_delete.append(ip_record.id)
 
+
 @dataclass
 class DnsServerResolveResultDto:
   server: str
@@ -81,6 +95,7 @@ class DnsServerResolveResultDto:
   ips_v4: List[str] = field(default_factory=list)
   ips_v6: List[str] = field(default_factory=list)
   cnames: List[str] = field(default_factory=list)
+
 
 @dataclass
 class CheckDomainResultDto:

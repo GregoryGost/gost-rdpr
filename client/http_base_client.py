@@ -1,20 +1,18 @@
 import logging
-from httpx import AsyncClient, Timeout, AsyncHTTPTransport, Limits
-from httpx._types import HeaderTypes
-from typing import Self
+from typing import ClassVar, Self
 
-from logger.logger import Logger
+from httpx import AsyncClient, AsyncHTTPTransport, Limits, Timeout
+from httpx._types import HeaderTypes
+
 from config.config import settings
-from metrics.httpx_metrics import HttpxMetrics
+from logger.logger import Logger
+from metrics.httpx_metrics import HttpxMetrics, ObservedAsyncTransport
+
 
 class HttpClient:
-
-  headers: HeaderTypes = {
-    'Accept': '*/*',
-    'User-Agent': f'{settings.app_title} [{settings.app_version}]'
-  }
-  __metrics: HttpxMetrics = HttpxMetrics()
-  __clients: dict[str, AsyncClient] = {}
+  headers: ClassVar[HeaderTypes] = {'Accept': '*/*', 'User-Agent': f'{settings.app_title} [{settings.app_version}]'}
+  __metrics: ClassVar[HttpxMetrics] = HttpxMetrics()
+  __clients: ClassVar[dict[str, AsyncClient]] = {}
 
   @classmethod
   def get_client(cls: type[Self], name: str = 'default', timeout: Timeout | None = None) -> AsyncClient:
@@ -23,25 +21,20 @@ class HttpClient:
     logging.getLogger('httpx').setLevel(Logger.LOGGER_LEVEL[settings.httpx_log_level])
     # Common
     limits: Limits = Limits(
-      max_connections=settings.req_max_connections,
-      max_keepalive_connections=settings.req_max_keepalive_connections
+      max_connections=settings.req_max_connections, max_keepalive_connections=settings.req_max_keepalive_connections
     )
     default_timeout: Timeout = Timeout(
-      timeout=settings.req_timeout_default,
-      connect=settings.req_timeout_connect,
-      read=settings.req_timeout_read
+      timeout=settings.req_timeout_default, connect=settings.req_timeout_connect, read=settings.req_timeout_read
     )
     transport: AsyncHTTPTransport = AsyncHTTPTransport(
-      retries=settings.req_connection_retries,
-      verify=settings.req_ssl_verify
+      retries=settings.req_connection_retries, verify=settings.req_ssl_verify
     )
     client: AsyncClient = AsyncClient(
       headers=cls.headers,
       limits=limits,
-      transport=transport,
-      timeout=timeout or default_timeout
+      transport=ObservedAsyncTransport(transport, integration=name, metrics=cls.__metrics),
+      timeout=timeout or default_timeout,
     )
-    client.event_hooks['response'] = [cls.__metrics.async_metric_hook]
     cls.__clients[name] = client
     return client
 

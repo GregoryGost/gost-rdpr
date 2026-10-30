@@ -20,9 +20,9 @@ from pathlib import Path
 from re import findall
 from sqlite3 import SQLITE_BUSY, SQLITE_LOCKED
 from sqlite3 import Error as SQLiteError
-from time import monotonic
+from time import monotonic, perf_counter
 from types import ModuleType
-from typing import Any, Dict, List, Optional, Self, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Self, Sequence, Tuple, cast
 
 from aiosqlite import __version__ as aiosqlite_version
 from sqlalchemy import Result, Row, delete, func, insert, select, text, update
@@ -35,6 +35,13 @@ from client.file_loader_client import FileLoaderClient
 from config.config import settings
 from jobs.job_registry import Jobs, job_registry
 from logger.logger import Logger, logger
+from metrics.metrics import (
+  log_persistence_summaries,
+  observe_duration,
+  persistence_summaries,
+  queue_duration,
+  writer_duration,
+)
 from models.db.dns_servers_dbo import DnsServersDbo
 from models.db.domains_dbo import DomainsDbo
 from models.db.domains_lists_dbo import DomainsListsDbo
@@ -48,7 +55,7 @@ from models.dto.domains_lists_dto import DomainsListDto
 from models.dto.ip_record_dto import IpRecordDto
 from models.dto.ips_lists_dto import IpsListDto
 from models.dto.migrations_dto import MigrationsDto
-from models.dto.queue_dto import QueueElementDto, TargetAction
+from models.dto.queue_dto import QueueElementDto, TargetAction, notify_observation
 from models.dto.ros_config_dto import RosConfigDto
 from models.http.dns_servers_req import DnsPostElementReq
 from models.http.dns_servers_resp import DnsElementResp, DnsPayloadResp
@@ -154,10 +161,10 @@ class WriterState(StrEnum):
 
 
 class DataBase:
-  '''
-  Bulk ORM DELETE not supported right now  
+  """
+  Bulk ORM DELETE not supported right now
   https://docs.sqlalchemy.org/en/20/orm/queryguide/dml.html#orm-queryguide-update-delete-where
-  '''
+  """
 
   __state: bool = False
   __read_engine: AsyncEngine
@@ -171,6 +178,8 @@ class DataBase:
     self.__initialization_failed = False
     self.db_save_queue: Queue[QueueElementDto] = Queue(maxsize=settings.queue_max_size)
     self.__pending_batch: list[QueueElementDto] = []
+    self.__observations: dict[int, QueueElementDto] = {}
+    self.__failure_summaries: dict[str, dict] = {}
     self.__writer_state = WriterState.NEW
     self.__writer_task: Task[None] | None = None
     self.__batch_task: Task[None] | None = None
@@ -214,7 +223,7 @@ class DataBase:
   @property
   def __db_read_session(self: Self) -> async_sessionmaker[AsyncSession]:
     return self.__read_session_factory
-  
+
   @property
   def __db_write_session(self: Self) -> async_sessionmaker[AsyncSession]:
     return self.__write_session_factory
@@ -248,7 +257,7 @@ class DataBase:
 
   async def __session_tune(self: Self, session: AsyncSession):
     # Config PRAGMA
-    await session.execute(text(f'PRAGMA foreign_keys=ON')) # foreign keys support
+    await session.execute(text(f'PRAGMA foreign_keys=ON'))  # foreign keys support
     await session.execute(text(f'PRAGMA journal_mode={settings.db_tune_journal_mode}'))
     await session.execute(text(f'PRAGMA temp_store={settings.db_tune_temp_store}'))
     await session.execute(text(f'PRAGMA mmap_size={settings.db_tune_mmap_size}'))
@@ -477,7 +486,8 @@ class DataBase:
     return True
 
   async def __read_connect(self: Self) -> AsyncSession:
-    if self.__state == False: raise Exception('Database not ready to work')
+    if self.__state == False:
+      raise Exception('Database not ready to work')
     async with self.__db_read_session() as session:
       try:
         return await self.__session_tune(session)
@@ -582,27 +592,79 @@ class DataBase:
     if self.__writer_state not in (WriterState.NEW, WriterState.RUNNING):
       raise WriterClosedError('Database writer is closed', pending_count=self.pending_count)
 
+  def __notify_item(self, item: QueueElementDto, event: str, *, final: bool = False) -> None:
+    for observation in item.observations:
+      notify_observation(observation, event, perf_counter())
+    if final:
+      self.__observations.pop(id(item), None)
+      item.observations = ()
+
+  def __notify_batch(self, items: list[QueueElementDto], event: str, *, final: bool = False) -> None:
+    for item in items:
+      self.__notify_item(item, event, final=final)
+
+  def __admitted(self, item: QueueElementDto) -> None:
+    item.admitted_at = perf_counter()
+    if item.observations:
+      self.__observations[id(item)] = item
+    self.__notify_item(item, 'admitted')
+
   async def __put_write(self, item: QueueElementDto) -> None:
-    self.__check_admission()
+    started = perf_counter()
+    outcome = 'rejected'
+    self.__notify_item(item, 'admission_started')
     try:
-      await self.db_save_queue.put(item)
-    except QueueShutDown:
       self.__check_admission()
-      raise WriterClosedError('Database writer queue is closed') from None
+      try:
+        await self.db_save_queue.put(item)
+      except QueueShutDown:
+        self.__check_admission()
+        raise WriterClosedError('Database writer queue is closed') from None
+      self.__admitted(item)
+      outcome = 'admitted'
+    except CancelledError:
+      outcome = 'cancelled'
+      raise
+    finally:
+      if outcome != 'admitted':
+        self.__notify_item(item, 'not_admitted', final=True)
+      observe_duration(queue_duration, started, queue='writer', phase='admission', outcome=outcome)
 
   def __put_write_nowait(self, item: QueueElementDto) -> None:
-    self.__check_admission()
+    started = perf_counter()
+    outcome = 'rejected'
+    self.__notify_item(item, 'admission_started')
     try:
-      self.db_save_queue.put_nowait(item)
-    except QueueShutDown:
       self.__check_admission()
-      raise WriterClosedError('Database writer queue is closed') from None
+      try:
+        self.db_save_queue.put_nowait(item)
+      except QueueShutDown:
+        self.__check_admission()
+        raise WriterClosedError('Database writer queue is closed') from None
+      self.__admitted(item)
+      outcome = 'admitted'
+    finally:
+      if outcome != 'admitted':
+        self.__notify_item(item, 'not_admitted', final=True)
+      observe_duration(queue_duration, started, queue='writer', phase='admission', outcome=outcome)
 
   def __fail_writer(self, failure: WriterFailedError) -> None:
     self.__writer_state = WriterState.FAILED
     if self.__writer_failure is None:
       self.__writer_failure = failure
     self.db_save_queue.shutdown(immediate=False)
+    active = (
+      {id(item) for item in self.__pending_batch}
+      if self.__batch_task is not None and not self.__batch_task.done()
+      else set()
+    )
+    observations = tuple(observation for item in self.__observations.values() for observation in item.observations)
+    for key, item in tuple(self.__observations.items()):
+      if key in active:
+        self.__notify_item(item, 'unknown')
+      else:
+        self.__notify_item(item, 'known_not_committed', final=True)
+    self.__failure_summaries.update(persistence_summaries(observations))
     logger.error(f'Database writer failed; pending={self.pending_count}, unknown={self.unknown_count}')
 
   async def __dispose_engines(self) -> None:
@@ -773,14 +835,14 @@ class DataBase:
   # DNS servers
 
   async def get_all_dns_servers(
-      self: Self,
-      before_time: float,
-      limit: int,
-      offset: int,
-      start_date: Optional[str] = None,
-      end_date: Optional[str] = None,
-      default: Optional[bool] = None,
-      search_text: Optional[str] = None
+    self: Self,
+    before_time: float,
+    limit: int,
+    offset: int,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    default: Optional[bool] = None,
+    search_text: Optional[str] = None,
   ) -> DnsPayloadResp:
     logger.debug(f'Try get all DNS servers ...')
     logger.debug(f'{limit=}, {offset=}, {start_date=}, {end_date=}, {default=}, {search_text=}')
@@ -790,46 +852,39 @@ class DataBase:
       #
       total: int = await DnsServersDbo.get_total(db_session=db_session)
       if total > 0:
-        dns_servers: Sequence[Row[Tuple[int, str | None, str | None, str | None, datetime, datetime | None]]] = \
-          await DnsServersDbo.get_all(
-            db_session=db_session,
-            limit=limit,
-            offset=offset,
-            start_date=start_date,
-            end_date=end_date,
-            default=default,
-            search_text=search_text
-          )
+        dns_servers: Sequence[
+          Row[Tuple[int, str | None, str | None, str | None, datetime, datetime | None]]
+        ] = await DnsServersDbo.get_all(
+          db_session=db_session,
+          limit=limit,
+          offset=offset,
+          start_date=start_date,
+          end_date=end_date,
+          default=default,
+          search_text=search_text,
+        )
         #
         for server in dns_servers:
-          payload.append(DnsElementResp(
-            id=server[0],
-            server=server[1],
-            doh_server=server[2],
-            description=server[3],
-            created_at=server[4].timestamp(),
-            created_at_hum=server[4].strftime('%Y-%m-%d %H:%M:%S'),
-            updated_at=None if server[5] == None else server[5].timestamp(),
-            updated_at_hum=None if server[5] == None else server[5].strftime('%Y-%m-%d %H:%M:%S')
-          ))
+          payload.append(
+            DnsElementResp(
+              id=server[0],
+              server=server[1],
+              doh_server=server[2],
+              description=server[3],
+              created_at=server[4].timestamp(),
+              created_at_hum=server[4].strftime('%Y-%m-%d %H:%M:%S'),
+              updated_at=None if server[5] == None else server[5].timestamp(),
+              updated_at_hum=None if server[5] == None else server[5].strftime('%Y-%m-%d %H:%M:%S'),
+            )
+          )
       return DnsPayloadResp(
-        limit=limit,
-        offset=offset,
-        total=total,
-        count=len(payload),
-        duration=monotonic() - before_time,
-        payload=payload
+        limit=limit, offset=offset, total=total, count=len(payload), duration=monotonic() - before_time, payload=payload
       )
     except Exception as err:
       logger.error(f'Try get all DNS servers failed : {err}', exc_info=True)
       await db_session.rollback()
       return DnsPayloadResp(
-        limit=limit,
-        offset=offset,
-        total=0,
-        count=0,
-        duration=monotonic() - before_time,
-        payload=payload
+        limit=limit, offset=offset, total=0, count=0, duration=monotonic() - before_time, payload=payload
       )
     finally:
       await db_session.close()
@@ -838,8 +893,9 @@ class DataBase:
     logger.debug(f'Try get DNS server on ID={id} ...')
     try:
       db_session: AsyncSession = await self.__read_connect()
-      dns_server: Row[Tuple[int, str | None, str | None, str | None, datetime, datetime | None]] | None = \
-        await DnsServersDbo.get_on_id(db_session=db_session, id=id)
+      dns_server: (
+        Row[Tuple[int, str | None, str | None, str | None, datetime, datetime | None]] | None
+      ) = await DnsServersDbo.get_on_id(db_session=db_session, id=id)
       if dns_server != None:
         return DnsElementResp(
           id=dns_server[0],
@@ -849,7 +905,7 @@ class DataBase:
           created_at=dns_server[4].timestamp(),
           created_at_hum=dns_server[4].strftime('%Y-%m-%d %H:%M:%S'),
           updated_at=None if dns_server[5] == None else dns_server[5].timestamp(),
-          updated_at_hum=None if dns_server[5] == None else dns_server[5].strftime('%Y-%m-%d %H:%M:%S')
+          updated_at_hum=None if dns_server[5] == None else dns_server[5].strftime('%Y-%m-%d %H:%M:%S'),
         )
       return None
     except Exception as err:
@@ -893,9 +949,19 @@ class DataBase:
     try:
       db_session: AsyncSession = await self.__read_connect()
       # get dns servers for resolve
-      dns_servers_for_resolve: Sequence[Row[Tuple[str | None, str | None, DnsServerType]]] = await DnsServersDbo.get_all_for_resolve(db_session=db_session)
-      dns_servers_default: List[DnsServerDto] = [DnsServerDto(server=dns_server[0]) for dns_server in dns_servers_for_resolve if dns_server[2] == DnsServerType.DEFAULT]
-      dns_servers_doh: List[DnsServerDto] = [DnsServerDto(server=dns_server[1]) for dns_server in dns_servers_for_resolve if dns_server[2] == DnsServerType.DOH]
+      dns_servers_for_resolve: Sequence[
+        Row[str | None, str | None, DnsServerType, int]
+      ] = await DnsServersDbo.get_all_for_resolve(db_session=db_session)
+      dns_servers_default: List[DnsServerDto] = [
+        DnsServerDto(server=cast(str, dns_server[0]), id=dns_server[3])
+        for dns_server in dns_servers_for_resolve
+        if dns_server[2] == DnsServerType.DEFAULT
+      ]
+      dns_servers_doh: List[DnsServerDto] = [
+        DnsServerDto(server=cast(str, dns_server[1]), id=dns_server[3])
+        for dns_server in dns_servers_for_resolve
+        if dns_server[2] == DnsServerType.DOH
+      ]
       logger.debug(f'DNS servers for resolve: {dns_servers_default=}, {dns_servers_doh=}')
       dns_servers = (dns_servers_default, dns_servers_doh)
       return dns_servers
@@ -909,14 +975,14 @@ class DataBase:
   # Domains Lists
 
   async def get_all_domains_lists(
-      self: Self,
-      before_time: float,
-      limit: int,
-      offset: int,
-      start_date: Optional[str] = None,
-      end_date: Optional[str] = None,
-      search_text: Optional[str] = None,
-      attempts: Optional[int] = None
+    self: Self,
+    before_time: float,
+    limit: int,
+    offset: int,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    search_text: Optional[str] = None,
+    attempts: Optional[int] = None,
   ) -> DomainsListsPayloadResp:
     logger.debug(f'Try get all Domains lists ...')
     logger.debug(f'{limit=}, {offset=}, {start_date=}, {end_date=}, {search_text=}')
@@ -925,53 +991,45 @@ class DataBase:
       db_session: AsyncSession = await self.__read_connect()
       total: int = await DomainsListsDbo.get_total(db_session=db_session)
       if total > 0:
-        domains_lists: Sequence[Row[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]]] = \
-          await DomainsListsDbo.get_all(
-            db_session=db_session,
-            limit=limit,
-            offset=offset,
-            start_date=start_date,
-            end_date=end_date,
-            search_text=search_text,
-            attempts=attempts
-          )
+        domains_lists: Sequence[
+          Row[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]]
+        ] = await DomainsListsDbo.get_all(
+          db_session=db_session,
+          limit=limit,
+          offset=offset,
+          start_date=start_date,
+          end_date=end_date,
+          search_text=search_text,
+          attempts=attempts,
+        )
         #
         for list in domains_lists:
           elements_count: int = await DomainsDbo.get_total_on_domains_list(
-            db_session=db_session,
-            domains_list_id=list[0]
+            db_session=db_session, domains_list_id=list[0]
           )
-          payload.append(DomainsListElementResp(
-            id=list[0],
-            name=list[1],
-            url=list[2],
-            description=list[3],
-            hash=list[4],
-            attempts=list[5],
-            elements_count=elements_count,
-            created_at=list[6].timestamp(),
-            created_at_hum=list[6].strftime('%Y-%m-%d %H:%M:%S'),
-            updated_at=None if list[7] == None else list[7].timestamp(),
-            updated_at_hum=None if list[7] == None else list[7].strftime('%Y-%m-%d %H:%M:%S')
-          ))
+          payload.append(
+            DomainsListElementResp(
+              id=list[0],
+              name=list[1],
+              url=list[2],
+              description=list[3],
+              hash=list[4],
+              attempts=list[5],
+              elements_count=elements_count,
+              created_at=list[6].timestamp(),
+              created_at_hum=list[6].strftime('%Y-%m-%d %H:%M:%S'),
+              updated_at=None if list[7] == None else list[7].timestamp(),
+              updated_at_hum=None if list[7] == None else list[7].strftime('%Y-%m-%d %H:%M:%S'),
+            )
+          )
       return DomainsListsPayloadResp(
-        limit=limit,
-        offset=offset,
-        total=total,
-        count=len(payload),
-        duration=monotonic() - before_time,
-        payload=payload
+        limit=limit, offset=offset, total=total, count=len(payload), duration=monotonic() - before_time, payload=payload
       )
     except Exception as err:
       logger.error(f'Try get all Domains lists failed : {err}', exc_info=True)
       await db_session.rollback()
       return DomainsListsPayloadResp(
-        limit=limit,
-        offset=offset,
-        total=0,
-        count=0,
-        duration=monotonic() - before_time,
-        payload=payload
+        limit=limit, offset=offset, total=0, count=0, duration=monotonic() - before_time, payload=payload
       )
     finally:
       await db_session.close()
@@ -980,13 +1038,11 @@ class DataBase:
     logger.debug(f'Try get Domains list on ID={id} ...')
     try:
       db_session: AsyncSession = await self.__read_connect()
-      domains_list: Row[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]] | None = \
-        await DomainsListsDbo.get_on_id(db_session=db_session, id=id)
+      domains_list: (
+        Row[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]] | None
+      ) = await DomainsListsDbo.get_on_id(db_session=db_session, id=id)
       if domains_list != None:
-        elements_count: int = await DomainsDbo.get_total_on_domains_list(
-          db_session=db_session,
-          domains_list_id=id
-        )
+        elements_count: int = await DomainsDbo.get_total_on_domains_list(db_session=db_session, domains_list_id=id)
         return DomainsListElementResp(
           id=domains_list[0],
           name=domains_list[1],
@@ -998,7 +1054,7 @@ class DataBase:
           created_at=domains_list[6].timestamp(),
           created_at_hum=domains_list[6].strftime('%Y-%m-%d %H:%M:%S'),
           updated_at=None if domains_list[7] == None else domains_list[7].timestamp(),
-          updated_at_hum=None if domains_list[7] == None else domains_list[7].strftime('%Y-%m-%d %H:%M:%S')
+          updated_at_hum=None if domains_list[7] == None else domains_list[7].strftime('%Y-%m-%d %H:%M:%S'),
         )
       return None
     except Exception as err:
@@ -1066,7 +1122,7 @@ class DataBase:
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     default: Optional[bool] = None,
-    search_text: Optional[str] = None
+    search_text: Optional[str] = None,
   ) -> DomainsPayloadResp:
     logger.debug(f'Try get all Domains ...')
     logger.debug(f'{limit=}, {offset=}, {start_date=}, {end_date=}, {search_text=}')
@@ -1076,8 +1132,9 @@ class DataBase:
       total: int = await DomainsDbo.get_total(db_session=db_session)
       resolved_count: int = await DomainsDbo.get_total_resolved(db_session=db_session)
       if total > 0:
-        domains_and_query: Tuple[Sequence[Row[Tuple[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None]]], int] = \
-        await DomainsDbo.get_all(
+        domains_and_query: Tuple[
+          Sequence[Row[Tuple[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None]]], int
+        ] = await DomainsDbo.get_all(
           db_session=db_session,
           limit=limit,
           offset=offset,
@@ -1085,28 +1142,32 @@ class DataBase:
           start_date=start_date,
           end_date=end_date,
           default=default,
-          search_text=search_text
+          search_text=search_text,
         )
         #
-        domains: Sequence[Row[Tuple[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None]]] = domains_and_query[0]
+        domains: Sequence[
+          Row[Tuple[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None]]
+        ] = domains_and_query[0]
         query_total: int = domains_and_query[1]
         for domain in domains:
           ip_addr_v4, ip_addr_v6 = await IpRecordsDbo.get_ips_on_domain_id(db_session=db_session, domain_id=domain[0])
-          payload.append(DomainElementResp(
-            id=domain[0],
-            domains_list_id=domain[1],
-            resolved=domain[2],
-            name=domain[3],
-            ros_comment=domain[4],
-            ips_v4=ip_addr_v4 if len(ip_addr_v4) > 0 else None,
-            ips_v6=ip_addr_v6 if len(ip_addr_v6) > 0 else None,
-            created_at=domain[5].timestamp(),
-            created_at_hum=domain[5].strftime('%Y-%m-%d %H:%M:%S'),
-            updated_at=None if domain[6] == None else domain[6].timestamp(),
-            updated_at_hum=None if domain[6] == None else domain[6].strftime('%Y-%m-%d %H:%M:%S'),
-            last_resolved_at=None if domain[7] == None else domain[7].timestamp(),
-            last_resolved_at_hum=None if domain[7] == None else domain[7].strftime('%Y-%m-%d %H:%M:%S')
-          ))
+          payload.append(
+            DomainElementResp(
+              id=domain[0],
+              domains_list_id=domain[1],
+              resolved=domain[2],
+              name=domain[3],
+              ros_comment=domain[4],
+              ips_v4=ip_addr_v4 if len(ip_addr_v4) > 0 else None,
+              ips_v6=ip_addr_v6 if len(ip_addr_v6) > 0 else None,
+              created_at=domain[5].timestamp(),
+              created_at_hum=domain[5].strftime('%Y-%m-%d %H:%M:%S'),
+              updated_at=None if domain[6] == None else domain[6].timestamp(),
+              updated_at_hum=None if domain[6] == None else domain[6].strftime('%Y-%m-%d %H:%M:%S'),
+              last_resolved_at=None if domain[7] == None else domain[7].timestamp(),
+              last_resolved_at_hum=None if domain[7] == None else domain[7].strftime('%Y-%m-%d %H:%M:%S'),
+            )
+          )
       return DomainsPayloadResp(
         limit=limit,
         offset=offset,
@@ -1115,18 +1176,13 @@ class DataBase:
         total_query=query_total,
         count=len(payload),
         duration=monotonic() - before_time,
-        payload=payload
+        payload=payload,
       )
     except Exception as err:
       logger.error(f'Try get all Domains failed : {err}', exc_info=True)
       await db_session.rollback()
       return DomainsPayloadResp(
-        limit=limit,
-        offset=offset,
-        total=0,
-        count=0,
-        duration=monotonic() - before_time,
-        payload=payload
+        limit=limit, offset=offset, total=0, count=0, duration=monotonic() - before_time, payload=payload
       )
     finally:
       await db_session.close()
@@ -1135,8 +1191,9 @@ class DataBase:
     logger.debug(f'Try get Domain on ID={id} ...')
     try:
       db_session: AsyncSession = await self.__read_connect()
-      domain: Row[Tuple[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None]] | None = \
-        await DomainsDbo.get_on_id(db_session=db_session, id=id)
+      domain: (
+        Row[Tuple[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None]] | None
+      ) = await DomainsDbo.get_on_id(db_session=db_session, id=id)
       if domain != None:
         ip_addr_v4, ip_addr_v6 = await IpRecordsDbo.get_ips_on_domain_id(db_session=db_session, domain_id=domain[0])
         return DomainElementResp(
@@ -1152,7 +1209,7 @@ class DataBase:
           updated_at=None if domain[6] == None else domain[6].timestamp(),
           updated_at_hum=None if domain[6] == None else domain[6].strftime('%Y-%m-%d %H:%M:%S'),
           last_resolved_at=None if domain[7] == None else domain[7].timestamp(),
-          last_resolved_at_hum=None if domain[7] == None else domain[7].strftime('%Y-%m-%d %H:%M:%S')
+          last_resolved_at_hum=None if domain[7] == None else domain[7].strftime('%Y-%m-%d %H:%M:%S'),
         )
       return None
     except Exception as err:
@@ -1205,8 +1262,9 @@ class DataBase:
     try:
       db_session: AsyncSession = await self.__read_connect()
       # get domains for resolve
-      domains_for_resolve: Sequence[Row[Tuple[int, str, int | None, int]]] = \
-        await DomainsDbo.get_new_for_resolve(db_session=db_session, limit=settings.domains_resolve_new_batch_size)
+      domains_for_resolve: Sequence[Row[Tuple[int, str, int | None, int]]] = await DomainsDbo.get_new_for_resolve(
+        db_session=db_session, limit=settings.domains_resolve_new_batch_size
+      )
       domains = [DomainResult(id=domain[0], name=domain[1], list_id=domain[2]) for domain in domains_for_resolve]
       logger.debug(f'New domains for resolve: {len(domains)}')
       return domains
@@ -1223,8 +1281,9 @@ class DataBase:
     try:
       db_session: AsyncSession = await self.__read_connect()
       # get domains for resolve
-      domains_for_resolve: Sequence[Row[Tuple[int, str, int | None, int]]] = \
-        await DomainsDbo.get_stale_for_resolve(db_session=db_session, limit=settings.domains_resolve_stale_batch_size)
+      domains_for_resolve: Sequence[Row[Tuple[int, str, int | None, int]]] = await DomainsDbo.get_stale_for_resolve(
+        db_session=db_session, limit=settings.domains_resolve_stale_batch_size
+      )
       domains = [DomainResult(id=domain[0], name=domain[1], list_id=domain[2]) for domain in domains_for_resolve]
       logger.debug(f'Stale domains for resolve: {len(domains)}')
       return domains
@@ -1242,8 +1301,7 @@ class DataBase:
       db_session: AsyncSession = await self.__read_connect()
       # get domains
       domains_on_list: Sequence[Row[Tuple[int, str]]] = await DomainsDbo.get_all_on_domains_list(
-        db_session=db_session,
-        domains_list_id=domains_list_id
+        db_session=db_session, domains_list_id=domains_list_id
       )
       domains = [DomainResult(id=domain[0], name=domain[1], list_id=domains_list_id) for domain in domains_on_list]
       logger.debug(f'Domains on domains list {domains_list_id=}: {domains=}')
@@ -1259,7 +1317,9 @@ class DataBase:
     logger.debug(f'Try send insert ips, delete ips, update domains to Queue ...')
     try:
       domains_resolved_element: QueueElementDto = QueueElementDto(
-        target=TargetAction.DOMAINS_RESOLVED, elements=[domain]
+        target=TargetAction.DOMAINS_RESOLVED,
+        elements=[domain],
+        observations=(domain.observation,) if domain.observation is not None else (),
       )
       await self.__put_write(item=domains_resolved_element)
     except DatabaseWriteError:
@@ -1279,7 +1339,7 @@ class DataBase:
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     search_text: Optional[str] = None,
-    attempts: Optional[int] = None
+    attempts: Optional[int] = None,
   ) -> IpsListsPayloadResp:
     logger.debug(f'Try get all IP address lists ...')
     logger.debug(f'{limit=}, {offset=}, {start_date=}, {end_date=}, {search_text=}')
@@ -1288,50 +1348,45 @@ class DataBase:
       db_session: AsyncSession = await self.__read_connect()
       total: int = await IpsListsDbo.get_total(db_session=db_session)
       if total > 0:
-        ips_lists: Sequence[Row[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]]] = \
-          await IpsListsDbo.get_all(
-            db_session=db_session,
-            limit=limit,
-            offset=offset,
-            start_date=start_date,
-            end_date=end_date,
-            search_text=search_text,
-            attempts=attempts
-          )
+        ips_lists: Sequence[
+          Row[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]]
+        ] = await IpsListsDbo.get_all(
+          db_session=db_session,
+          limit=limit,
+          offset=offset,
+          start_date=start_date,
+          end_date=end_date,
+          search_text=search_text,
+          attempts=attempts,
+        )
         for list in ips_lists:
-          ip_v4_count, ip_v6_count = await IpRecordsDbo.get_total_ips_on_ips_list(db_session=db_session, ip_list_id=list[0])
-          payload.append(IpsListElementResp(
-            id=list[0],
-            name=list[1],
-            url=list[2],
-            description=list[3],
-            hash=list[4],
-            attempts=list[5],
-            ip_v4_count=ip_v4_count,
-            ip_v6_count=ip_v6_count,
-            created_at=list[6].timestamp(),
-            created_at_hum=list[6].strftime('%Y-%m-%d %H:%M:%S'),
-            updated_at=None if list[7] == None else list[7].timestamp(),
-            updated_at_hum=None if list[7] == None else list[7].strftime('%Y-%m-%d %H:%M:%S')
-          ))
+          ip_v4_count, ip_v6_count = await IpRecordsDbo.get_total_ips_on_ips_list(
+            db_session=db_session, ip_list_id=list[0]
+          )
+          payload.append(
+            IpsListElementResp(
+              id=list[0],
+              name=list[1],
+              url=list[2],
+              description=list[3],
+              hash=list[4],
+              attempts=list[5],
+              ip_v4_count=ip_v4_count,
+              ip_v6_count=ip_v6_count,
+              created_at=list[6].timestamp(),
+              created_at_hum=list[6].strftime('%Y-%m-%d %H:%M:%S'),
+              updated_at=None if list[7] == None else list[7].timestamp(),
+              updated_at_hum=None if list[7] == None else list[7].strftime('%Y-%m-%d %H:%M:%S'),
+            )
+          )
       return IpsListsPayloadResp(
-        limit=limit,
-        offset=offset,
-        total=total,
-        count=len(payload),
-        duration=monotonic() - before_time,
-        payload=payload
+        limit=limit, offset=offset, total=total, count=len(payload), duration=monotonic() - before_time, payload=payload
       )
     except Exception as err:
       logger.error(f'Try get all IP address lists failed : {err}', exc_info=True)
       await db_session.rollback()
       return IpsListsPayloadResp(
-        limit=limit,
-        offset=offset,
-        total=0,
-        count=0,
-        duration=monotonic() - before_time,
-        payload=payload
+        limit=limit, offset=offset, total=0, count=0, duration=monotonic() - before_time, payload=payload
       )
     finally:
       await db_session.close()
@@ -1340,10 +1395,13 @@ class DataBase:
     logger.debug(f'Try get Ips list on ID={id} ...')
     try:
       db_session: AsyncSession = await self.__read_connect()
-      ips_list: Row[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]] | None = \
-        await IpsListsDbo.get_on_id(db_session=db_session, id=id)
+      ips_list: (
+        Row[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]] | None
+      ) = await IpsListsDbo.get_on_id(db_session=db_session, id=id)
       if ips_list != None:
-        ip_v4_count, ip_v6_count = await IpRecordsDbo.get_total_ips_on_ips_list(db_session=db_session, ip_list_id=ips_list[0])
+        ip_v4_count, ip_v6_count = await IpRecordsDbo.get_total_ips_on_ips_list(
+          db_session=db_session, ip_list_id=ips_list[0]
+        )
         return IpsListElementResp(
           id=ips_list[0],
           name=ips_list[1],
@@ -1356,7 +1414,7 @@ class DataBase:
           created_at=ips_list[6].timestamp(),
           created_at_hum=ips_list[6].strftime('%Y-%m-%d %H:%M:%S'),
           updated_at=None if ips_list[7] == None else ips_list[7].timestamp(),
-          updated_at_hum=None if ips_list[7] == None else ips_list[7].strftime('%Y-%m-%d %H:%M:%S')
+          updated_at_hum=None if ips_list[7] == None else ips_list[7].strftime('%Y-%m-%d %H:%M:%S'),
         )
       return None
     except Exception as err:
@@ -1418,7 +1476,7 @@ class DataBase:
     end_date: Optional[str] = None,
     search_text: Optional[str] = None,
     addr_type: Optional[int] = None,
-    use_default_gw: Optional[bool] = None
+    use_default_gw: Optional[bool] = None,
   ) -> IpsPayloadResp:
     logger.debug(f'Try get all IP address records ...')
     logger.debug(f'{limit=}, {offset=}, {start_date=}, {end_date=}, {search_text=}')
@@ -1427,8 +1485,9 @@ class DataBase:
       db_session: AsyncSession = await self.__read_connect()
       total: int = await IpRecordsDbo.get_total(db_session=db_session)
       if total > 0:
-        ips: Sequence[Row[Tuple[int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None]]] = \
-        await IpRecordsDbo.get_all(
+        ips: Sequence[
+          Row[Tuple[int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None]]
+        ] = await IpRecordsDbo.get_all(
           db_session=db_session,
           limit=limit,
           offset=offset,
@@ -1436,43 +1495,35 @@ class DataBase:
           end_date=end_date,
           search_text=search_text,
           addr_type=addr_type,
-          use_default_gw=use_default_gw
+          use_default_gw=use_default_gw,
         )
         #
         for ip in ips:
-          payload.append(IpsElementResp(
-            id=ip[0],
-            type=ip[5],
-            addr=ip[6],
-            ip_list_id=ip[1],
-            ip_list_name=ip[2],
-            domain_id=ip[3],
-            domain_name=ip[4],
-            ros_comment=ip[7],
-            use_default_gw=ip[8],
-            created_at=ip[9].timestamp(),
-            created_at_hum=ip[9].strftime('%Y-%m-%d %H:%M:%S'),
-            updated_at=None if ip[10] == None else ip[10].timestamp(),
-            updated_at_hum=None if ip[10] == None else ip[10].strftime('%Y-%m-%d %H:%M:%S')
-          ))
+          payload.append(
+            IpsElementResp(
+              id=ip[0],
+              type=ip[5],
+              addr=ip[6],
+              ip_list_id=ip[1],
+              ip_list_name=ip[2],
+              domain_id=ip[3],
+              domain_name=ip[4],
+              ros_comment=ip[7],
+              use_default_gw=ip[8],
+              created_at=ip[9].timestamp(),
+              created_at_hum=ip[9].strftime('%Y-%m-%d %H:%M:%S'),
+              updated_at=None if ip[10] == None else ip[10].timestamp(),
+              updated_at_hum=None if ip[10] == None else ip[10].strftime('%Y-%m-%d %H:%M:%S'),
+            )
+          )
       return IpsPayloadResp(
-        limit=limit,
-        offset=offset,
-        total=total,
-        count=len(payload),
-        duration=monotonic() - before_time,
-        payload=payload
+        limit=limit, offset=offset, total=total, count=len(payload), duration=monotonic() - before_time, payload=payload
       )
     except Exception as err:
       logger.error(f'Try get all Domains failed : {err}', exc_info=True)
       await db_session.rollback()
       return IpsPayloadResp(
-        limit=limit,
-        offset=offset,
-        total=0,
-        count=0,
-        duration=monotonic() - before_time,
-        payload=payload
+        limit=limit, offset=offset, total=0, count=0, duration=monotonic() - before_time, payload=payload
       )
     finally:
       await db_session.close()
@@ -1481,8 +1532,9 @@ class DataBase:
     logger.debug(f'Try get IP address record on ID={id} ...')
     try:
       db_session: AsyncSession = await self.__read_connect()
-      ip_address_record: Row[Tuple[int, int | None, str, int | None, str, str, int, str | None, bool, datetime, datetime | None]] | None = \
-        await IpRecordsDbo.get_on_id(db_session=db_session, id=id)
+      ip_address_record: (
+        Row[Tuple[int, int | None, str, int | None, str, str, int, str | None, bool, datetime, datetime | None]] | None
+      ) = await IpRecordsDbo.get_on_id(db_session=db_session, id=id)
       if ip_address_record != None:
         return IpsElementResp(
           id=ip_address_record[0],
@@ -1497,7 +1549,7 @@ class DataBase:
           created_at=ip_address_record[9].timestamp(),
           created_at_hum=ip_address_record[9].strftime('%Y-%m-%d %H:%M:%S'),
           updated_at=None if ip_address_record[10] == None else ip_address_record[10].timestamp(),
-          updated_at_hum=None if ip_address_record[10] == None else ip_address_record[10].strftime('%Y-%m-%d %H:%M:%S')
+          updated_at_hum=None if ip_address_record[10] == None else ip_address_record[10].strftime('%Y-%m-%d %H:%M:%S'),
         )
       return None
     except Exception as err:
@@ -1512,25 +1564,12 @@ class DataBase:
     db_session: AsyncSession | None = None
     try:
       db_session = await self.__read_connect()
-      ip_records: Sequence[Row[Tuple[int, str]]] = \
-        await IpRecordsDbo.get_all_ids_and_addresses(db_session=db_session)
-      result = await to_thread(
-        lambda: [
-          record[0]
-          for record in ip_records
-          if not check_ip_allow(record[1])
-        ]
-      )
-      logger.debug(
-        f'IP address records blocked by IP_NOT_ALLOWED: {len(result)}'
-      )
+      ip_records: Sequence[Row[Tuple[int, str]]] = await IpRecordsDbo.get_all_ids_and_addresses(db_session=db_session)
+      result = await to_thread(lambda: [record[0] for record in ip_records if not check_ip_allow(record[1])])
+      logger.debug(f'IP address records blocked by IP_NOT_ALLOWED: {len(result)}')
       return result
     except Exception as err:
-      logger.error(
-        'Try get IP address records blocked by IP_NOT_ALLOWED failed : '
-        f'{err}',
-        exc_info=True
-      )
+      logger.error(f'Try get IP address records blocked by IP_NOT_ALLOWED failed : {err}', exc_info=True)
       if db_session is not None:
         await db_session.rollback()
       raise err
@@ -1598,16 +1637,9 @@ class DataBase:
       ids: List[int] = await self.get_not_allowed_ip_record_ids()
       is_queued: bool = await self.put_delete_ip_records_to_queue(ids)
       if is_queued:
-        logger.info(
-          'IP address records blocked by IP_NOT_ALLOWED queued for '
-          f'deletion: {len(ids)}'
-        )
+        logger.info(f'IP address records blocked by IP_NOT_ALLOWED queued for deletion: {len(ids)}')
     except Exception as err:
-      logger.error(
-        'Cleanup of IP address records blocked by IP_NOT_ALLOWED failed : '
-        f'{err}',
-        exc_info=True
-      )
+      logger.error(f'Cleanup of IP address records blocked by IP_NOT_ALLOWED failed : {err}', exc_info=True)
 
   async def get_all_ips_for_domain(self: Self, domain_id: int) -> List[IpRecordDto]:
     logger.debug(f'Try get all IP address records for Domain {domain_id=} ...')
@@ -1616,7 +1648,9 @@ class DataBase:
     read_error: Exception | None = None
     try:
       db_session = await self.__read_connect()
-      ips_result: Sequence[Row[Tuple[int, str, int]]] = await IpRecordsDbo.get_ips_on_domain_id_extend(db_session=db_session, domain_id=domain_id)
+      ips_result: Sequence[Row[Tuple[int, str, int]]] = await IpRecordsDbo.get_ips_on_domain_id_extend(
+        db_session=db_session, domain_id=domain_id
+      )
       result = [IpRecordDto(id=ip[0], ip_address=ip[1], addr_type=ip[2]) for ip in ips_result]
     except Exception as err:
       read_error = err
@@ -1643,8 +1677,7 @@ class DataBase:
     try:
       db_session: AsyncSession = await self.__read_connect()
       ips_result: Sequence[Row[Tuple[int, str]]] = await IpRecordsDbo.get_all_on_ips_list(
-        db_session=db_session,
-        ip_list_id=ips_list_id
+        db_session=db_session, ip_list_id=ips_list_id
       )
       result = [IpRecordDto(id=ip[0], ip_address=ip[1]) for ip in ips_result]
       return result
@@ -1661,8 +1694,7 @@ class DataBase:
     try:
       db_session: AsyncSession = await self.__read_connect()
       all_ips: Sequence[Row[Tuple[str, str, bool, int]]] = await IpRecordsDbo.get_all_for_update(
-        db_session=db_session,
-        addr_type=addr_type
+        db_session=db_session, addr_type=addr_type
       )
       ips = [IpRecordDto(ip_address=ip[0], comment=ip[1], use_default_gw=ip[2], addr_type=ip[3]) for ip in all_ips]
       return ips
@@ -1683,7 +1715,7 @@ class DataBase:
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     default: Optional[bool] = None,
-    search_text: Optional[str] = None
+    search_text: Optional[str] = None,
   ) -> RosConfigPayloadResp:
     logger.debug(f'Try get all RoS configs ...')
     logger.debug(f'{limit=}, {offset=}, {start_date=}, {end_date=}, {default=}, {search_text=}')
@@ -1693,48 +1725,41 @@ class DataBase:
       #
       total: int = await RosConfigsDbo.get_total(db_session=db_session)
       if total > 0:
-        ros_configs: Sequence[Row[Tuple[int, str, str, str, str, str | None, datetime, datetime | None]]] = \
-          await RosConfigsDbo.get_all(
-            db_session=db_session,
-            limit=limit,
-            offset=offset,
-            start_date=start_date,
-            end_date=end_date,
-            default=default,
-            search_text=search_text
-          )
+        ros_configs: Sequence[
+          Row[Tuple[int, str, str, str, str, str | None, datetime, datetime | None]]
+        ] = await RosConfigsDbo.get_all(
+          db_session=db_session,
+          limit=limit,
+          offset=offset,
+          start_date=start_date,
+          end_date=end_date,
+          default=default,
+          search_text=search_text,
+        )
         #
         for config in ros_configs:
-          payload.append(RosConfigElementResp(
-            id=config[0],
-            host=config[1],
-            user=config[2],
-            password=config[3],
-            bgp_list_name=config[4],
-            description=config[5],
-            created_at=config[6].timestamp(),
-            created_at_hum=config[6].strftime('%Y-%m-%d %H:%M:%S'),
-            updated_at=None if config[7] == None else config[7].timestamp(),
-            updated_at_hum=None if config[7] == None else config[7].strftime('%Y-%m-%d %H:%M:%S')
-          ))
+          payload.append(
+            RosConfigElementResp(
+              id=config[0],
+              host=config[1],
+              user=config[2],
+              password=config[3],
+              bgp_list_name=config[4],
+              description=config[5],
+              created_at=config[6].timestamp(),
+              created_at_hum=config[6].strftime('%Y-%m-%d %H:%M:%S'),
+              updated_at=None if config[7] == None else config[7].timestamp(),
+              updated_at_hum=None if config[7] == None else config[7].strftime('%Y-%m-%d %H:%M:%S'),
+            )
+          )
       return RosConfigPayloadResp(
-        limit=limit,
-        offset=offset,
-        total=total,
-        count=len(payload),
-        duration=monotonic() - before_time,
-        payload=payload
+        limit=limit, offset=offset, total=total, count=len(payload), duration=monotonic() - before_time, payload=payload
       )
     except Exception as err:
       logger.error(f'Try get all RoS configs failed : {err}', exc_info=True)
       await db_session.rollback()
       return RosConfigPayloadResp(
-        limit=limit,
-        offset=offset,
-        total=0,
-        count=0,
-        duration=monotonic() - before_time,
-        payload=payload
+        limit=limit, offset=offset, total=0, count=0, duration=monotonic() - before_time, payload=payload
       )
     finally:
       await db_session.close()
@@ -1743,8 +1768,9 @@ class DataBase:
     logger.debug(f'Try get RoS config on ID={id} ...')
     try:
       db_session: AsyncSession = await self.__read_connect()
-      ros_config: Row[Tuple[int, str, str, str, str, str | None, datetime, datetime | None]] | None = \
-        await RosConfigsDbo.get_on_id(db_session=db_session, id=id)
+      ros_config: (
+        Row[Tuple[int, str, str, str, str, str | None, datetime, datetime | None]] | None
+      ) = await RosConfigsDbo.get_on_id(db_session=db_session, id=id)
       if ros_config != None:
         return RosConfigElementResp(
           id=ros_config[0],
@@ -1756,7 +1782,7 @@ class DataBase:
           created_at=ros_config[6].timestamp(),
           created_at_hum=ros_config[6].strftime('%Y-%m-%d %H:%M:%S'),
           updated_at=None if ros_config[7] == None else ros_config[7].timestamp(),
-          updated_at_hum=None if ros_config[7] == None else ros_config[7].strftime('%Y-%m-%d %H:%M:%S')
+          updated_at_hum=None if ros_config[7] == None else ros_config[7].strftime('%Y-%m-%d %H:%M:%S'),
         )
       return None
     except Exception as err:
@@ -1799,7 +1825,9 @@ class DataBase:
     configs: List[RosConfigDto] = []
     try:
       db_session: AsyncSession = await self.__read_connect()
-      ros_configs: Sequence[Row[Tuple[int, str, str, str, str]]] = await RosConfigsDbo.get_all_for_update(db_session=db_session)
+      ros_configs: Sequence[Row[Tuple[int, str, str, str, str]]] = await RosConfigsDbo.get_all_for_update(
+        db_session=db_session
+      )
       configs: List[RosConfigDto] = [
         RosConfigDto(id=config[0], host=config[1], user=config[2], passwd=config[3], bgp_list_name=config[4])
         for config in ros_configs
@@ -1907,7 +1935,7 @@ class DataBase:
       dns=StatsDnsData(),
       domains=StatsDomainsData(),
       ips=StatsIpsData(),
-      ros=StatsRosData()
+      ros=StatsRosData(),
     )
     try:
       db_session: AsyncSession = await self.__read_connect()
@@ -1923,10 +1951,7 @@ class DataBase:
         resolved=domains_stats.resolved,
         unresolved=domains_stats.unresolved,
         lists_total=domains_stats.lists_total,
-        per_list=[
-          StatsDomainsListItem(**item)
-          for item in loads(domains_stats.per_list or '[]')
-        ]
+        per_list=[StatsDomainsListItem(**item) for item in loads(domains_stats.per_list or '[]')],
       )
       result.ips = StatsIpsData(
         total=ips_stats.total,
@@ -1935,10 +1960,7 @@ class DataBase:
         linked_to_domain=ips_stats.linked_to_domain,
         standalone=ips_stats.standalone,
         lists_total=ips_stats.lists_total,
-        per_list=[
-          StatsIpsListItem(**item)
-          for item in loads(ips_stats.per_list or '[]')
-        ]
+        per_list=[StatsIpsListItem(**item) for item in loads(ips_stats.per_list or '[]')],
       )
       result.ros = StatsRosData(total=ros_stats.total)
       #
@@ -1951,14 +1973,14 @@ class DataBase:
       await db_session.close()
 
   async def stats_growth(
-      self: Self,
-      before_time: float,
-      entity: GrowthEntity,
-      granularity: GrowthGranularity,
-      date_field: GrowthDateField,
-      start_date: str | None = None,
-      end_date: str | None = None,
-      ip_subtype: int | None = None
+    self: Self,
+    before_time: float,
+    entity: GrowthEntity,
+    granularity: GrowthGranularity,
+    date_field: GrowthDateField,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    ip_subtype: int | None = None,
   ) -> StatsGrowthResp:
     logger.debug(f'Try get aggregated metrics ...')
     result: StatsGrowthResp = StatsGrowthResp(
@@ -1978,7 +2000,7 @@ class DataBase:
           granularity=granularity,
           start_date=start_date,
           end_date=end_date,
-          date_field=date_field
+          date_field=date_field,
         )
         result.payload = [StatsGrowthPoint(date=row[0], count=row[1]) for row in domains_stats_growth]
         result.total_in_period = sum(row[1] for row in domains_stats_growth)
@@ -1990,7 +2012,7 @@ class DataBase:
           granularity=granularity,
           start_date=start_date,
           end_date=end_date,
-          date_field=date_field
+          date_field=date_field,
         )
         result.payload = [StatsGrowthPoint(date=row[0], count=row[1]) for row in all_lists_stats_growth]
         result.total_in_period = sum(row[1] for row in all_lists_stats_growth)
@@ -2001,7 +2023,7 @@ class DataBase:
           granularity=granularity,
           start_date=start_date,
           end_date=end_date,
-          date_field=date_field
+          date_field=date_field,
         )
         result.payload = [StatsGrowthPoint(date=row[0], count=row[1]) for row in ips_stats_growth]
         result.total_in_period = sum(row[1] for row in ips_stats_growth)
@@ -2017,6 +2039,7 @@ class DataBase:
   #
 
   def __acknowledge_batch(self) -> None:
+    self.__notify_batch(self.__pending_batch, 'confirmed', final=True)
     for _ in self.__pending_batch:
       self.db_save_queue.task_done()
     self.__pending_batch.clear()
@@ -2028,17 +2051,44 @@ class DataBase:
       self.__writer_failure.unknown_count = 0
 
   async def __commit_pending(self) -> None:
-    for attempt in range(3):
-      if self.__writer_state == WriterState.FAILED:
-        # No attempt is active; earlier retryable failures were rolled back and released.
-        raise BatchWriteError('Database batch stopped before the next write attempt')
-      try:
-        await self.__batch_items_commit(self.__pending_batch)
-        return
-      except BatchWriteError as err:
-        if not err.retryable or attempt == 2:
-          raise
-        await sleep(0.1 * (attempt + 1))
+    observations = tuple(observation for item in self.__pending_batch for observation in item.observations)
+    for item in self.__pending_batch:
+      if not item.dwell_observed and item.dequeued_at is not None:
+        observe_duration(writer_duration, item.dequeued_at, phase='batch_dwell', outcome='attempted')
+        item.dwell_observed = True
+    try:
+      for attempt in range(3):
+        if self.__writer_state == WriterState.FAILED:
+          # Earlier retryable failures have already been rolled back and released.
+          raise BatchWriteError('Database batch stopped before the next write attempt')
+        try:
+          await self.__batch_items_commit(self.__pending_batch)
+          return
+        except BatchWriteError as err:
+          if not err.retryable or attempt == 2:
+            raise
+          retry_started = perf_counter()
+          retry_outcome = 'complete'
+          try:
+            await sleep(0.1 * (attempt + 1))
+          except CancelledError:
+            retry_outcome = 'cancelled'
+            raise
+          finally:
+            observe_duration(writer_duration, retry_started, phase='retry_wait', outcome=retry_outcome)
+    except BatchWriteError as err:
+      event = 'confirmed' if err.committed else 'final_unknown' if err.outcome_unknown else 'known_not_committed'
+      self.__notify_batch(self.__pending_batch, event, final=True)
+      raise
+    except Exception, CancelledError:
+      self.__notify_batch(self.__pending_batch, 'final_unknown', final=True)
+      raise
+    finally:
+      summaries = persistence_summaries(observations)
+      for key, summary in summaries.items():
+        if key in self.__failure_summaries:
+          self.__failure_summaries[key] = summary
+      log_persistence_summaries(summaries)
 
   async def __flush_pending(self) -> None:
     if not self.__pending_batch:
@@ -2117,6 +2167,12 @@ class DataBase:
         except QueueShutDown:
           await self.__flush_pending()
           break
+        queue_element.dequeued_at = perf_counter()
+        if queue_element.admitted_at is not None:
+          observe_duration(
+            queue_duration, queue_element.admitted_at, queue='writer', phase='residence', outcome='dequeued'
+          )
+          queue_element.admitted_at = None
         self.__pending_batch.append(queue_element)
         if len(self.__pending_batch) == 1:
           deadline = monotonic() + settings.db_save_batch_timeout
@@ -2152,11 +2208,16 @@ class DataBase:
     finally:
       if self.__writer_state != WriterState.FAILED:
         self.__writer_state = WriterState.STOPPED
+      log_persistence_summaries(self.__failure_summaries)
+      self.__failure_summaries.clear()
       logger.info('Database writer stopped')
 
   async def __batch_items_commit(self: Self, queue_elements: List[QueueElementDto]) -> None:
     """Persist one atomic batch and translate all persistence failures."""
     logger.debug(f'Try prepare elements count={len(queue_elements)} ...')
+    attempt_started = perf_counter()
+    transaction_started: float | None = None
+    transaction_outcome = 'failure'
     db_session: AsyncSession | None = None
     commit_started = False
     committed = False
@@ -2359,6 +2420,7 @@ class DataBase:
       db_session = await self.__write_connect()
       await self.__session_tune(db_session)
       # Recording with immediate write lock
+      transaction_started = perf_counter()
       await db_session.execute(text('BEGIN IMMEDIATE'))
       # DNS SERVERS
       if len(dns_servers_add) > 0:
@@ -2417,11 +2479,28 @@ class DataBase:
       #
       # Any failure from commit itself has an ambiguous physical outcome.
       commit_started = True
-      await db_session.commit()
-      committed = True
+      commit_timer = perf_counter()
+      commit_outcome = 'unknown'
+      try:
+        await db_session.commit()
+        committed = True
+        commit_outcome = 'confirmed'
+      finally:
+        observe_duration(writer_duration, commit_timer, phase='commit', outcome=commit_outcome)
+      transaction_outcome = 'confirmed'
+      observe_duration(writer_duration, transaction_started, phase='transaction', outcome=transaction_outcome)
+      transaction_started = None
+      self.__notify_batch(queue_elements, 'confirmed', final=True)
     except (Exception, CancelledError) as err:
       failure = err
+      if transaction_started is not None:
+        transaction_outcome = (
+          'unknown' if commit_started else 'cancelled' if isinstance(err, CancelledError) else 'failure'
+        )
+        observe_duration(writer_duration, transaction_started, phase='transaction', outcome=transaction_outcome)
+        transaction_started = None
       if db_session is not None:
+        rollback_started = perf_counter()
         try:
           await db_session.rollback()
         except Exception, CancelledError:
@@ -2430,8 +2509,13 @@ class DataBase:
             'Database batch rollback failed',
             exc_info=DatabaseWriteError('Database batch rollback failed'),
           )
+        finally:
+          observe_duration(
+            writer_duration, rollback_started, phase='rollback', outcome='complete' if rollback_ok else 'failure'
+          )
     finally:
       if db_session is not None:
+        cleanup_started = perf_counter()
         try:
           await db_session.close()
         except (Exception, CancelledError) as err:
@@ -2443,6 +2527,24 @@ class DataBase:
             'Database batch session cleanup failed',
             exc_info=DatabaseWriteError('Database batch session cleanup failed'),
           )
+        finally:
+          observe_duration(
+            writer_duration, cleanup_started, phase='cleanup', outcome='complete' if release_ok else 'failure'
+          )
+      observe_duration(
+        writer_duration,
+        attempt_started,
+        phase='attempt',
+        outcome=(
+          'confirmed'
+          if committed
+          else 'unknown'
+          if commit_started
+          else 'failure'
+          if failure is not None
+          else 'complete'
+        ),
+      )
     if failure is not None:
       # SQLite extended result codes retain the primary code in the low byte.
       original = getattr(failure, 'orig', failure)

@@ -2,17 +2,25 @@
 
 import asyncio
 import importlib
+import importlib.metadata
+import json
+import math
+import os
 import shutil
 import sqlite3
+import sys
 from contextlib import closing
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace
 
 import dns.rdatatype
 import httpx
 import pytest
+from prometheus_client import REGISTRY
+from prometheus_client.parser import text_string_to_metric_families
 from sqlalchemy import insert, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -2077,3 +2085,609 @@ async def test_startup_error_after_physical_commit_keeps_writer_stopped_and_allo
     await recovered._DataBase__read_engine.dispose()
     await recovered._DataBase__write_engine.dispose()
   assert sqlite_snapshot(path) == committed
+
+
+def measured_domain(app, *, mode='stored', complete=True):
+  """Establish the source-domain result before the real database admission boundary."""
+  metrics = importlib.import_module('metrics.metrics')
+  run = metrics.ResolutionRun(mode)
+  run.select(1)
+  observation = run.observe()
+  observation.notify('processing_started', perf_counter())
+  observation.notify('success' if complete else 'partial', perf_counter())
+  command = app.dto.DomainResult(
+    id=1,
+    name='www.example.test',
+    resolution_complete=complete,
+    observation=observation,
+  )
+  return run, command
+
+
+def assert_receipt_conservation(run):
+  counts = run.snapshot()
+  assert (
+    counts['admitted'] == counts['pending'] + counts['confirmed'] + counts['known_not_committed'] + counts['unknown']
+  )
+  assert counts['selected'] == counts['not_started'] + counts['attempted']
+  assert counts['attempted'] == counts['active'] + sum(
+    counts[field] for field in ('success', 'partial', 'failure', 'cancelled_processing')
+  )
+  return counts
+
+
+@pytest.mark.parametrize(
+  ('stage', 'state'),
+  [
+    (None, 'confirmed'),
+    ('close', 'confirmed'),
+    ('begin', 'known_not_committed'),
+    ('commit', 'unknown'),
+    ('after_commit', 'unknown'),
+  ],
+)
+async def test_domain_receipt_is_commit_evidence_and_never_inserted_row_count(app, store, monkeypatch, stage, state):
+  await seed(app, store)
+  before = await snapshot(app, store)
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+  run, command = measured_domain(app, complete=False)
+
+  async def fault(current, evidence):
+    if current == stage:
+      raise RuntimeError('Synthetic driver failure')
+
+  evidence = instrument_sessions(store, monkeypatch, fault=fault)
+  await store.put_domain_after_resolve(command)
+  command.observation.notify('processing_finished', perf_counter())
+  run.finish(True)
+  assert assert_receipt_conservation(run)['pending'] == 1
+  assert run.snapshot()['saved_rate_valid'] is False
+  await store.start_writer()
+  if stage is None:
+    await asyncio.wait_for(store.db_save_queue.join(), timeout=2)
+  else:
+    await asyncio.wait_for(asyncio.shield(store.writer_task), timeout=2)
+  counts = assert_receipt_conservation(run)
+  assert counts[state] == 1
+  assert counts['pending'] == 0
+  assert counts['partial'] == 1
+  assert counts['success'] == counts['failure'] == 0
+  assert counts['saved_rate_valid'] is (state != 'unknown')
+  if state == 'unknown':
+    assert math.isnan(counts['saved_rate'])
+  elif state == 'known_not_committed':
+    assert counts['saved_rate'] == 0
+  else:
+    assert counts['saved_rate'] > 0
+  assert evidence.commits == int(stage != 'begin')
+  # A partial result with no additions is still one committed source result, with no physical row changes.
+  assert await snapshot(app, store) == before
+  assert store._DataBase__observations == {}
+
+
+async def test_domain_receipt_retries_are_pending_and_confirm_only_once(app, store, monkeypatch):
+  await seed(app, store)
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+  run, command = measured_domain(app)
+  retry_states = []
+
+  async def fault(stage, evidence):
+    if stage == 'begin' and evidence.begins < 3:
+      raise lock_error()
+
+  async def retry(delay):
+    retry_states.append((delay, assert_receipt_conservation(run)))
+
+  monkeypatch.setattr(app.database, 'sleep', retry)
+  evidence = instrument_sessions(store, monkeypatch, fault=fault)
+  await store.put_domain_after_resolve(command)
+  await store.start_writer()
+  await asyncio.wait_for(store.db_save_queue.join(), timeout=2)
+  assert evidence.begins == 3
+  assert evidence.commits == 1
+  assert [delay for delay, _ in retry_states] == [0.1, 0.2]
+  assert all(
+    counts['pending'] == 1 and counts['confirmed'] == counts['unknown'] == counts['known_not_committed'] == 0
+    for _, counts in retry_states
+  )
+  counts = assert_receipt_conservation(run)
+  assert counts['confirmed'] == counts['admitted'] == 1
+  assert counts['pending'] == 0
+  assert store._DataBase__observations == {}
+
+
+async def test_writer_failure_distinguishes_owned_provisional_unknown_and_unattempted_receipts(app, store, monkeypatch):
+  await seed(app, store)
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+  entered, release = asyncio.Event(), asyncio.Event()
+
+  async def hold_commit():
+    entered.set()
+    await release.wait()
+
+  instrument_sessions(store, monkeypatch, before_commit=hold_commit)
+  first, first_command = measured_domain(app)
+  queued, queued_command = measured_domain(app)
+  await store.put_domain_after_resolve(first_command)
+  await store.put_domain_after_resolve(queued_command)
+  await store.start_writer()
+  await asyncio.wait_for(entered.wait(), timeout=2)
+  try:
+    with pytest.raises(app.database.DatabaseShutdownError):
+      await store.close(timeout=0)
+    assert assert_receipt_conservation(first)['unknown'] == 1
+    assert assert_receipt_conservation(queued)['known_not_committed'] == 1
+    assert store.db_save_queue.qsize() == 1
+    assert store.pending_count == 2
+    assert len(store._DataBase__observations) == 1
+  finally:
+    release.set()
+  with pytest.raises(asyncio.CancelledError):
+    await asyncio.wait_for(asyncio.shield(store.writer_task), timeout=2)
+  assert assert_receipt_conservation(first)['confirmed'] == 1
+  assert first.snapshot()['unknown'] == 0
+  assert queued.snapshot()['known_not_committed'] == 1
+  assert store.pending_count == 1
+  assert store.db_save_queue.qsize() == 1
+  assert store._DataBase__observations == {}
+
+
+async def test_writer_blocked_admission_is_not_a_receipt_and_cancellation_preserves_processing(app, store):
+  run, command = measured_domain(app)
+  entered = asyncio.Event()
+
+  class FullQueue(asyncio.Queue):
+    async def put(self, item):
+      entered.set()
+      await super().put(item)
+
+  store.db_save_queue = FullQueue(maxsize=1)
+  await enqueue_names(app, store, ['occupies-capacity.example.test'])
+  entered.clear()
+  producer = asyncio.create_task(store.put_domain_after_resolve(command))
+  await asyncio.wait_for(entered.wait(), timeout=2)
+  counts = assert_receipt_conservation(run)
+  assert counts['admission_in_progress'] == 1
+  assert counts['admitted'] == counts['pending'] == 0
+  producer.cancel()
+  with pytest.raises(asyncio.CancelledError):
+    await producer
+  counts = assert_receipt_conservation(run)
+  assert counts['not_admitted'] == counts['success'] == 1
+  assert counts['admission_in_progress'] == counts['admitted'] == counts['unknown'] == 0
+  assert store._DataBase__observations == {}
+
+
+async def test_dns_row_identity_survives_default_and_configured_union_mapping(app, store):
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(insert(app.database.DnsServersDbo).values(id=0, server='192.0.2.1'))
+  classic, doh = await store.get_dns_servers_for_resolve()
+  assert [(row.id, row.server) for row in classic] == [(0, '192.0.2.1')]
+  assert doh == []
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.DnsServersDbo),
+      [
+        {'id': 42, 'server': '192.0.2.42', 'doh_server': None},
+        {'id': 43, 'server': None, 'doh_server': 'https://example.test/dns-query'},
+      ],
+    )
+  classic, doh = await store.get_dns_servers_for_resolve()
+  assert [(row.id, row.server) for row in classic] == [(42, '192.0.2.42')]
+  assert [(row.id, row.server) for row in doh] == [(43, 'https://example.test/dns-query')]
+
+
+@pytest.mark.parametrize('error_type', [RuntimeError, asyncio.CancelledError])
+async def test_receipt_observer_failure_cannot_cancel_real_commit(app, store, monkeypatch, error_type):
+  await seed(app, store)
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+
+  class BrokenObserver:
+    def notify(self, event, at):
+      raise error_type('Synthetic observer failure')
+
+  command = app.dto.DomainResult(id=1, name='www.example.test', resolution_complete=True, observation=BrokenObserver())
+  await store.put_domain_after_resolve(command)
+  await store.start_writer()
+  await asyncio.wait_for(store.db_save_queue.join(), timeout=2)
+  assert store.pending_count == 0
+  assert store.writer_state == 'RUNNING'
+  domain, _ips = await snapshot(app, store)
+  assert domain[0] is True
+  assert domain[1] is not None
+
+
+async def test_writer_phase_durations_follow_admission_dequeue_commit_and_cleanup(app, store, monkeypatch):
+  metrics = importlib.import_module('metrics.metrics')
+  clock = SimpleNamespace(value=10.0)
+  monkeypatch.setattr(metrics, 'perf_counter', lambda: clock.value)
+  monkeypatch.setattr(app.database, 'perf_counter', lambda: clock.value)
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+
+  def total(name, **labels):
+    return sum(
+      sample.value
+      for family in REGISTRY.collect()
+      for sample in family.samples
+      if sample.name == name and all(sample.labels.get(key) == value for key, value in labels.items())
+    )
+
+  before = {
+    phase: total('resolution_writer_duration_seconds_sum', phase=phase)
+    for phase in ('attempt', 'transaction', 'commit', 'cleanup', 'batch_dwell')
+  }
+  before_residence = total('resolution_queue_duration_seconds_sum', queue='writer', phase='residence')
+  before_admission = total('resolution_queue_duration_seconds_sum', queue='writer', phase='admission')
+
+  class TimedQueue(asyncio.Queue):
+    async def put(self, item):
+      clock.value = 100.0
+      await super().put(item)
+
+    async def get(self):
+      item = await super().get()
+      clock.value = 120.0
+      return item
+
+  async def fault(stage, evidence):
+    clock.value = {'begin': 122.0, 'after_insert': 130.0, 'commit': 132.0, 'after_commit': 134.0, 'close': 140.0}.get(
+      stage, clock.value
+    )
+
+  store.db_save_queue = TimedQueue(maxsize=2)
+  instrument_sessions(store, monkeypatch, fault=fault)
+  await enqueue_names(app, store, ['measured.example.test'])
+  clock.value = 110.0
+  await store.start_writer()
+  await asyncio.wait_for(store.db_save_queue.join(), timeout=2)
+  assert await stored_names(app, store) == ['measured.example.test']
+  assert total('resolution_queue_duration_seconds_sum', queue='writer', phase='admission') - before_admission == 90
+  assert total('resolution_queue_duration_seconds_sum', queue='writer', phase='residence') - before_residence == 20
+  assert total('resolution_writer_duration_seconds_sum', phase='attempt') - before['attempt'] == 20
+  assert total('resolution_writer_duration_seconds_sum', phase='transaction') - before['transaction'] == 14
+  assert total('resolution_writer_duration_seconds_sum', phase='commit') - before['commit'] == 4
+  assert total('resolution_writer_duration_seconds_sum', phase='cleanup') - before['cleanup'] == 6
+  assert total('resolution_writer_duration_seconds_sum', phase='batch_dwell') - before['batch_dwell'] == 0
+
+
+def parse_samples(body):
+  return {
+    (sample.name, tuple(sorted(sample.labels.items()))): sample.value
+    for family in text_string_to_metric_families(body)
+    for sample in family.samples
+  }
+
+
+def sample_total(samples, name, **labels):
+  return sum(
+    value
+    for (sample_name, sample_labels), value in samples.items()
+    if sample_name == name and all(dict(sample_labels).get(key) == str(value) for key, value in labels.items())
+  )
+
+
+def run_fields(samples, mode):
+  return {
+    dict(labels)['field']: value
+    for (name, labels), value in samples.items()
+    if name == 'resolution_run_snapshot' and dict(labels).get('mode') == mode
+  }
+
+
+def application_pid(samples):
+  pids = {int(dict(labels)['pid']) for name, labels in samples if name == 'fastapi_app_info'}
+  assert len(pids) == 1
+  return pids.pop()
+
+
+async def completed_metrics(client, *, mode, selected, previous_completed=0):
+  async with asyncio.timeout(10):
+    while True:
+      response = await client.get('/metrics')
+      assert response.status_code == 200
+      samples = parse_samples(response.text)
+      fields = run_fields(samples, mode)
+      if (
+        fields.get('selected') == selected
+        and sample_total(samples, 'resolution_run_elapsed_seconds_count', mode=mode) > previous_completed
+        and fields.get('processing_complete') == 1
+        and fields.get('active') == 0
+        and fields.get('pending') == 0
+        and fields.get('admission_in_progress') == 0
+      ):
+        return samples, fields
+      await asyncio.sleep(0.01)
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+  ('classic', 'doh', 'outcome', 'admitted'),
+  [
+    ('positive', 'positive', 'success', 1),
+    ('positive', 'servfail', 'partial', 1),
+    ('nodata', 'servfail', 'partial', 0),
+    ('servfail', 'servfail', 'failure', 0),
+  ],
+)
+async def test_public_metrics_separate_processing_admission_and_real_persistence(
+  e2e_service,
+  classic,
+  doh,
+  outcome,
+  admitted,
+):
+  service = e2e_service
+  domain_id = await configure_public_domain(service)
+  before = public_flow_snapshot(service, domain_id)
+  service.providers.classic, service.providers.doh = classic, doh
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    response = await client.post(f'/domains/{domain_id}/resolve')
+    assert response.status_code == 202
+    samples, fields = await completed_metrics(client, mode='stored', selected=1)
+    assert fields['attempted'] == fields[outcome] == 1
+    assert fields['success'] + fields['partial'] + fields['failure'] == 1
+    assert fields['admitted'] == fields['confirmed'] == admitted
+    assert fields['pending'] == fields['unknown'] == fields['known_not_committed'] == 0
+    assert fields['processing_rate_valid'] == fields['saved_rate_valid'] == 1
+    assert fields['processing_elapsed'] > 0
+    assert fields['persistence_elapsed'] >= fields['processing_elapsed']
+    assert fields['processing_rate'] > 0
+    assert (fields['saved_rate'] > 0) is bool(admitted)
+    assert sample_total(samples, 'resolution_dns_duration_seconds_count', record_type='A') == 2
+    assert sample_total(samples, 'resolution_dns_duration_seconds_count', record_type='CNAME') == 2
+    assert sample_total(samples, 'httpx_exchanges_in_flight') == 0
+    assert sample_total(samples, 'httpx_exchanges_started_total') == sample_total(
+      samples, 'httpx_exchanges_terminal_total'
+    )
+    dns_samples = {
+      (name, labels): value for (name, labels), value in samples.items() if name.startswith('resolution_dns_')
+    }
+    assert 'www.example.test' not in repr(dns_samples)
+    assert service.dns_host not in repr(dns_samples)
+    assert service.doh_url not in repr(dns_samples)
+  after = public_flow_snapshot(service, domain_id)
+  if not admitted:
+    assert after == before
+  else:
+    assert '8.8.8.8' in after[1]
+    assert ('9.9.9.9' in after[1]) is (outcome == 'partial')
+  # This must be the application process, not the pytest coordinator.
+  resources = service.resource_snapshot(application_pid(samples))
+  assert resources['pid'] == application_pid(samples)
+  assert resources['pid'] != os.getpid()
+  assert resources['rss_bytes'] > 0
+  assert resources['peak_rss_bytes'] >= resources['rss_bytes']
+  assert resources['cpu_seconds'] > 0
+
+
+def histogram_percentiles(samples, before, name, **selected_labels):
+  """Interpolate observed histogram buckets; report estimates, never raw-event quantiles."""
+  buckets = {}
+  for (sample_name, labels), value in samples.items():
+    if sample_name == f'{name}_bucket' and all(
+      dict(labels).get(key) == value for key, value in selected_labels.items()
+    ):
+      boundary = float(dict(labels)['le'])
+      buckets[boundary] = buckets.get(boundary, 0) + value - before.get((sample_name, labels), 0)
+  total = buckets.get(math.inf, 0)
+  result = {'count': total, 'method': 'linear interpolation of Prometheus cumulative histogram buckets'}
+  for label, quantile in [('p50', 0.5), ('p95', 0.95), ('p99', 0.99)]:
+    result[label] = None
+    if not total:
+      continue
+    previous_bound, previous_count = 0.0, 0.0
+    for boundary, count in sorted(buckets.items()):
+      if count >= total * quantile:
+        if math.isinf(boundary):
+          result[f'{label}_lower_bound'] = previous_bound
+        else:
+          result[label] = previous_bound + (boundary - previous_bound) * (total * quantile - previous_count) / (
+            count - previous_count
+          )
+        break
+      previous_bound, previous_count = boundary, count
+  return result
+
+
+@pytest.mark.e2e
+@pytest.mark.e2e_load
+async def test_reproducible_local_measurement_baseline(e2e_service, tmp_path):
+  """Measure fixed local work with real DNS/HTTP, app lifespan, queue, and SQLite."""
+  service = e2e_service
+  first_id = await configure_public_domain(service, resolved=False)
+  names = ['www.example.test', *[f'baseline-{index}.example.test' for index in range(3)]]
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    response = await client.post('/domains', json=[{'domain': name} for name in names[1:]])
+    assert response.status_code == 200
+    async with asyncio.timeout(5):
+      while True:
+        rows = (await client.get('/domains')).json()['payload']
+        ids = [row['id'] for row in rows if row['name'] in names]
+        if len(ids) == len(names):
+          break
+        await asyncio.sleep(0.01)
+  assert first_id in ids
+  service.providers.classic_addresses = ('8.8.8.0',)
+  service.providers.doh_addresses = ('8.8.4.0',)
+  service.environment.update(
+    {
+      'DB_SAVE_BATCH_SIZE': '1000',
+      'DOMAINS_RESOLVE_NEW_BATCH_SIZE': '500',
+      'DOMAINS_RESOLVE_SEMAPHORE_LIMIT': '20',
+      'RIPE_STAT_REQUESTS_SEMAPHORE_LIMIT': '5',
+      'RIPE_STAT_PREFIX_CACHE_TTL_SEC': '28800',
+      'RIPE_STAT_EMPTY_PREFIX_CACHE_TTL_SEC': '3600',
+      'RIPE_STAT_CACHE_LOCK_TTL_SEC': '120',
+      'RIPE_STAT_CACHE_SIZE': '10000',
+      'QUEUE_MAX_SIZE': '1000',
+    }
+  )
+  scenarios = []
+  settings = {
+    key: value
+    for key, value in service.environment.items()
+    if key.startswith(('DB_', 'REQ_', 'DOMAINS_', 'QUEUE_', 'RIPE_'))
+  }
+  for schedule, delay, unavailable in [('fast', 0.0, False), ('slow', 0.02, False), ('unavailable', 0.0, True)]:
+    await service.stop()
+    service.providers.delay = delay
+    service.providers.unavailable = unavailable
+    service.providers.classic = 'servfail' if unavailable else 'positive'
+    await service.start()
+    async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+      for temperature in ('cold', 'warm'):
+        # This disposable setup runs after the preceding job and its receipts are terminal.
+        with closing(sqlite3.connect(service.db_path)) as connection, connection:
+          connection.executemany(
+            'UPDATE rdpr_domains SET resolved=0, last_resolved_at=NULL WHERE id=?', [(value,) for value in ids]
+          )
+          before_rows = connection.execute(
+            'SELECT id, domain_id, addr_type, ip_address FROM rdpr_ip_records ORDER BY id'
+          ).fetchall()
+        before = parse_samples((await client.get('/metrics')).text)
+        request_offset = len(service.providers.requests)
+        http_offset = len(service.providers.http_requests)
+        child_pid = application_pid(before)
+        resources = [service.resource_snapshot(child_pid)]
+        done = asyncio.Event()
+
+        async def sample_child(done=done, resources=resources, child_pid=child_pid):
+          while not done.is_set():
+            resources.append(service.resource_snapshot(child_pid))
+            try:
+              await asyncio.wait_for(done.wait(), timeout=0.01)
+            except TimeoutError:
+              pass
+
+        sampler = asyncio.create_task(sample_child())
+        started = perf_counter()
+        try:
+          response = await client.post('/commands/domains/resolve/new')
+          assert response.status_code == 200
+          samples, fields = await completed_metrics(
+            client,
+            mode='new',
+            selected=len(names),
+            previous_completed=sample_total(before, 'resolution_run_elapsed_seconds_count', mode='new'),
+          )
+        finally:
+          done.set()
+          await sampler
+        elapsed = perf_counter() - started
+        resources.append(service.resource_snapshot(child_pid))
+        assert fields['failure' if unavailable else 'success'] == len(names)
+        assert fields['confirmed'] == (0 if unavailable else len(names))
+        assert fields['admitted'] == fields['confirmed']
+        assert fields['pending'] == fields['unknown'] == 0
+        assert fields['saved_rate_valid'] == fields['processing_rate_valid'] == 1
+        with closing(sqlite3.connect(service.db_path)) as connection:
+          actual_rows = connection.execute(
+            'SELECT id, domain_id, addr_type, ip_address FROM rdpr_ip_records ORDER BY id'
+          ).fetchall()
+          checkpoints = connection.execute(
+            'SELECT id, resolved, last_resolved_at FROM rdpr_domains WHERE id>0 ORDER BY id'
+          ).fetchall()
+          assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
+        if unavailable:
+          assert actual_rows == before_rows
+          assert all(row[1:] == (0, None) for row in checkpoints)
+        else:
+          assert {'8.8.8.0', '8.8.4.0'} <= {row[3] for row in actual_rows}
+          assert all(row[1] == 1 and row[2] is not None for row in checkpoints)
+        network_count = sample_total(samples, 'resolution_ripe_duration_seconds_count', phase='network') - sample_total(
+          before, 'resolution_ripe_duration_seconds_count', phase='network'
+        )
+        if not unavailable:
+          assert network_count == (2 if temperature == 'cold' else 0)
+        else:
+          assert network_count == 0
+        distributions = {
+          'httpx_exchange_duration_seconds': histogram_percentiles(samples, before, 'httpx_exchange_duration_seconds'),
+          'resolution_dns_duration_seconds': histogram_percentiles(samples, before, 'resolution_dns_duration_seconds'),
+          **{
+            f'resolution_ripe_{phase}_seconds': histogram_percentiles(
+              samples, before, 'resolution_ripe_duration_seconds', phase=phase
+            )
+            for phase in ('lookup', 'network')
+          },
+          **{
+            f'resolution_{queue}_queue_{phase}_seconds': histogram_percentiles(
+              samples, before, 'resolution_queue_duration_seconds', queue=queue, phase=phase
+            )
+            for queue in ('writer', 'resolve')
+            for phase in ('admission', 'residence')
+          },
+          **{
+            f'resolution_writer_{phase}_seconds': histogram_percentiles(
+              samples, before, 'resolution_writer_duration_seconds', phase=phase
+            )
+            for phase in ('attempt', 'transaction', 'commit')
+          },
+        }
+        assert distributions['resolution_dns_duration_seconds']['count'] == len(names) * 4
+        scenarios.append(
+          {
+            'schedule': schedule,
+            'cache': temperature,
+            'provider_delay_seconds': delay,
+            'http_provider_disconnects': unavailable,
+            'classic_rcode': 'SERVFAIL' if unavailable else 'NOERROR',
+            'wall_elapsed_seconds': elapsed,
+            'run': fields,
+            'histogram_percentile_estimates': distributions,
+            'actual_classic_calls': sum(row[0] == 'classic' for row in service.providers.requests[request_offset:]),
+            'actual_http_calls': service.providers.http_requests[http_offset:],
+            'ripe_network_calls': network_count,
+            'actual_ip_rows': actual_rows,
+            'actual_checkpoints': checkpoints,
+            'child_pid': child_pid,
+            'launcher_pid': service.process.pid,
+            'resource_source': resources[0]['source'],
+            'child_cpu_seconds': resources[-1]['cpu_seconds'] - resources[0]['cpu_seconds'],
+            'child_peak_rss_bytes': max(sample['peak_rss_bytes'] for sample in resources),
+            'child_max_sampled_rss_bytes': max(sample['rss_bytes'] for sample in resources),
+            'resource_sample_count': len(resources),
+          }
+        )
+  source_paths = [
+    'main.py',
+    'pyproject.toml',
+    'poetry.lock',
+    'config/config.py',
+    'server/server.py',
+    'metrics/httpx_metrics.py',
+    'metrics/metrics.py',
+    'client/http_base_client.py',
+    'client/domains_resolving_client.py',
+    'client/ripe_stat_client.py',
+    'database/db.py',
+    'models/dto/queue_dto.py',
+    'models/dto/domains_dto.py',
+    'models/dto/dns_server_dto.py',
+    'models/db/dns_servers_dbo.py',
+    'tests/conftest.py',
+    'tests/unit/test_domains_resolving_client.py',
+    'tests/integration/test_domain_resolution_persistence.py',
+  ]
+  artifact = tmp_path / 'measurement-baseline.json'
+  artifact.write_text(
+    json.dumps(
+      {
+        'scope': 'local controlled protocol baseline; not production performance or a speedup comparison',
+        'dataset': names,
+        'settings': settings,
+        'python': sys.version,
+        'invocation': [sys.executable, '-B', '-m', 'pytest', *sys.argv[1:]],
+        'versions': {
+          name: importlib.metadata.version(name)
+          for name in ('httpx', 'sqlalchemy', 'aiosqlite', 'prometheus-client', 'cashews', 'dnspython')
+        },
+        'source_sha256': {name: sha256((service.root / name).read_bytes()).hexdigest() for name in source_paths},
+        'scenarios': scenarios,
+      },
+      indent=2,
+      allow_nan=False,
+    ),
+    encoding='utf-8',
+  )
+  assert len(scenarios) == 6

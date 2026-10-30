@@ -130,6 +130,103 @@ database engines. A deadline or forced cancellation reports unresolved work and 
 cleanup. `DB_SHUTDOWN_TIMEOUT` covers the database wait, not the total application or container shutdown time.
 The queue is process-local and does not recover pending commands after a crash or forced process termination.
 
+## Resolution measurements
+
+`/metrics` exposes separate measurements for processing, queue admission and confirmed database commands.
+All durations use monotonic clocks and seconds. Nested phase durations overlap and must not be added as wall time.
+
+| Metric family | Meaning |
+| ------------- | ------- |
+| `httpx_requests_total` | Started transport exchanges, including failures without a response |
+| `httpx_responses_total` | Exchanges that received response headers, grouped by HTTP status |
+| `httpx_requests_duration_seconds` | Transport entry to the first stream terminal; includes consumer pauses |
+| `httpx_request_headers_duration_seconds` | Transport entry to response headers or a transport error |
+| `httpx_exchanges_started_total`, `httpx_exchanges_terminal_total`, `httpx_exchanges_in_flight` | Exchange lifecycle conservation by integration |
+| `httpx_exchange_duration_seconds` | Full exchange lifecycle by integration, terminal phase and outcome |
+| `httpx_stream_cleanup_errors_total` | Cleanup failures after an already observed stream terminal |
+| `resolution_dns_duration_seconds`, `resolution_dns_semaphore_wait_seconds` | DNS query/validation and semaphore wait by server ID, transport, record type and outcome |
+| `resolution_ripe_duration_seconds` | RIPEstat cache, lock, network and logical lookup phases |
+| `resolution_queue_duration_seconds` | Queue admission, residence and pending-batch waits |
+| `resolution_writer_duration_seconds` | Write attempts, transactions, commit and cleanup phases |
+| `resolution_run_events_total`, `resolution_run_elapsed_seconds` | Cumulative run events and processing duration |
+| `resolution_run_snapshot` | Fields of the latest started run for each `new`, `stale` or `stored` mode |
+
+HTTP measurements observe each transport exchange separately; redirects and authentication exchanges can create
+several exchanges for one logical request. Existing connection retries remain inside an exchange. A completed stream
+does not imply a successful HTTP status, DNS result or JSON payload. Unconsumed, unclosed streams remain in flight.
+Metrics never consume response bodies. Legacy HTTP exception labels retain their names, with `host` and `path`
+set to `redacted` and errors mapped to fixed categories.
+
+DNS `server_id` is the existing configuration row ID, including the fallback row `0`; use the DNS API to identify it.
+It is not an immutable endpoint identity. Historical ID series last for the process lifetime, and reused SQLite IDs
+aggregate under that key. Configuration churn can increase historical series. Queried domains, addresses, URLs,
+credentials and run IDs are not metric labels. CNAME `no_alias` does not prove absence of IPv4 addresses.
+
+Run processing outcomes are `success`, `partial`, `failure` and actual processing cancellation. Confirmed absence
+of addresses is successful evidence. Partial evidence remains partial even when no new addresses require a write.
+Admission failure is separate from an already established processing result. Best-effort CNAME discovery and RIPEstat
+fallback have their own observations.
+
+Persistence fields distinguish `admitted`, `pending`, `confirmed`, `known_not_committed` and `unknown`, plus rejected
+admission and results needing no write. `confirmed` means a source-domain result command had a known commit, including
+partial results; it does not count inserted IP rows, CNAME commands or records surviving a later deletion. Retry
+attempts do not increase confirmed counts. A known commit remains confirmed after cleanup failure. An ambiguous
+commit remains unknown; an interrupted in-flight operation can acquire a known outcome later.
+
+The processing summary uses the existing job completion boundary and does not wait for the database writer.
+Later receipts update persistence statistics. `processing_rate` counts attempted domains per processing second;
+compare success/partial/failure counts alongside that rate. `saved_rate` counts confirmed result commands per second
+through processing and known persistence completion. Final rates have explicit `*_rate_valid` fields; unknown,
+interrupted or zero-duration measurements are invalid and use `NaN`, rather than a fabricated zero. A completed run
+with no required writes can have a valid saved rate of zero. Late receipts from an older run cannot replace a newer
+run's snapshot for the same mode. All observations are process-local and do not provide crash durability.
+
+### Repeatable local baseline
+
+The explicitly selected `e2e_load` scenarios use the real application entrypoint and lifespan, disposable SQLite,
+and local DNS, DoH and RIPEstat protocol providers. They record fixed workloads and safe settings, cold/warm cache
+conditions, fast/slow/unavailable providers, processing and persistence measurements, actual database effects and
+application-process resources. These results describe the local test environment, not production provider latency.
+
+On Windows, select a fresh temporary directory so the run owns all generated files:
+
+```powershell
+$measurementTemp = Join-Path ([System.IO.Path]::GetTempPath()) ('rdpr-measurements-' + [guid]::NewGuid().ToString('N'))
+.\.venv\Scripts\python.exe -B -m pytest -n 0 -m e2e_load -p no:cacheprovider --basetemp $measurementTemp
+```
+
+Keep the exact source snapshot, dependency versions, workload, provider schedule, settings and generated results
+when comparing later changes. Resource measurements must use the actual application PID; a virtual-environment
+launcher PID and unavailable process metrics must not be substituted for application CPU or resident memory.
+
+The initial local baseline was recorded on 2026-10-31, Windows AMD64, Python 3.15.2, HTTPX 0.28.1,
+SQLAlchemy 2.1.6, aiosqlite 0.22.1, dnspython 2.9.1, cashews 7.6.0 and prometheus-client 0.26.0.
+It used four fixed domains, two local DNS transports and sixteen A/CNAME queries per run. Relevant explicit settings
+were `DB_SAVE_BATCH_SIZE=1000`, `DB_SAVE_BATCH_TIMEOUT=0.05`, `QUEUE_MAX_SIZE=1000`,
+`DOMAINS_RESOLVE_SEMAPHORE_LIMIT=20`, `RIPE_STAT_REQUESTS_SEMAPHORE_LIMIT=5`,
+`REQ_CONNECTION_RETRIES=0` and two-second HTTP timeouts. These are controlled test settings.
+
+| Provider / cache | Attempts per second | Confirmed commands per second | DNS p95 estimate, ms |
+| ---------------- | -------------------: | ----------------------------: | -------------------: |
+| Fast / cold | 19.152 | 18.056 | 43.3 |
+| Fast / warm | 21.308 | 19.869 | 40.0 |
+| Slow, 20 ms / cold | 9.152 | 8.005 | 55.0 |
+| Slow, 20 ms / warm | 8.624 | 7.602 | 71.7 |
+| Disconnected DoH and DNS SERVFAIL / cold | 36.093 | 0.000 | 22.6 |
+| Disconnected DoH and DNS SERVFAIL / warm | 39.639 | 0.000 | 22.6 |
+
+Each unavailable run had four failed attempts and zero confirmed commands. RIPEstat made two network lookups with
+a cold cache and none with a warm cache; unavailable runs needed no RIPEstat lookup. The measured application CPU
+deltas were 0.078125–0.296875 seconds; process-lifetime peak resident memory was 119,140,352–120,176,640 bytes.
+Histogram quantiles are interpolated bucket estimates. The workload is a small reproducibility baseline with
+metrics polling, and the numbers include its observation overhead. Repeat runs under comparable host load before
+attributing a difference to application code.
+
+The tested source/configuration snapshot identity is
+`2237ef45537716d78b14507e3080baaf92d860a8dcb00922b83fbaa2c6d8b609`, based on commit `1a96db7` plus the
+measurement changes. Each rerun writes `measurement-baseline.json` under its pytest temporary directory with the
+exact invocation, input hashes, versions, settings, provider schedule, outcomes, database effects and resource samples.
+
 ## MikroTik RouterOS
 
 RouterOS v7 only !!! RouterOS v6 NOT supported !!!

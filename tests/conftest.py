@@ -1,7 +1,9 @@
 """Fixtures for isolated unit/integration tests and real service E2E processes."""
 
 import asyncio
+import ctypes
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -10,6 +12,7 @@ import socket
 import sys
 from base64 import urlsafe_b64decode
 from contextlib import closing
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -32,10 +35,78 @@ import httpx
 import pytest
 from pydantic_settings.sources import DotEnvSettingsSource
 
+_coverage_migration_directories = set()
+
+
+def normalize_migration_coverage(data, root, directories):
+  """Merge identical migration copies and exclude test-owned migration fault code."""
+  from coverage import CoverageData
+
+  root = Path(root).resolve()
+  directories = {Path(directory).resolve() for directory in directories}
+  paths = {}
+  for filename in data.measured_files():
+    source = Path(filename).resolve()
+    if source.is_relative_to(root) or source.parent not in directories:
+      paths[filename] = filename
+      continue
+    original = root / 'migrations' / source.name
+    if (
+      original.is_file()
+      and source.is_file()
+      and sha256(original.read_bytes()).digest() == sha256(source.read_bytes()).digest()
+    ):
+      paths[filename] = str(original)
+  if paths == {filename: filename for filename in data.measured_files()}:
+    return
+
+  has_arcs = data.has_arcs()
+  read = data.arcs if data.has_arcs() else data.lines
+  # Preserve even unexecuted files, branch entry/exit arcs, and exact context names.
+  contexts = {}
+  for context in data.measured_contexts():
+    data.set_query_context(context)
+    measurements = contexts[context] = {}
+    for filename, target in paths.items():
+      values = read(filename)
+      if values:
+        measurements.setdefault(target, set()).update(values)
+  data.set_query_contexts(None)
+  tracers = {target: data.file_tracer(filename) for filename, target in paths.items()}
+  data.erase()
+  # A fresh data object also writes the branch/line metadata after the old file is erased.
+  replacement = CoverageData(basename=data.data_filename())
+  add = replacement.add_arcs if has_arcs else replacement.add_lines
+  add({})
+  replacement.touch_files(set(paths.values()))
+  replacement.add_file_tracers(tracers)
+  for context, measurements in contexts.items():
+    replacement.set_context(context)
+    add(measurements)
+  replacement.write()
+  replacement.close()
+  data.read()
+
+
+@pytest.hookimpl(wrapper=True, trylast=True)
+def pytest_runtestloop(session):
+  """Normalize parent data after fixture teardown, before pytest-cov combines children."""
+  result = yield
+  from coverage import Coverage
+
+  coverage = Coverage.current()
+  if coverage is not None:
+    coverage.stop()
+    normalize_migration_coverage(
+      coverage.get_data(), Path(__file__).resolve().parents[1], _coverage_migration_directories
+    )
+  return result
+
 
 @pytest.fixture
 async def app(tmp_path, monkeypatch):
   """Prevent secret-file reads and production I/O before importing globals."""
+  _coverage_migration_directories.add(tmp_path / 'migrations')
   monkeypatch.setattr(dotenv, 'load_dotenv', lambda *args, **kwargs: False)
   monkeypatch.setattr(DotEnvSettingsSource, '_read_env_files', lambda self: {})
   monkeypatch.setenv('DB_BASE_DIR', str(tmp_path))
@@ -260,6 +331,72 @@ class ServiceProcess:
   def diagnostics(self):
     return self.log_path.read_text(encoding='utf-8', errors='replace') if self.log_path.exists() else ''
 
+  def resource_snapshot(self, application_pid):
+    """Read the actual child's CPU time and resident memory from its operating system."""
+    assert self.process is not None
+    assert self.process.returncode is None
+    pid = application_pid
+    if sys.platform == 'win32':
+      from ctypes import wintypes
+
+      class MemoryCounters(ctypes.Structure):
+        _fields_ = [
+          ('cb', wintypes.DWORD),
+          ('PageFaultCount', wintypes.DWORD),
+          ('PeakWorkingSetSize', ctypes.c_size_t),
+          ('WorkingSetSize', ctypes.c_size_t),
+          ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+          ('QuotaPagedPoolUsage', ctypes.c_size_t),
+          ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+          ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+          ('PagefileUsage', ctypes.c_size_t),
+          ('PeakPagefileUsage', ctypes.c_size_t),
+        ]
+
+      kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+      psapi = ctypes.WinDLL('psapi', use_last_error=True)
+      kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+      kernel.OpenProcess.restype = wintypes.HANDLE
+      kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+      kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+      psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(MemoryCounters), wintypes.DWORD]
+      handle = kernel.OpenProcess(0x1000 | 0x0010, False, pid)
+      if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+      try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        memory = MemoryCounters()
+        memory.cb = ctypes.sizeof(memory)
+        if not kernel.GetProcessTimes(handle, *(ctypes.byref(value) for value in times)):
+          raise ctypes.WinError(ctypes.get_last_error())
+        if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(memory), ctypes.sizeof(memory)):
+          raise ctypes.WinError(ctypes.get_last_error())
+        cpu = sum((value.dwHighDateTime << 32) + value.dwLowDateTime for value in times[2:]) / 10_000_000
+        return {
+          'pid': pid,
+          'cpu_seconds': cpu,
+          'rss_bytes': memory.WorkingSetSize,
+          'peak_rss_bytes': memory.PeakWorkingSetSize,
+          'source': 'Windows process APIs',
+        }
+      finally:
+        kernel.CloseHandle(handle)
+    if sys.platform.startswith('linux'):
+      process_dir = Path('/proc') / str(pid)
+      fields = (process_dir / 'stat').read_text(encoding='ascii').rsplit(')', 1)[1].split()
+      status = dict(line.split(':', 1) for line in (process_dir / 'status').read_text(encoding='ascii').splitlines())
+      cpu = (int(fields[11]) + int(fields[12])) / os.sysconf('SC_CLK_TCK')
+      rss = int(status['VmRSS'].split()[0]) * 1024
+      peak_rss = int(status['VmHWM'].split()[0]) * 1024
+      return {
+        'pid': pid,
+        'cpu_seconds': cpu,
+        'rss_bytes': rss,
+        'peak_rss_bytes': peak_rss,
+        'source': 'Linux procfs process counters',
+      }
+    raise RuntimeError(f'Child resource sampling is not implemented for {sys.platform}')
+
   async def health_ready(self):
     """Bound a real health request and own its socket across cancellation."""
     loop = asyncio.get_running_loop()
@@ -287,14 +424,26 @@ class ServiceProcess:
     # The wrapper only converts test-owned stdin into SIGINT; main.py owns the app.
     bootstrap = (
       'import _thread, os, runpy, sys, threading\n'
+      'from pathlib import Path\n'
+      'from hashlib import sha256\n' + inspect.getsource(normalize_migration_coverage) + '\n'
       'def stop():\n'
       '  os.read(sys.stdin.fileno(), 1)\n'
       '  _thread.interrupt_main()\n'
       'threading.Thread(target=stop, daemon=True).start()\n'
+      'coverage = None\n'
+      'if os.environ.get("COVERAGE_PROCESS_START"):\n'
+      '  import coverage as coverage_module\n'
+      '  coverage = coverage_module.Coverage(config_file=os.environ["COVERAGE_PROCESS_START"], data_suffix=True)\n'
+      '  coverage.start()\n'
       'try:\n'
       '  runpy.run_path(sys.argv[1], run_name="__main__")\n'
       'except KeyboardInterrupt:\n'
       '  pass\n'
+      'finally:\n'
+      '  if coverage is not None:\n'
+      '    coverage.stop()\n'
+      '    normalize_migration_coverage(coverage.get_data(), Path(sys.argv[1]).parent, [Path.cwd() / "migrations"])\n'
+      '    coverage.save()\n'
     )
     self.log = self.log_path.open('ab', buffering=0)
     try:
@@ -361,7 +510,10 @@ class ServiceProcess:
 @pytest.fixture
 async def e2e_service(tmp_path, dns_message, request):
   """Keep application logic real and replace only external wire protocols."""
+  from coverage import Coverage
+
   root = Path(__file__).resolve().parents[1]
+  _coverage_migration_directories.add(tmp_path / 'migrations')
   shutil.copytree(root / 'migrations', tmp_path / 'migrations', ignore=shutil.ignore_patterns('__pycache__'))
   db_path = tmp_path / 'service.sqlite'
 
@@ -369,9 +521,12 @@ async def e2e_service(tmp_path, dns_message, request):
     classic='positive',
     doh='positive',
     requests=[],
+    http_requests=[],
     errors=[],
     classic_addresses=('8.8.8.8',),
     doh_addresses=('8.8.4.4',),
+    delay=0.0,
+    unavailable=False,
   )
 
   def response_wire(query, transport):
@@ -386,7 +541,11 @@ async def e2e_service(tmp_path, dns_message, request):
 
     def datagram_received(self, data, address):
       query = dns.message.from_wire(data)
-      self.transport.sendto(response_wire(query, 'classic'), address)
+      wire = response_wire(query, 'classic')
+      if providers.delay:
+        loop.call_later(providers.delay, self.transport.sendto, wire, address)
+      else:
+        self.transport.sendto(wire, address)
 
     def error_received(self, error):
       providers.errors.append(str(error))
@@ -407,6 +566,11 @@ async def e2e_service(tmp_path, dns_message, request):
         method, target, _ = request_line
         url = urlsplit(target)
         params = parse_qs(url.query)
+        providers.http_requests.append((method, url.path))
+        if providers.delay:
+          await asyncio.sleep(providers.delay)
+        if providers.unavailable:
+          return
         if method == 'GET' and url.path == '/dns-query':
           assert headers.get('accept') == 'application/dns-message'
           encoded = params['dns'][0]
@@ -468,6 +632,14 @@ async def e2e_service(tmp_path, dns_message, request):
         'REQ_TIMEOUT_READ': '2',
       }
     )
+    coverage = Coverage.current()
+    if coverage is not None:
+      environment['COVERAGE_PROCESS_START'] = str(root / 'pyproject.toml')
+      environment['COVERAGE_FILE'] = str(Path(coverage.get_option('run:data_file')).resolve())
+    elif os.environ.get('COVERAGE_PROCESS_START'):
+      environment['COVERAGE_PROCESS_START'] = os.environ['COVERAGE_PROCESS_START']
+      if os.environ.get('COVERAGE_FILE'):
+        environment['COVERAGE_FILE'] = os.environ['COVERAGE_FILE']
     service = ServiceProcess(root, tmp_path, environment)
     service.db_path = db_path
     service.providers = providers

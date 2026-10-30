@@ -1,33 +1,35 @@
 from datetime import datetime
+from typing import Optional, Self, Sequence, Tuple
+
 from sqlalchemy import (
-  select,
-  or_,
-  case,
-  exists,
-  union_all,
-  func,
+  INTEGER,
+  TEXT,
+  TIMESTAMP,
+  CheckConstraint,
+  CompoundSelect,
+  Result,
   Row,
   Select,
-  Result,
-  CompoundSelect,
-  CheckConstraint,
-  INTEGER,
-  TIMESTAMP,
-  TEXT
+  case,
+  exists,
+  func,
+  or_,
+  select,
+  union_all,
 )
-from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Optional, Tuple, Self, Sequence
-
-from .base_dbo import Dbo
+from sqlalchemy.orm import Mapped, mapped_column
 
 from models.dto.dns_server_dto import DnsServerType
 
+from .base_dbo import Dbo
+
+
 class DnsServersDbo(Dbo):
-  '''
-  DNS servers table  
+  """
+  DNS servers table
   default: Cloudflare DNS 1.1.1.1 / ID=0
-  '''
+  """
 
   __tablename__ = 'dns_servers'
 
@@ -42,7 +44,7 @@ class DnsServersDbo(Dbo):
 
   __table_args__ = (
     CheckConstraint("server != ''", name='server_chk'),
-    CheckConstraint("doh_server != ''", name='doh_server_chk')
+    CheckConstraint("doh_server != ''", name='doh_server_chk'),
   )
 
   # get_total in Base class
@@ -57,74 +59,60 @@ class DnsServersDbo(Dbo):
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     default: Optional[bool] = None,
-    search_text: Optional[str] = None
+    search_text: Optional[str] = None,
   ) -> Sequence[Row[Tuple[int, str | None, str | None, str | None, datetime, datetime | None]]]:
     try:
       select_stmt: Select[Tuple[int, str | None, str | None, str | None, datetime, datetime | None]] = select(
-        cls.id,
-        cls.server,
-        cls.doh_server,
-        cls.description,
-        cls.created_at,
-        cls.updated_at
+        cls.id, cls.server, cls.doh_server, cls.description, cls.created_at, cls.updated_at
       )
       if start_date != None:
         select_stmt = select_stmt.where(cls.created_at >= start_date)
       if end_date != None:
         select_stmt = select_stmt.where(cls.created_at <= end_date)
-      if default != None and default == False: # We don't include default in the sample
+      if default != None and default == False:  # We don't include default in the sample
         select_stmt = select_stmt.where(cls.id > 0)
       if search_text != None:
-        select_stmt = select_stmt.where(
-          or_(
-            cls.server.contains(search_text),
-            cls.doh_server.contains(search_text)
-          )
-        )
-      select_limit_stmt: Select[Tuple[int, str | None, str | None, str | None, datetime, datetime | None]] = \
+        select_stmt = select_stmt.where(or_(cls.server.contains(search_text), cls.doh_server.contains(search_text)))
+      select_limit_stmt: Select[Tuple[int, str | None, str | None, str | None, datetime, datetime | None]] = (
         select_stmt.limit(limit).offset(offset)
-      exec_result: Result[Tuple[int, str | None, str | None, str | None, datetime, datetime | None]] = \
-        await db_session.execute(select_limit_stmt)
+      )
+      exec_result: Result[
+        Tuple[int, str | None, str | None, str | None, datetime, datetime | None]
+      ] = await db_session.execute(select_limit_stmt)
       return exec_result.fetchall()
     except Exception as err:
       raise err
 
   @classmethod
   async def get_on_id(
-    cls: type[Self],
-    db_session: AsyncSession,
-    id: int
+    cls: type[Self], db_session: AsyncSession, id: int
   ) -> Optional[Row[Tuple[int, str | None, str | None, str | None, datetime, datetime | None]]]:
     try:
       select_stmt: Select[Tuple[int, str | None, str | None, str | None, datetime, datetime | None]] = select(
-        cls.id,
-        cls.server,
-        cls.doh_server,
-        cls.description,
-        cls.created_at,
-        cls.updated_at
+        cls.id, cls.server, cls.doh_server, cls.description, cls.created_at, cls.updated_at
       ).where(cls.id == id)
-      exec_result: Result[Tuple[int, str | None, str | None, str | None, datetime, datetime | None]] = \
-        await db_session.execute(select_stmt)
+      exec_result: Result[
+        Tuple[int, str | None, str | None, str | None, datetime, datetime | None]
+      ] = await db_session.execute(select_stmt)
       return exec_result.fetchone()
     except Exception as err:
       raise err
 
   @classmethod
   async def get_all_for_resolve(
-    cls: type[Self],
-    db_session: AsyncSession
-  ) -> Sequence[Row[Tuple[str | None, str | None, DnsServerType]]]:
+    cls: type[Self], db_session: AsyncSession
+  ) -> Sequence[Row[str | None, str | None, DnsServerType, int]]:
     try:
       # user DNS servers
-      select_stmt_normal: Select[Tuple[str | None, str | None, DnsServerType]] = select(
+      select_stmt_normal: Select[str | None, str | None, DnsServerType, int] = select(
         cls.server,
         cls.doh_server,
         case(
           (cls.server != None, DnsServerType.DEFAULT),
           (cls.doh_server != None, DnsServerType.DOH),
-          else_ = DnsServerType.UNKNOWN
-        ).label('type')
+          else_=DnsServerType.UNKNOWN,
+        ).label('type'),
+        cls.id,
       ).where(cls.id > 0)
       # default DNS server (one record)
       select_stmt_default = select(
@@ -133,28 +121,24 @@ class DnsServersDbo(Dbo):
         case(
           (cls.server != None, DnsServerType.DEFAULT),
           (cls.doh_server != None, DnsServerType.DOH),
-          else_ = DnsServerType.UNKNOWN
-        ).label('type')
+          else_=DnsServerType.UNKNOWN,
+        ).label('type'),
+        cls.id,
       ).where(cls.id == 0, ~exists(select(1).where(cls.id > 0)))
       # union
-      select_stmt_union: CompoundSelect[Tuple[str | None, str | None, DnsServerType]] = \
-        union_all(select_stmt_normal, select_stmt_default)
-      exec_result: Result[Tuple[str | None, str | None, DnsServerType]] = \
-        await db_session.execute(select_stmt_union)
+      select_stmt_union: CompoundSelect[str | None, str | None, DnsServerType, int] = union_all(
+        select_stmt_normal, select_stmt_default
+      )
+      exec_result: Result[str | None, str | None, DnsServerType, int] = await db_session.execute(select_stmt_union)
       return exec_result.fetchall()
     except Exception as err:
       raise err
 
   @classmethod
-  async def get_stats(
-    cls: type[Self],
-    db_session: AsyncSession
-  ) -> Row[Tuple[int, int, int]]:
+  async def get_stats(cls: type[Self], db_session: AsyncSession) -> Row[Tuple[int, int, int]]:
     try:
       select_stmt: Select[Tuple[int, int, int]] = select(
-        func.count().label('total'),
-        func.count(cls.server).label('classic'),
-        func.count(cls.doh_server).label('doh')
+        func.count().label('total'), func.count(cls.server).label('classic'), func.count(cls.doh_server).label('doh')
       )
       exec_result: Result[Tuple[int, int, int]] = await db_session.execute(select_stmt)
       return exec_result.one()
