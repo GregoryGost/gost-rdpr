@@ -1,17 +1,24 @@
-"""Real SQLite persistence checks without application startup or migrations."""
+"""SQLite integration and service E2E tests of startup, migrations, API flows, and shutdown."""
 
 import asyncio
 import importlib
 import sqlite3
-from datetime import datetime
+from contextlib import closing
+from datetime import UTC, datetime
+from hashlib import sha256
 from types import SimpleNamespace
 
+import dns.rdatatype
+import httpx
 import pytest
 from sqlalchemy import insert, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 pytestmark = pytest.mark.integration
+
+# SQLite persists UTC timestamps without a timezone component.
+STALE_CHECKPOINT = datetime(2000, 1, 1, tzinfo=UTC).replace(tzinfo=None)
 
 
 @pytest.fixture
@@ -40,28 +47,44 @@ async def store(app, monkeypatch):
 
 async def seed(app, store, *, resolved=False, checkpoint=None):
   async with store._DataBase__write_engine.begin() as connection:
-    await connection.execute(insert(app.database.DomainsDbo).values(
-      id=1, name='www.example.test', resolved=resolved, last_resolved_at=checkpoint,
-    ))
-    await connection.execute(insert(app.database.IpRecordsDbo), [
-      {'id': 10, 'domain_id': 1, 'addr_type': 4, 'ip_address': '9.9.9.9'},
-      {'id': 11, 'domain_id': 1, 'addr_type': 6, 'ip_address': '2001:4860:4860::8888'},
-      {'id': 12, 'domain_id': 1, 'addr_type': 4, 'ip_address': '8.8.8.0/24'},
-      {'id': 13, 'domain_id': 1, 'addr_type': 4, 'ip_address': '8.8.8.0'},
-      {'id': 14, 'domain_id': 1, 'addr_type': 4, 'ip_address': '8.8.8.0/25'},
-    ])
+    await connection.execute(
+      insert(app.database.DomainsDbo).values(
+        id=1,
+        name='www.example.test',
+        resolved=resolved,
+        last_resolved_at=checkpoint,
+      )
+    )
+    await connection.execute(
+      insert(app.database.IpRecordsDbo),
+      [
+        {'id': 10, 'domain_id': 1, 'addr_type': 4, 'ip_address': '9.9.9.9'},
+        {'id': 11, 'domain_id': 1, 'addr_type': 6, 'ip_address': '2001:4860:4860::8888'},
+        {'id': 12, 'domain_id': 1, 'addr_type': 4, 'ip_address': '8.8.8.0/24'},
+        {'id': 13, 'domain_id': 1, 'addr_type': 4, 'ip_address': '8.8.8.0'},
+        {'id': 14, 'domain_id': 1, 'addr_type': 4, 'ip_address': '8.8.8.0/25'},
+      ],
+    )
 
 
 async def snapshot(app, store):
   async with store._DataBase__read_engine.connect() as connection:
-    domain = (await connection.execute(select(
-      app.database.DomainsDbo.resolved,
-      app.database.DomainsDbo.last_resolved_at,
-    ).where(app.database.DomainsDbo.id == 1))).one()
-    ips = (await connection.execute(select(
-      app.database.IpRecordsDbo.id,
-      app.database.IpRecordsDbo.ip_address,
-    ).where(app.database.IpRecordsDbo.domain_id == 1))).all()
+    domain = (
+      await connection.execute(
+        select(
+          app.database.DomainsDbo.resolved,
+          app.database.DomainsDbo.last_resolved_at,
+        ).where(app.database.DomainsDbo.id == 1)
+      )
+    ).one()
+    ips = (
+      await connection.execute(
+        select(
+          app.database.IpRecordsDbo.id,
+          app.database.IpRecordsDbo.ip_address,
+        ).where(app.database.IpRecordsDbo.domain_id == 1)
+      )
+    ).all()
   return tuple(domain), dict(ips)
 
 
@@ -76,13 +99,22 @@ async def flush_queue(store):
   return elements
 
 
-@pytest.mark.parametrize(('resolved', 'checkpoint'), [
-  (False, None),
-  (True, datetime(2000, 1, 1)),
-])
+@pytest.mark.parametrize(
+  ('resolved', 'checkpoint'),
+  [
+    (False, None),
+    (True, STALE_CHECKPOINT),
+  ],
+)
 @pytest.mark.parametrize('second_kind', ['servfail', 'nodata'])
 async def test_partial_cycle_adds_reliable_ip_without_postponing_retry(
-  app, store, resolver, network, resolved, checkpoint, second_kind,
+  app,
+  store,
+  resolver,
+  network,
+  resolved,
+  checkpoint,
+  second_kind,
 ):
   await seed(app, store, resolved=resolved, checkpoint=checkpoint)
   before = await snapshot(app, store)
@@ -99,7 +131,9 @@ async def test_partial_cycle_adds_reliable_ip_without_postponing_retry(
   assert after[0] == before[0]
   assert {key: after[1][key] for key in before[1]} == before[1]
   assert set(after[1].values()) == set(before[1].values()) | {'8.8.8.8'}
-  eligible = await (store.get_new_domains_for_resolve() if checkpoint is None else store.get_stale_domains_for_resolve())
+  eligible = await (
+    store.get_new_domains_for_resolve() if checkpoint is None else store.get_stale_domains_for_resolve()
+  )
   assert [domain.id for domain in eligible] == [1]
 
 
@@ -109,7 +143,8 @@ async def test_complete_cycle_reconciles_only_ipv4_and_checkpoints_atomically(ap
   network({'192.0.2.53': kind})
   await resolver._DomainsResolver__dns_main_tasker(
     domain=app.dto.DomainResult(id=1, name='www.example.test'),
-    default_dns_servers=[app.Server(server='192.0.2.53')], doh_dns_servers=[],
+    default_dns_servers=[app.Server(server='192.0.2.53')],
+    doh_dns_servers=[],
   )
   assert (await snapshot(app, store))[0] == (False, None)
   commands = await flush_queue(store)
@@ -148,10 +183,12 @@ async def test_checkpoint_failure_rolls_back_ip_addition_and_deletion(app, store
   await seed(app, store)
   before = await snapshot(app, store)
   async with store._DataBase__write_engine.begin() as connection:
-    await connection.execute(text(
-      'CREATE TRIGGER refuse_checkpoint BEFORE UPDATE OF resolved ON rdpr_domains '
-      "BEGIN SELECT RAISE(ABORT, 'synthetic checkpoint rejection'); END"
-    ))
+    await connection.execute(
+      text(
+        'CREATE TRIGGER refuse_checkpoint BEFORE UPDATE OF resolved ON rdpr_domains '
+        "BEGIN SELECT RAISE(ABORT, 'synthetic checkpoint rejection'); END"
+      )
+    )
   command = app.dto.DomainResult(id=1, name='www.example.test', resolution_complete=True)
   command.insert.ips_insert = [app.Ip(ip_address='8.8.4.4', addr_type=4)]
   command.insert.ips_delete = [10]
@@ -186,12 +223,13 @@ async def test_connection_open_failure_remains_typed_without_uninitialized_clean
 
 @pytest.mark.parametrize('kind', ['servfail', 'empty'])
 async def test_all_failure_cycle_never_enqueues_or_changes_storage(app, store, resolver, network, kind):
-  await seed(app, store, resolved=True, checkpoint=datetime(2000, 1, 1))
+  await seed(app, store, resolved=True, checkpoint=STALE_CHECKPOINT)
   before = await snapshot(app, store)
   network({'192.0.2.53': kind})
   await resolver._DomainsResolver__dns_main_tasker(
     domain=app.dto.DomainResult(id=1, name='www.example.test'),
-    default_dns_servers=[app.Server(server='192.0.2.53')], doh_dns_servers=[],
+    default_dns_servers=[app.Server(server='192.0.2.53')],
+    doh_dns_servers=[],
   )
   assert await flush_queue(store) == []
   assert await snapshot(app, store) == before
@@ -199,22 +237,35 @@ async def test_all_failure_cycle_never_enqueues_or_changes_storage(app, store, r
 
 async def enqueue_names(app, store, names):
   for name in names:
-    await store.put_add_domains_to_queue([
-      app.database.DomainsPostElementReq(domain=name),
-    ])
+    await store.put_add_domains_to_queue(
+      [
+        app.database.DomainsPostElementReq(domain=name),
+      ]
+    )
 
 
 async def stored_names(app, store):
   async with store._DataBase__read_engine.connect() as connection:
-    return (await connection.execute(
-      select(app.database.DomainsDbo.name).order_by(app.database.DomainsDbo.name),
-    )).scalars().all()
+    return (
+      (
+        await connection.execute(
+          select(app.database.DomainsDbo.name).order_by(app.database.DomainsDbo.name),
+        )
+      )
+      .scalars()
+      .all()
+    )
 
 
 def instrument_sessions(store, monkeypatch, *, fault=None, before_commit=None):
   """Inject faults at the driver boundary while retaining real SQL and cleanup."""
   evidence = SimpleNamespace(
-    begins=0, commits=0, rollbacks=0, closes=0, sessions=[], commit_queues=[],
+    begins=0,
+    commits=0,
+    rollbacks=0,
+    closes=0,
+    sessions=[],
+    commit_queues=[],
   )
 
   class ObservedSession(AsyncSession):
@@ -272,11 +323,24 @@ def lock_error(code=sqlite3.SQLITE_BUSY):
   return OperationalError('synthetic private SQL statement', {}, error)
 
 
-@pytest.mark.parametrize(('batch_size', 'count'), [
-  (3, 2), (3, 3), (3, 4), (1, 1), (1, 4), (3, 9), (3, 10),
-])
+@pytest.mark.parametrize(
+  ('batch_size', 'count'),
+  [
+    (3, 2),
+    (3, 3),
+    (3, 4),
+    (1, 1),
+    (1, 4),
+    (3, 9),
+    (3, 10),
+  ],
+)
 async def test_writer_persists_every_admitted_event_across_batch_boundaries(
-  app, store, monkeypatch, batch_size, count,
+  app,
+  store,
+  monkeypatch,
+  batch_size,
+  count,
 ):
   monkeypatch.setattr(app.settings, 'db_save_batch_size', batch_size)
   monkeypatch.setattr(app.settings, 'db_save_batch_timeout', 0.01)
@@ -444,21 +508,31 @@ async def test_shutdown_wakes_blocked_producer_without_admitting_its_event(app, 
     release.set()
   await asyncio.wait_for(closing, timeout=2)
   assert await stored_names(app, store) == [
-    'accepted-first.example.test', 'accepted-second.example.test',
+    'accepted-first.example.test',
+    'accepted-second.example.test',
   ]
   assert await store.put_delete_ip_records_to_queue([10]) is False
   assert await store.put_delete_ip_records_to_queue([]) is True
 
 
-@pytest.mark.parametrize('method_name', [
-  'put_add_dns_servers_to_queue', 'put_delete_dns_servers_to_queue',
-  'put_add_domains_lists_to_queue', 'put_delete_domains_list_to_queue',
-  'put_add_domains_to_queue', 'put_delete_domains_to_queue',
-  'put_add_ips_lists_to_queue', 'put_delete_ips_list_to_queue',
-  'put_add_ips_to_queue', 'put_delete_ips_to_queue',
-  'put_add_ros_configs_to_queue', 'put_delete_ros_configs_to_queue',
-  'put_domain_after_resolve',
-])
+@pytest.mark.parametrize(
+  'method_name',
+  [
+    'put_add_dns_servers_to_queue',
+    'put_delete_dns_servers_to_queue',
+    'put_add_domains_lists_to_queue',
+    'put_delete_domains_list_to_queue',
+    'put_add_domains_to_queue',
+    'put_delete_domains_to_queue',
+    'put_add_ips_lists_to_queue',
+    'put_delete_ips_list_to_queue',
+    'put_add_ips_to_queue',
+    'put_delete_ips_to_queue',
+    'put_add_ros_configs_to_queue',
+    'put_delete_ros_configs_to_queue',
+    'put_domain_after_resolve',
+  ],
+)
 async def test_producer_methods_propagate_closed_admission(app, store, method_name):
   await store.close(timeout=2)
   method = getattr(store, method_name)
@@ -473,10 +547,15 @@ async def test_producer_methods_propagate_closed_admission(app, store, method_na
   assert store.pending_count == 0
 
 
-@pytest.mark.parametrize('code', [
-  sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED,
-  sqlite3.SQLITE_BUSY | (2 << 8), sqlite3.SQLITE_LOCKED | (1 << 8),
-])
+@pytest.mark.parametrize(
+  'code',
+  [
+    sqlite3.SQLITE_BUSY,
+    sqlite3.SQLITE_LOCKED,
+    sqlite3.SQLITE_BUSY | (2 << 8),
+    sqlite3.SQLITE_LOCKED | (1 << 8),
+  ],
+)
 async def test_known_precommit_lock_retries_same_batch_then_persists(app, store, monkeypatch, code):
   monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
   delays = []
@@ -502,16 +581,24 @@ async def test_known_precommit_lock_retries_same_batch_then_persists(app, store,
   assert evidence.commit_queues[0] == 1
 
 
-@pytest.mark.parametrize(('stage', 'error_kind', 'expected_attempts'), [
-  ('begin', 'lock', 3),
-  ('begin', 'generic', 1),
-  ('after_insert', 'generic', 1),
-  ('after_insert', 'cancelled', 1),
-  ('commit', 'lock', 1),
-  ('after_commit', 'lock', 1),
-])
+@pytest.mark.parametrize(
+  ('stage', 'error_kind', 'expected_attempts'),
+  [
+    ('begin', 'lock', 3),
+    ('begin', 'generic', 1),
+    ('after_insert', 'generic', 1),
+    ('after_insert', 'cancelled', 1),
+    ('commit', 'lock', 1),
+    ('after_commit', 'lock', 1),
+  ],
+)
 async def test_terminal_write_failure_retains_work_and_never_replays_ambiguity(
-  app, store, monkeypatch, stage, error_kind, expected_attempts,
+  app,
+  store,
+  monkeypatch,
+  stage,
+  error_kind,
+  expected_attempts,
 ):
   monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
   delays = []
@@ -755,7 +842,7 @@ async def test_lifespan_always_attempts_database_and_http_cleanup(app, monkeypat
       await run_lifespan()
     assert raised.value is failure
   expected = ['setup'] + ([] if failure_stage == 'setup' else ['body'])
-  assert events == expected + ['database_close', 'http_close']
+  assert events == [*expected, 'database_close', 'http_close']
 
 
 async def test_waiting_producer_is_admitted_when_capacity_becomes_available(app, store, monkeypatch):
@@ -789,7 +876,9 @@ async def test_waiting_producer_is_admitted_when_capacity_becomes_available(app,
   await asyncio.wait_for(producer, timeout=2)
   await asyncio.wait_for(store.db_save_queue.join(), timeout=2)
   assert await stored_names(app, store) == [
-    'capacity-first.example.test', 'capacity-second.example.test', 'capacity-third.example.test',
+    'capacity-first.example.test',
+    'capacity-second.example.test',
+    'capacity-third.example.test',
   ]
 
 
@@ -801,7 +890,10 @@ async def test_nonblocking_deletion_acknowledges_admission_before_commit(app, st
   await store.start_writer()
   await asyncio.wait_for(store.db_save_queue.join(), timeout=2)
   assert (await snapshot(app, store))[1] == {
-    11: '2001:4860:4860::8888', 12: '8.8.8.0/24', 13: '8.8.8.0', 14: '8.8.8.0/25',
+    11: '2001:4860:4860::8888',
+    12: '8.8.8.0/24',
+    13: '8.8.8.0',
+    14: '8.8.8.0/25',
   }
 
 
@@ -831,7 +923,10 @@ async def test_idle_writer_waits_for_queue_without_opening_sessions(app, store, 
 
 @pytest.mark.parametrize('interruption', ['deadline', 'writer_cancel'])
 async def test_backoff_interruption_retains_known_uncommitted_work(
-  app, store, monkeypatch, interruption,
+  app,
+  store,
+  monkeypatch,
+  interruption,
 ):
   monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
   entered = asyncio.Event()
@@ -878,16 +973,23 @@ async def test_backoff_interruption_retains_known_uncommitted_work(
   assert store.db_save_queue.qsize() == 1
   assert store.db_save_queue._unfinished_tasks == 2
   # No commit was entered, so the retained commands have a known outcome.
-  assert (store.unknown_count, store.writer_failure.unknown_count,
-          store.writer_failure.outcome_unknown) == (0, 0, False)
+  assert (store.unknown_count, store.writer_failure.unknown_count, store.writer_failure.outcome_unknown) == (
+    0,
+    0,
+    False,
+  )
 
 
 @pytest.mark.parametrize('parent', ['domain', 'domain_list'])
 async def test_writer_parent_deletion_cascades_linked_ips(app, store, monkeypatch, parent):
   async with store._DataBase__write_engine.begin() as connection:
-    await connection.execute(insert(app.database.DomainsListsDbo).values(
-      id=5, name='linked', url='https://example.test/domains',
-    ))
+    await connection.execute(
+      insert(app.database.DomainsListsDbo).values(
+        id=5,
+        name='linked',
+        url='https://example.test/domains',
+      )
+    )
   await seed(app, store)
   async with store._DataBase__write_engine.begin() as connection:
     await connection.execute(text('UPDATE rdpr_domains SET domain_list_id=5 WHERE id=1'))
@@ -933,7 +1035,9 @@ async def test_mixed_domain_delete_and_partial_resolution_preserve_grouping(app,
 
 
 async def test_late_resolution_after_parent_deletion_fails_without_orphan_or_replay(
-  app, store, monkeypatch,
+  app,
+  store,
+  monkeypatch,
 ):
   await seed(app, store)
   monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
@@ -966,7 +1070,11 @@ async def test_late_resolution_after_parent_deletion_fails_without_orphan_or_rep
 
 @pytest.mark.parametrize('failure_stage', [None, 'migration', 'history_read', 'history_write'])
 async def test_setup_observes_runner_failures_and_preserves_migration_history(
-  app, store, monkeypatch, tmp_path, failure_stage,
+  app,
+  store,
+  monkeypatch,
+  tmp_path,
+  failure_stage,
 ):
   paths = []
   async with store._DataBase__write_engine.begin() as connection:
@@ -975,18 +1083,26 @@ async def test_setup_observes_runner_failures_and_preserves_migration_history(
     path = tmp_path / 'migrations' / name
     failure = "  raise RuntimeError('synthetic migration failure')\n" if failure_stage == 'migration' else ''
     path.write_text(
-      'from sqlalchemy import text\n'
-      'async def upgrade(conn):\n'
-      f"  await conn.execute(text(\"INSERT INTO migration_steps VALUES ('{name}:up')\"))\n"
-      + failure
-      + 'async def downgrade(conn):\n'
-      f"  await conn.execute(text(\"INSERT INTO migration_steps VALUES ('{name}:down')\"))\n",
+      '\n'.join(
+        [
+          'from sqlalchemy import text',
+          f'STEP = {name!r}',
+          'async def upgrade(conn):',
+          '  await conn.execute(text("INSERT INTO migration_steps VALUES (:step)"), {"step": STEP + ":up"})',
+          failure.rstrip('\n'),
+          'async def downgrade(conn):',
+          '  await conn.execute(text("INSERT INTO migration_steps VALUES (:step)"), {"step": STEP + ":down"})',
+          '',
+        ]
+      ),
       encoding='utf-8',
     )
     paths.append(path)
   if failure_stage == 'history_read':
+
     async def unavailable_history(cls, conn):
       raise RuntimeError('synthetic history failure')
+
     monkeypatch.setattr(app.database.MigrationsDbo, 'get_all', classmethod(unavailable_history))
   elif failure_stage == 'history_write':
     original_execute = app.database.AsyncConnection.execute
@@ -1011,12 +1127,18 @@ async def test_setup_observes_runner_failures_and_preserves_migration_history(
   if failure_stage in {None, 'migration'}:
     async with store._DataBase__read_engine.connect() as connection:
       steps = (await connection.execute(text('SELECT step FROM migration_steps ORDER BY rowid'))).scalars().all()
-      history = (await connection.execute(select(
-        app.database.MigrationsDbo.name, app.database.MigrationsDbo.checksum,
-        app.database.MigrationsDbo.applied_at,
-      ).order_by(app.database.MigrationsDbo.name))).all()
+      history = (
+        await connection.execute(
+          select(
+            app.database.MigrationsDbo.name,
+            app.database.MigrationsDbo.checksum,
+            app.database.MigrationsDbo.applied_at,
+          ).order_by(app.database.MigrationsDbo.name)
+        )
+      ).all()
     assert steps == [
-      f'{name}:{direction}' for name in ['migration_a.py', 'migration_b.py']
+      f'{name}:{direction}'
+      for name in ['migration_a.py', 'migration_b.py']
       for direction in (['up'] if failure_stage else ['up', 'down'])
     ]
     assert [(row.name, row.checksum) for row in history] == [
@@ -1051,3 +1173,203 @@ async def test_lifespan_database_error_keeps_priority_when_http_cleanup_also_fai
         events.append('body')
   assert raised.value is database_failure
   assert events == ['setup', 'body', 'database_close', 'http_close']
+
+
+async def configure_public_domain(service, *, resolved=True):
+  """Create the domain and provider settings through the actual writer/API."""
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    response = await client.post('/dns', json=[{'server': service.dns_host}, {'doh_server': service.doh_url}])
+    assert response.status_code == 200, response.text
+    response = await client.post('/domains', json=[{'domain': 'www.example.test'}])
+    assert response.status_code == 200, response.text
+    async with asyncio.timeout(5):
+      while True:
+        domains = await client.get('/domains')
+        dns_servers = await client.get('/dns', params={'default': 'false'})
+        assert domains.status_code == dns_servers.status_code == 200
+        records = [row for row in domains.json()['payload'] if row['name'] == 'www.example.test']
+        configured = dns_servers.json()['payload']
+        if records and len(configured) == 2:
+          domain_id = records[0]['id']
+          break
+        await asyncio.sleep(0.02)
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    connection.execute(
+      'UPDATE rdpr_domains SET resolved=?, last_resolved_at=? WHERE id=?',
+      (int(resolved), '2000-01-01 00:00:00' if resolved else None, domain_id),
+    )
+    connection.executemany(
+      'INSERT INTO rdpr_ip_records (domain_id, addr_type, ip_address, ros_comment, use_default_gw) '
+      'VALUES (?, ?, ?, ?, ?)',
+      [
+        (domain_id, 4, '9.9.9.9', 'existing IPv4', 1),
+        (domain_id, 6, '2001:4860:4860::8888', 'existing IPv6', 1),
+      ],
+    )
+  return domain_id
+
+
+def public_flow_snapshot(service, domain_id):
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    domain = connection.execute(
+      'SELECT resolved, last_resolved_at FROM rdpr_domains WHERE id=?',
+      (domain_id,),
+    ).fetchone()
+    rows = connection.execute(
+      'SELECT id, addr_type, ip_address, ros_comment, use_default_gw, created_at, updated_at '
+      'FROM rdpr_ip_records WHERE domain_id=? ORDER BY id',
+      (domain_id,),
+    ).fetchall()
+  return domain, {row[2]: row for row in rows}
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+  ('classic', 'doh', 'complete', 'addresses'),
+  [
+    ('positive', 'positive', True, {'8.8.8.8', '8.8.4.4'}),
+    ('nxdomain', 'nodata', True, set()),
+    ('nodata', 'nxdomain', True, set()),
+    ('positive', 'servfail', False, {'8.8.8.8'}),
+    ('servfail', 'positive', False, {'8.8.4.4'}),
+    ('positive', 'nodata', False, {'8.8.8.8'}),
+    ('nxdomain', 'positive', False, {'8.8.4.4'}),
+    ('servfail', 'empty', False, set()),
+  ],
+)
+async def test_public_resolution_reconciles_only_complete_trustworthy_ipv4(
+  e2e_service,
+  classic,
+  doh,
+  complete,
+  addresses,
+):
+  service = e2e_service
+  service.providers.classic, service.providers.doh = classic, doh
+  domain_id = await configure_public_domain(service)
+  before_domain, before_ips = public_flow_snapshot(service, domain_id)
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    assert 'use_default_gw' in {row[1] for row in connection.execute('PRAGMA table_info(rdpr_ip_records)')}
+    history = connection.execute('SELECT name, checksum, applied_at FROM rdpr_migrations ORDER BY name').fetchall()
+  migrations = sorted((service.root / 'migrations').glob('migration_*.py'))
+  assert [(row[0], row[1]) for row in history] == [
+    (path.name, sha256(path.read_text(encoding='utf-8').encode()).hexdigest()) for path in migrations
+  ]
+  assert all(row[2] is not None for row in history)
+
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    response = await client.post('/domains/resolve/check', json={'domain': 'www.example.test.'})
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert set(payload) == {'domain', 'results'}
+    assert payload['domain'] == 'www.example.test'
+    by_transport = {row['server_type']: row for row in payload['results']}
+    assert set(by_transport) == {'classic', 'doh'}
+    for transport, kind, server, expected in [
+      ('classic', classic, service.dns_host, ['8.8.8.8']),
+      ('doh', doh, service.doh_url, ['8.8.4.4']),
+    ]:
+      assert by_transport[transport] == {
+        'server': server,
+        'server_type': transport,
+        'ips_v4': expected if kind == 'positive' else [],
+        'ips_v6': [],
+        'cnames': [],
+      }
+    assert public_flow_snapshot(service, domain_id) == (before_domain, before_ips)
+    service.providers.requests.clear()
+    response = await client.post(f'/domains/{domain_id}/resolve')
+    assert response.status_code == 202, response.text
+    assert response.json()['result'] == 'Domain resolving accepted'
+  # Uvicorn awaits the real background task; lifespan then drains the writer.
+  await service.stop()
+  domain, ips = public_flow_snapshot(service, domain_id)
+  assert ips['2001:4860:4860::8888'] == before_ips['2001:4860:4860::8888']
+  if complete:
+    assert domain[0] == 1
+    assert domain[1] != before_domain[1]
+    assert datetime.fromisoformat(domain[1]).replace(tzinfo=UTC) > STALE_CHECKPOINT.replace(tzinfo=UTC)
+    assert set(ips) == {'2001:4860:4860::8888'} | addresses
+  else:
+    assert domain == before_domain
+    assert {address: ips[address] for address in before_ips} == before_ips
+    assert set(ips) == set(before_ips) | addresses
+  assert {(row[0], row[2]) for row in service.providers.requests} == {
+    ('classic', dns.rdatatype.A),
+    ('classic', dns.rdatatype.CNAME),
+    ('doh', dns.rdatatype.A),
+    ('doh', dns.rdatatype.CNAME),
+  }
+
+  if not complete:
+    # A new process runs the public stale job without a manual per-domain override.
+    service.providers.classic = service.providers.doh = 'positive'
+    service.providers.requests.clear()
+    await service.start()
+    async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+      response = await client.post('/commands/domains/resolve/stale')
+      assert response.status_code == 200, response.text
+      async with asyncio.timeout(5):
+        while public_flow_snapshot(service, domain_id)[0][1] == before_domain[1]:
+          await asyncio.sleep(0.02)
+      response = await client.get(f'/domains/{domain_id}')
+      assert response.status_code == 200, response.text
+      assert set(response.json()['ips_v4']) == {'8.8.8.8', '8.8.4.4'}
+      assert response.json()['ips_v6'] == ['2001:4860:4860::8888']
+    await service.stop()
+    assert set(public_flow_snapshot(service, domain_id)[1]) == {
+      '8.8.8.8',
+      '8.8.4.4',
+      '2001:4860:4860::8888',
+    }
+
+
+@pytest.mark.e2e
+async def test_failed_new_domain_remains_eligible_for_the_public_new_job(e2e_service):
+  service = e2e_service
+  service.providers.classic = 'servfail'
+  service.providers.doh = 'empty'
+  domain_id = await configure_public_domain(service, resolved=False)
+  before = public_flow_snapshot(service, domain_id)
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    response = await client.post('/commands/domains/resolve/new')
+    assert response.status_code == 200, response.text
+  await service.stop()
+  assert public_flow_snapshot(service, domain_id) == before
+  assert {(row[0], row[2]) for row in service.providers.requests} == {
+    ('classic', dns.rdatatype.A),
+    ('classic', dns.rdatatype.CNAME),
+    ('doh', dns.rdatatype.A),
+    ('doh', dns.rdatatype.CNAME),
+  }
+  service.providers.classic = service.providers.doh = 'positive'
+  await service.start()
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    response = await client.post('/commands/domains/resolve/new')
+    assert response.status_code == 200, response.text
+    async with asyncio.timeout(5):
+      while public_flow_snapshot(service, domain_id)[0][1] is None:
+        await asyncio.sleep(0.02)
+  await service.stop()
+  domain, ips = public_flow_snapshot(service, domain_id)
+  assert domain[0] == 1
+  assert set(ips) == {'8.8.8.8', '8.8.4.4', '2001:4860:4860::8888'}
+  assert ips['2001:4860:4860::8888'] == before[1]['2001:4860:4860::8888']
+
+
+@pytest.mark.e2e
+async def test_public_queue_tail_is_persisted_by_real_lifespan_shutdown(e2e_service):
+  service = e2e_service
+  await service.stop()
+  service.environment['DB_SAVE_BATCH_TIMEOUT'] = '3600'
+  await service.start()
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    response = await client.post('/domains', json=[{'domain': 'tail.example.test'}])
+    assert response.status_code == 200, response.text
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    assert connection.execute('SELECT name FROM rdpr_domains WHERE name=?', ('tail.example.test',)).fetchall() == []
+  await service.stop()
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    assert connection.execute('SELECT name FROM rdpr_domains WHERE name=?', ('tail.example.test',)).fetchall() == [
+      ('tail.example.test',),
+    ]

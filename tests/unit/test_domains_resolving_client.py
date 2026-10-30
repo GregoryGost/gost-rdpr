@@ -17,40 +17,43 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.mark.parametrize('transport', ['classic', 'doh'])
-@pytest.mark.parametrize(('kind', 'expected'), [
-  ('positive', 'ADDRESSES'),
-  ('positive-unrelated', 'ADDRESSES'),
-  ('alias-positive', 'ADDRESSES'),
-  ('alias-duplicate', 'ADDRESSES'),
-  ('nxdomain', 'ABSENT'),
-  ('nxdomain-ns', 'ABSENT'),
-  ('alias-nxdomain', 'ABSENT'),
-  ('nodata', 'ABSENT'),
-  ('alias-nodata', 'ABSENT'),
-  ('empty', 'FAILURE'),
-  ('cname-only', 'FAILURE'),
-  ('foreign-soa', 'FAILURE'),
-  ('wrong-soa-class', 'FAILURE'),
-  ('unrelated-negative', 'FAILURE'),
-  ('referral', 'FAILURE'),
-  ('nxdomain-positive', 'FAILURE'),
-  ('servfail', 'FAILURE'),
-  ('refused', 'FAILURE'),
-  ('wrong-name', 'FAILURE'),
-  ('wrong-type', 'FAILURE'),
-  ('wrong-class', 'FAILURE'),
-  ('multiple-questions', 'FAILURE'),
-  ('no-question', 'FAILURE'),
-  ('not-response', 'FAILURE'),
-  ('truncated', 'FAILURE'),
-  ('wrong-opcode', 'FAILURE'),
-  ('alias-cycle', 'FAILURE'),
-  ('alias-address-collision', 'FAILURE'),
-  ('alias-conflict', 'FAILURE'),
-  ('aaaa-only', 'FAILURE'),
-  ('chain-limit', 'FAILURE'),
-  ('chain-below-limit', 'ADDRESSES'),
-])
+@pytest.mark.parametrize(
+  ('kind', 'expected'),
+  [
+    ('positive', 'ADDRESSES'),
+    ('positive-unrelated', 'ADDRESSES'),
+    ('alias-positive', 'ADDRESSES'),
+    ('alias-duplicate', 'ADDRESSES'),
+    ('nxdomain', 'ABSENT'),
+    ('nxdomain-ns', 'ABSENT'),
+    ('alias-nxdomain', 'ABSENT'),
+    ('nodata', 'ABSENT'),
+    ('alias-nodata', 'ABSENT'),
+    ('empty', 'FAILURE'),
+    ('cname-only', 'FAILURE'),
+    ('foreign-soa', 'FAILURE'),
+    ('wrong-soa-class', 'FAILURE'),
+    ('unrelated-negative', 'FAILURE'),
+    ('referral', 'FAILURE'),
+    ('nxdomain-positive', 'FAILURE'),
+    ('servfail', 'FAILURE'),
+    ('refused', 'FAILURE'),
+    ('wrong-name', 'FAILURE'),
+    ('wrong-type', 'FAILURE'),
+    ('wrong-class', 'FAILURE'),
+    ('multiple-questions', 'FAILURE'),
+    ('no-question', 'FAILURE'),
+    ('not-response', 'FAILURE'),
+    ('truncated', 'FAILURE'),
+    ('wrong-opcode', 'FAILURE'),
+    ('alias-cycle', 'FAILURE'),
+    ('alias-address-collision', 'FAILURE'),
+    ('alias-conflict', 'FAILURE'),
+    ('aaaa-only', 'FAILURE'),
+    ('chain-limit', 'FAILURE'),
+    ('chain-below-limit', 'ADDRESSES'),
+  ],
+)
 async def test_query_requires_trustworthy_ipv4_evidence(app, resolver, network, transport, kind, expected):
   server = '192.0.2.53' if transport == 'classic' else 'https://dns.example.test/dns-query'
   network({server: kind}, transport=transport)
@@ -76,25 +79,30 @@ async def test_classic_missing_response_is_failure(app, resolver, network, excep
   network({server: exception})
   outcome = await resolver._DomainsResolver__default_resolver(
     domain=app.dto.DomainResult(id=1, name='www.example.test'),
-    dns_server=app.Server(server=server), lookup_type=dns.rdatatype.A,
+    dns_server=app.Server(server=server),
+    lookup_type=dns.rdatatype.A,
   )
   assert outcome.status == app.dto.DnsQueryStatus.FAILURE
   assert outcome.addresses == ()
 
 
-@pytest.mark.parametrize(('status', 'media', 'mutation'), [
-  (503, 'application/dns-message', None),
-  (200, 'application/json', None),
-  (200, 'application/dns-message', lambda wire: b'broken'),
-  (200, 'application/dns-message', lambda wire: wire + b'trailing'),
-  (200, 'application/dns-message', lambda wire: bytes([wire[0] ^ 1]) + wire[1:]),
-])
+@pytest.mark.parametrize(
+  ('status', 'media', 'mutation'),
+  [
+    (503, 'application/dns-message', None),
+    (200, 'application/json', None),
+    (200, 'application/dns-message', lambda wire: b'broken'),
+    (200, 'application/dns-message', lambda wire: wire + b'trailing'),
+    (200, 'application/dns-message', lambda wire: bytes([wire[0] ^ 1]) + wire[1:]),
+  ],
+)
 async def test_doh_rejects_invalid_http_and_wire_contract(app, resolver, network, status, media, mutation):
   server = 'https://dns.example.test/dns-query'
   network({server: 'positive'}, transport='doh', status=status, media=media, mutate_wire=mutation)
   outcome = await resolver._DomainsResolver__doh_resolver(
     domain=app.dto.DomainResult(id=1, name='www.example.test'),
-    dns_server=app.Server(server=server), lookup_type=dns.rdatatype.A,
+    dns_server=app.Server(server=server),
+    lookup_type=dns.rdatatype.A,
   )
   assert outcome.status == app.dto.DnsQueryStatus.FAILURE
   assert outcome.addresses == ()
@@ -105,7 +113,8 @@ async def test_doh_accepts_normalized_dns_media_type(app, resolver, network):
   network({server: 'positive'}, transport='doh', media='Application/DNS-Message; charset=binary')
   outcome = await resolver._DomainsResolver__doh_resolver(
     domain=app.dto.DomainResult(id=1, name='www.example.test'),
-    dns_server=app.Server(server=server), lookup_type=dns.rdatatype.A,
+    dns_server=app.Server(server=server),
+    lookup_type=dns.rdatatype.A,
   )
   assert outcome.status == app.dto.DnsQueryStatus.ADDRESSES
   assert outcome.addresses == ('8.8.8.8',)
@@ -117,7 +126,8 @@ async def test_doh_failure_does_not_log_body_or_exception_payload(app, resolver,
   network({server: httpx.ReadTimeout(marker)}, transport='doh')
   outcome = await resolver._DomainsResolver__doh_resolver(
     domain=app.dto.DomainResult(id=1, name='www.example.test'),
-    dns_server=app.Server(server=server), lookup_type=dns.rdatatype.A,
+    dns_server=app.Server(server=server),
+    lookup_type=dns.rdatatype.A,
   )
   assert outcome.status == app.dto.DnsQueryStatus.FAILURE
   assert marker not in caplog.text
@@ -132,21 +142,25 @@ async def test_doh_http_failure_does_not_log_response_body(app, resolver, caplog
   caplog.set_level(logging.ERROR)
   outcome = await resolver._DomainsResolver__doh_resolver(
     domain=app.dto.DomainResult(id=1, name='www.example.test'),
-    dns_server=app.Server(server='https://dns.example.test/dns-query'), lookup_type=dns.rdatatype.A,
+    dns_server=app.Server(server='https://dns.example.test/dns-query'),
+    lookup_type=dns.rdatatype.A,
   )
   assert outcome.status == app.dto.DnsQueryStatus.FAILURE
   assert marker not in caplog.text
   assert marker not in (outcome.reason or '')
 
 
-@pytest.mark.parametrize(('kinds', 'complete', 'ips'), [
-  (['positive', 'positive'], True, {'8.8.8.8'}),
-  (['positive', 'nodata'], False, {'8.8.8.8'}),
-  (['positive', 'servfail'], False, {'8.8.8.8'}),
-  (['nxdomain', 'nodata'], True, set()),
-  (['servfail', 'empty'], False, set()),
-  ([], False, set()),
-])
+@pytest.mark.parametrize(
+  ('kinds', 'complete', 'ips'),
+  [
+    (['positive', 'positive'], True, {'8.8.8.8'}),
+    (['positive', 'nodata'], False, {'8.8.8.8'}),
+    (['positive', 'servfail'], False, {'8.8.8.8'}),
+    (['nxdomain', 'nodata'], True, set()),
+    (['servfail', 'empty'], False, set()),
+    ([], False, set()),
+  ],
+)
 async def test_cycle_completion_controls_mutation(app, resolver, repository, network, kinds, complete, ips):
   servers = [f'192.0.2.{index + 1}' for index in range(len(kinds))]
   network(dict(zip(servers, kinds, strict=True)))
@@ -156,7 +170,9 @@ async def test_cycle_completion_controls_mutation(app, resolver, repository, net
   ]
   domain = app.dto.DomainResult(id=1, name='www.example.test')
   await resolver._DomainsResolver__dns_main_tasker(
-    domain=domain, default_dns_servers=[app.Server(server=value) for value in servers], doh_dns_servers=[],
+    domain=domain,
+    default_dns_servers=[app.Server(server=value) for value in servers],
+    doh_dns_servers=[],
   )
   assert domain.resolution_complete is complete
   if complete or ips:
@@ -168,7 +184,9 @@ async def test_cycle_completion_controls_mutation(app, resolver, repository, net
     repository.put_domain_after_resolve.assert_not_awaited()
 
 
-async def test_distinct_server_addresses_are_unioned_before_reconciliation(app, resolver, repository, monkeypatch, dns_message):
+async def test_distinct_server_addresses_are_unioned_before_reconciliation(
+  app, resolver, repository, monkeypatch, dns_message
+):
   async def classic(boundary, qname, rdtype, **kwargs):
     message = dns_message(query=dns.message.make_query(qname, rdtype), addresses=(boundary.nameservers[0],))
     return SimpleNamespace(response=message)
@@ -176,7 +194,8 @@ async def test_distinct_server_addresses_are_unioned_before_reconciliation(app, 
   monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
   domain = app.dto.DomainResult(id=1, name='www.example.test')
   await resolver._DomainsResolver__dns_main_tasker(
-    domain=domain, default_dns_servers=[app.Server(server='8.8.8.8'), app.Server(server='9.9.9.9')],
+    domain=domain,
+    default_dns_servers=[app.Server(server='8.8.8.8'), app.Server(server='9.9.9.9')],
     doh_dns_servers=[],
   )
   queued = repository.put_domain_after_resolve.await_args.kwargs['domain']
@@ -189,7 +208,8 @@ async def test_storage_read_failure_enqueues_nothing(app, resolver, repository, 
   repository.get_all_ips_for_domain.side_effect = app.database.DomainIpReadError('Unable to read domain IPs')
   await resolver._DomainsResolver__dns_main_tasker(
     domain=app.dto.DomainResult(id=1, name='www.example.test'),
-    default_dns_servers=[app.Server(server='192.0.2.53')], doh_dns_servers=[],
+    default_dns_servers=[app.Server(server='192.0.2.53')],
+    doh_dns_servers=[],
   )
   repository.put_domain_after_resolve.assert_not_awaited()
 
@@ -199,7 +219,9 @@ async def test_storage_mapping_failure_is_typed_and_session_is_released(app, mon
   store = app.database.db
   monkeypatch.setattr(store, '_DataBase__read_connect', AsyncMock(return_value=session))
   monkeypatch.setattr(
-    app.database.IpRecordsDbo, 'get_ips_on_domain_id_extend', AsyncMock(return_value=[()]),
+    app.database.IpRecordsDbo,
+    'get_ips_on_domain_id_extend',
+    AsyncMock(return_value=[()]),
   )
   with pytest.raises(app.database.DomainIpReadError) as failure:
     await store.get_all_ips_for_domain(domain_id=1)
@@ -209,7 +231,9 @@ async def test_storage_mapping_failure_is_typed_and_session_is_released(app, mon
 
 
 @pytest.mark.parametrize('complete', [False, True])
-async def test_policy_filtering_does_not_change_positive_cycle_status(app, resolver, repository, monkeypatch, dns_message, complete):
+async def test_policy_filtering_does_not_change_positive_cycle_status(
+  app, resolver, repository, monkeypatch, dns_message, complete
+):
   async def classic(boundary, qname, rdtype, **kwargs):
     if boundary.nameservers[0] == '192.0.2.54':
       return SimpleNamespace(response=dns_message('nxdomain', query=dns.message.make_query(qname, rdtype)))
@@ -220,7 +244,9 @@ async def test_policy_filtering_does_not_change_positive_cycle_status(app, resol
   domain = app.dto.DomainResult(id=1, name='www.example.test')
   servers = ['192.0.2.53'] if complete else ['192.0.2.53', '192.0.2.54']
   await resolver._DomainsResolver__dns_main_tasker(
-    domain=domain, default_dns_servers=[app.Server(server=value) for value in servers], doh_dns_servers=[],
+    domain=domain,
+    default_dns_servers=[app.Server(server=value) for value in servers],
+    doh_dns_servers=[],
   )
   assert domain.resolution_complete is complete
   assert domain.insert.ips_insert == []
@@ -228,7 +254,9 @@ async def test_policy_filtering_does_not_change_positive_cycle_status(app, resol
 
 
 @pytest.mark.parametrize('stored', ['8.8.8.0', '8.8.8.0/24', '8.8.8.0/25'])
-async def test_partial_cycle_preserves_existing_representation_without_enrichment(app, resolver, repository, monkeypatch, dns_message, stored):
+async def test_partial_cycle_preserves_existing_representation_without_enrichment(
+  app, resolver, repository, monkeypatch, dns_message, stored
+):
   async def classic(boundary, qname, rdtype, **kwargs):
     if boundary.nameservers[0] == '192.0.2.54':
       raise dns.exception.Timeout()
@@ -240,7 +268,9 @@ async def test_partial_cycle_preserves_existing_representation_without_enrichmen
   resolver._DomainsResolver__ripe_stat_client = SimpleNamespace(get_prefix=ripe_boundary)
   domain = app.dto.DomainResult(id=1, name='www.example.test')
   await resolver._DomainsResolver__dns_main_tasker(
-    domain=domain, default_dns_servers=[app.Server(server='192.0.2.53'), app.Server(server='192.0.2.54')], doh_dns_servers=[],
+    domain=domain,
+    default_dns_servers=[app.Server(server='192.0.2.53'), app.Server(server='192.0.2.54')],
+    doh_dns_servers=[],
   )
   assert domain.insert.ips_insert == []
   assert domain.insert.ips_delete == []
@@ -248,12 +278,15 @@ async def test_partial_cycle_preserves_existing_representation_without_enrichmen
   ripe_boundary.assert_not_awaited()
 
 
-@pytest.mark.parametrize(('payload', 'expected'), [
-  ({'status': 'ok', 'data': {'prefix': '8.8.8.0/24'}}, '8.8.8.0/24'),
-  ({'status': 'ok', 'data': {'prefix': '8.8.0.0/16'}}, '8.8.8.0'),
-  ({'status': 'ok', 'data': {'prefix': None}}, '8.8.8.0'),
-  ({'status': 'error', 'message': 'Unavailable'}, '8.8.8.0/25'),
-])
+@pytest.mark.parametrize(
+  ('payload', 'expected'),
+  [
+    ({'status': 'ok', 'data': {'prefix': '8.8.8.0/24'}}, '8.8.8.0/24'),
+    ({'status': 'ok', 'data': {'prefix': '8.8.0.0/16'}}, '8.8.8.0'),
+    ({'status': 'ok', 'data': {'prefix': None}}, '8.8.8.0'),
+    ({'status': 'error', 'message': 'Unavailable'}, '8.8.8.0/25'),
+  ],
+)
 async def test_complete_cycle_keeps_ripe_prefix_and_failure_contract(app, resolver, payload, expected):
   client = app.make_http(lambda request: httpx.Response(200, json=payload))
   ripe = app.ripe.RipeStatClient()
@@ -300,7 +333,10 @@ async def test_supplied_message_rrsets_are_validated_without_original_wire(app, 
   message = dns_message(kind)
   assert message.wire is None
   outcome = app.resolver.classify_dns_response(
-    message, 'www.example.test', '192.0.2.53', 'classic',
+    message,
+    'www.example.test',
+    '192.0.2.53',
+    'classic',
   )
   assert outcome.status == (
     app.dto.DnsQueryStatus.FAILURE if kind == 'alias-conflict' else app.dto.DnsQueryStatus.ADDRESSES
@@ -319,7 +355,12 @@ async def test_only_reachable_ipv4_records_are_deduplicated(app, dns_message):
 
 @pytest.mark.parametrize('discover_alias', [False, True])
 async def test_stored_resolution_keeps_cname_discovery_best_effort(
-  app, resolver, repository, monkeypatch, dns_message, discover_alias,
+  app,
+  resolver,
+  repository,
+  monkeypatch,
+  dns_message,
+  discover_alias,
 ):
   requests = []
 
@@ -331,7 +372,9 @@ async def test_stored_resolution_keeps_cname_discovery_best_effort(
     return SimpleNamespace(response=dns_message(kind, query=dns.message.make_query(qname, rdtype)))
 
   monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
-  repository.get_domain_on_id = AsyncMock(return_value=SimpleNamespace(id=1, name='www.example.test', domains_list_id=7))
+  repository.get_domain_on_id = AsyncMock(
+    return_value=SimpleNamespace(id=1, name='www.example.test', domains_list_id=7)
+  )
   repository.get_dns_servers_for_resolve.return_value = ([app.Server(server='192.0.2.53')], [])
   await resolver.resolve_stored_domain(domain_id=1)
   queued = repository.put_domain_after_resolve.await_args.kwargs['domain']
@@ -347,7 +390,12 @@ async def test_stored_resolution_keeps_cname_discovery_best_effort(
 
 @pytest.mark.parametrize('alias_write_fails', [False, True])
 async def test_alias_nxdomain_survives_cname_query_and_alias_write_failures(
-  app, resolver, repository, monkeypatch, dns_message, alias_write_fails,
+  app,
+  resolver,
+  repository,
+  monkeypatch,
+  dns_message,
+  alias_write_fails,
 ):
   async def classic(boundary, qname, rdtype, **kwargs):
     if rdtype == dns.rdatatype.CNAME:
@@ -357,7 +405,9 @@ async def test_alias_nxdomain_survives_cname_query_and_alias_write_failures(
     raise dns.resolver.NXDOMAIN(qnames=[query.question[0].name], responses={query.question[0].name: response})
 
   monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
-  repository.get_domain_on_id = AsyncMock(return_value=SimpleNamespace(id=1, name='www.example.test', domains_list_id=7))
+  repository.get_domain_on_id = AsyncMock(
+    return_value=SimpleNamespace(id=1, name='www.example.test', domains_list_id=7)
+  )
   repository.get_dns_servers_for_resolve.return_value = ([app.Server(server='192.0.2.53')], [])
   if alias_write_fails:
     repository.put_add_domains_to_queue.side_effect = RuntimeError('Synthetic alias queue failure')

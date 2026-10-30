@@ -1,11 +1,21 @@
-"""Isolated application imports and deterministic DNS network boundaries."""
+"""Fixtures for isolated unit/integration tests and real service E2E processes."""
 
 import asyncio
 import importlib
+import json
 import logging
+import os
+import shutil
+import socket
+import sqlite3
+import sys
 from base64 import urlsafe_b64decode
+from contextlib import closing
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlsplit
+from uuid import uuid4
 
 import dns.asyncresolver
 import dns.exception
@@ -69,8 +79,13 @@ async def app(tmp_path, monkeypatch):
     return client
 
   value = SimpleNamespace(
-    database=database, resolver=resolver, dto=dto, settings=config.settings,
-    Server=server_dto.DnsServerDto, Ip=ip_dto.IpRecordDto, ripe=ripe,
+    database=database,
+    resolver=resolver,
+    dto=dto,
+    settings=config.settings,
+    Server=server_dto.DnsServerDto,
+    Ip=ip_dto.IpRecordDto,
+    ripe=ripe,
     make_http=make_http,
   )
   try:
@@ -135,7 +150,9 @@ def dns_message():
     if kind in {'nodata', 'alias-nodata', 'unrelated-negative', 'foreign-soa', 'wrong-soa-class'}:
       soa_owner = 'other.invalid.' if kind == 'foreign-soa' else 'example.test.'
       add(
-        message.authority, soa_owner, 'SOA',
+        message.authority,
+        soa_owner,
+        'SOA',
         'ns.example.test. hostmaster.example.test. 1 60 60 60 60',
         rdclass='CH' if kind == 'wrong-soa-class' else 'IN',
       )
@@ -182,6 +199,7 @@ def dns_message():
         current = target
       add(message.answer, current, 'A', *addresses)
     return message
+
   return build
 
 
@@ -225,4 +243,269 @@ def network(app, resolver, dns_message, monkeypatch):
     monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
     resolver._DomainsResolver__http_client = app.make_http(doh)
     return requests
+
   return install
+
+
+class ServiceProcess:
+  """Run the real entrypoint with disposable settings and graceful shutdown."""
+
+  def __init__(self, root, directory, environment):
+    self.root = root
+    self.directory = directory
+    self.environment = environment
+    self.process = None
+    self.log_path = directory / 'application.log'
+    self.log = None
+
+  def diagnostics(self):
+    return self.log_path.read_text(encoding='utf-8', errors='replace') if self.log_path.exists() else ''
+
+  async def health_ready(self):
+    """Bound a real health request and own its socket across cancellation."""
+    loop = asyncio.get_running_loop()
+    port = int(self.environment['APP_PORT'])
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as connection:
+      connection.setblocking(False)
+      async with asyncio.timeout(0.5):
+        await loop.sock_connect(connection, ('127.0.0.1', port))
+        await loop.sock_sendall(
+          connection,
+          f'GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n'.encode('ascii'),
+        )
+        response = bytearray()
+        while chunk := await loop.sock_recv(connection, 4096 - len(response) + 1):
+          response.extend(chunk)
+          if len(response) > 4096:
+            return False
+        headers, separator, _ = response.partition(b'\r\n\r\n')
+        if not separator:
+          return False
+        status = bytes(headers).split(b'\r\n', 1)[0].split(b' ', 2)
+        return len(status) >= 2 and status[0] in {b'HTTP/1.0', b'HTTP/1.1'} and status[1] == b'200'
+
+  async def start(self):
+    # The wrapper only converts test-owned stdin into SIGINT; main.py owns the app.
+    bootstrap = (
+      'import _thread, runpy, sys, threading\n'
+      'def stop():\n'
+      '  sys.stdin.buffer.read(1)\n'
+      '  _thread.interrupt_main()\n'
+      'threading.Thread(target=stop, daemon=True).start()\n'
+      'try:\n'
+      '  runpy.run_path(sys.argv[1], run_name="__main__")\n'
+      'except KeyboardInterrupt:\n'
+      '  pass\n'
+    )
+    self.log = self.log_path.open('ab', buffering=0)
+    try:
+      self.process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        '-B',
+        '-c',
+        bootstrap,
+        str(self.root / 'main.py'),
+        cwd=self.directory,
+        env=self.environment,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=self.log,
+        stderr=asyncio.subprocess.STDOUT,
+      )
+      async with asyncio.timeout(15):
+        while True:
+          if self.process.returncode is not None:
+            raise AssertionError(f'Application exited before readiness:\n{self.diagnostics()}')
+          try:
+            if await self.health_ready():
+              break
+          except OSError, TimeoutError:
+            pass
+          await asyncio.sleep(0.02)
+    except BaseException:
+      await self.stop()
+      raise
+
+  @property
+  def url(self):
+    return f'http://127.0.0.1:{self.environment["APP_PORT"]}'
+
+  async def stop(self):
+    process, self.process = self.process, None
+    try:
+      if process is None:
+        return
+      if process.returncode is None:
+        try:
+          process.stdin.write(b'\n')
+          await process.stdin.drain()
+        except BrokenPipeError, ConnectionResetError:
+          pass
+        try:
+          await asyncio.wait_for(process.wait(), timeout=15)
+        except TimeoutError:
+          process.kill()
+          await asyncio.wait_for(process.wait(), timeout=5)
+          raise AssertionError(f'Application did not shut down gracefully:\n{self.diagnostics()}') from None
+      assert process.returncode == 0, self.diagnostics()
+    finally:
+      try:
+        if process is not None and process.stdin is not None:
+          process.stdin.close()
+          await process.stdin.wait_closed()
+      finally:
+        if self.log is not None:
+          self.log.close()
+          self.log = None
+
+
+@pytest.fixture
+async def e2e_service(tmp_path, dns_message):
+  """Keep application logic real and replace only external wire protocols."""
+  root = Path(__file__).resolve().parents[1]
+  shutil.copytree(root / 'migrations', tmp_path / 'migrations', ignore=shutil.ignore_patterns('__pycache__'))
+  db_path = tmp_path / 'service.sqlite'
+  # This historical table predates the pending gateway migration. The real runner
+  # must add its column; no migration history is fabricated by the fixture.
+  with closing(sqlite3.connect(db_path)) as connection, connection:
+    connection.executescript("""
+      CREATE TABLE rdpr_ip_records (
+        id INTEGER NOT NULL PRIMARY KEY,
+        ip_list_id INTEGER,
+        domain_id INTEGER NOT NULL,
+        addr_type INTEGER NOT NULL,
+        ip_address TEXT NOT NULL CHECK (ip_address != ''),
+        ros_comment TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP,
+        FOREIGN KEY (ip_list_id) REFERENCES rdpr_ips_lists(id) ON DELETE CASCADE,
+        FOREIGN KEY (domain_id) REFERENCES rdpr_domains(id) ON DELETE CASCADE
+      );
+      CREATE UNIQUE INDEX ix__rdpr_ip_records__ip_address ON rdpr_ip_records(ip_address);
+      CREATE INDEX ix__rdpr_ip_records__ip_list_id ON rdpr_ip_records(ip_list_id);
+      CREATE INDEX ix__rdpr_ip_records__domain_id ON rdpr_ip_records(domain_id);
+    """)
+    assert 'use_default_gw' not in {row[1] for row in connection.execute('PRAGMA table_info(rdpr_ip_records)')}
+
+  providers = SimpleNamespace(
+    classic='positive',
+    doh='positive',
+    requests=[],
+    errors=[],
+    classic_addresses=('8.8.8.8',),
+    doh_addresses=('8.8.4.4',),
+  )
+
+  def response_wire(query, transport):
+    providers.requests.append((transport, query.question[0].name.to_text(), query.question[0].rdtype))
+    kind = getattr(providers, transport) if query.question[0].rdtype == dns.rdatatype.A else 'nodata'
+    addresses = getattr(providers, f'{transport}_addresses')
+    return dns_message(kind, query=query, addresses=addresses).to_wire()
+
+  class DnsProtocol(asyncio.DatagramProtocol):
+    def connection_made(self, transport):
+      self.transport = transport
+
+    def datagram_received(self, data, address):
+      query = dns.message.from_wire(data)
+      self.transport.sendto(response_wire(query, 'classic'), address)
+
+    def error_received(self, error):
+      providers.errors.append(str(error))
+
+  connections = set()
+
+  async def serve_http(reader, writer):
+    connections.add(writer)
+    try:
+      async with asyncio.timeout(5):
+        request_line = (await reader.readline()).decode('ascii').split()
+        headers = {}
+        while line := await reader.readline():
+          if line == b'\r\n':
+            break
+          key, value = line.decode('ascii').split(':', 1)
+          headers[key.lower()] = value.strip()
+        method, target, _ = request_line
+        url = urlsplit(target)
+        params = parse_qs(url.query)
+        if method == 'GET' and url.path == '/dns-query':
+          assert headers.get('accept') == 'application/dns-message'
+          encoded = params['dns'][0]
+          query = dns.message.from_wire(urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)))
+          body = response_wire(query, 'doh')
+          media = 'application/dns-message'
+        elif method == 'GET' and url.path == '/data/network-info/data.json':
+          providers.requests.append(('ripe', params['resource'][0], None))
+          body = json.dumps({'status': 'ok', 'data': {'prefix': None}}).encode()
+          media = 'application/json'
+        else:
+          raise AssertionError(f'Unexpected provider request: {method} {target}')
+        writer.write(
+          f'HTTP/1.1 200 OK\r\nContent-Type: {media}\r\nContent-Length: {len(body)}\r\n'
+          'Connection: close\r\n\r\n'.encode()
+          + body
+        )
+        await writer.drain()
+    except (AssertionError, KeyError, ValueError, TimeoutError) as error:
+      providers.errors.append(repr(error))
+    finally:
+      writer.close()
+      await writer.wait_closed()
+      connections.discard(writer)
+
+  loop = asyncio.get_running_loop()
+  # Classic DNS has no configurable port. A separate loopback address owns port 53.
+  dns_host = f'127.{uuid4().int % 254 + 1}.{uuid4().int % 254 + 1}.{uuid4().int % 254 + 1}'
+  dns_transport, _ = await loop.create_datagram_endpoint(DnsProtocol, local_addr=(dns_host, 53))
+  http_server = None
+  service = None
+  try:
+    http_server = await asyncio.start_server(serve_http, '127.0.0.1', 0)
+    provider_url = f'http://127.0.0.1:{http_server.sockets[0].getsockname()[1]}'
+    # Reserve an ephemeral address before handing it to the real HTTP server.
+    port_reservation = await asyncio.start_server(lambda reader, writer: writer.close(), '127.0.0.1', 0)
+    port = port_reservation.sockets[0].getsockname()[1]
+    port_reservation.close()
+    await port_reservation.wait_closed()
+    environment = {key: os.environ[key] for key in ('SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP') if key in os.environ}
+    environment.update(
+      {
+        'PYTHONPATH': str(root),
+        'PYTHONDONTWRITEBYTECODE': '1',
+        'PYTHON_DOTENV_DISABLED': '1',
+        'APP_HOST': '127.0.0.1',
+        'APP_PORT': str(port),
+        'APP_LOG_LEVEL': 'error',
+        'ROOT_LOG_LEVEL': 'error',
+        'DB_BASE_DIR': str(tmp_path),
+        'DB_FILE_NAME': db_path.name,
+        'DB_TABLE_PREFIX': 'rdpr_',
+        'DB_SAVE_BATCH_TIMEOUT': '0.05',
+        'DB_SHUTDOWN_TIMEOUT': '5',
+        'RIPE_STAT_BASE_URL': provider_url,
+        'REQ_CONNECTION_RETRIES': '0',
+        'REQ_TIMEOUT_DEFAULT': '2',
+        'REQ_TIMEOUT_CONNECT': '2',
+        'REQ_TIMEOUT_READ': '2',
+      }
+    )
+    service = ServiceProcess(root, tmp_path, environment)
+    service.db_path = db_path
+    service.providers = providers
+    service.dns_host = dns_host
+    service.doh_url = f'{provider_url}/dns-query'
+    await service.start()
+    yield service
+  finally:
+    try:
+      if service is not None:
+        await service.stop()
+    finally:
+      dns_transport.close()
+      if http_server is not None:
+        http_server.close()
+        await http_server.wait_closed()
+      for writer in tuple(connections):
+        writer.close()
+        await writer.wait_closed()
+      assert providers.errors == []
