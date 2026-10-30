@@ -1,0 +1,4 @@
+interface:
+  display_name: "Python Backend Security"
+  short_description: "Security guidance for Python backends"
+  default_prompt: "Use $python-backend-security to review Python backend changes for auth, authorization, SSRF, SQL injection, secrets, and tests."

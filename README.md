@@ -161,17 +161,20 @@ set api address=192.168.50.20/24
 
 ## For contrib
 
-Python version >= `3.14`
+Codex contributors: start with [AGENTS.md](./AGENTS.md) and the project profile in
+[CODEX_PROJECT.md](./CODEX_PROJECT.md).
 
-How to alt install python 3.14 in WSL Debian
+Python version >= `3.15`
+
+How to alt install python 3.15 in WSL Debian
 
 ```sh
 sudo apt update
 sudo apt install pkg-config build-essential zlib1g-dev libncurses5-dev libgdbm-dev \
   libnss3-dev libssl-dev libreadline-dev libffi-dev libsqlite3-dev -y
-wget https://www.python.org/ftp/python/3.14.0/Python-3.14.0.tgz
-tar -xzvf Python-3.14.0.tgz
-cd Python-3.14.0
+wget https://www.python.org/ftp/python/3.15.2/Python-3.15.2.tgz
+tar -xzvf Python-3.15.2.tgz
+cd Python-3.15.2
 dpkg-architecture --query DEB_BUILD_GNU_TYPE # use in --build next ./configure
 ./configure --build="x86_64-linux-gnu" --prefix=/usr/local --enable-optimizations \
   --enable-loadable-sqlite-extensions --enable-option-checking=fatal --enable-shared \
@@ -179,25 +182,25 @@ dpkg-architecture --query DEB_BUILD_GNU_TYPE # use in --build next ./configure
 nproc # if output 20 CPUS use 18
 sudo make -j 18
 sudo make altinstall
-python3.14 -VV
+python3.15 -VV
 ```
 
 example output
 
 ```sh
-Python 3.14.0 (main, Nov 27 2025, 23:09:49) [GCC 12.2.0]
+Python 3.15.2 (tags/v3.15.2:5e58eaa, Oct 25 2026, 17:27:03) [MSC v.1951 64 bit (AMD64)]
 ```
 
 Create virtual env
 
 ```sh
-python3.14 -m venv .venv
+python3.15 -m venv .venv
 ```
 
 Or Windows
 
 ```powershell
-& 'C:\Program Files\Python\Python3.14\python.exe' -m venv .venv
+& 'C:\Program Files\Python315\python.exe' -m venv .venv
 ```
 
 Activate venv

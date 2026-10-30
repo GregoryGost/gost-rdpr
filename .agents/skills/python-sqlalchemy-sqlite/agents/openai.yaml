@@ -1,0 +1,4 @@
+interface:
+  display_name: "Python SQLAlchemy SQLite"
+  short_description: "SQLite-specific SQLAlchemy guidance"
+  default_prompt: "Use $python-sqlalchemy-sqlite together with $python-sqlalchemy-core to review SQLite-specific engines, migrations, writer queues, and integration tests."

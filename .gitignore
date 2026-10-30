@@ -174,7 +174,7 @@ cython_debug/
 .pypirc
 
 # IDE
-.vscode/
+#.vscode/
 
 # SQLITE DB
 *.sqlite
@@ -192,3 +192,7 @@ test/
 .old/
 .new/
 /db/
+
+# LLM
+.codex/config.toml
+.agent-handoffs/
