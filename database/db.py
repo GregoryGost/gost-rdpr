@@ -88,6 +88,11 @@ from models.dto.migrations_dto import MigrationsDto
 
 from jobs.job_registry import job_registry, Jobs
 
+
+class DomainIpReadError(RuntimeError):
+  """The current IP snapshot for a domain could not be read safely."""
+
+
 class DataBase:
   '''
   Bulk ORM DELETE not supported right now  
@@ -1275,17 +1280,30 @@ class DataBase:
   async def get_all_ips_for_domain(self: Self, domain_id: int) -> List[IpRecordDto]:
     logger.debug(f'Try get all IP address records for Domain {domain_id=} ...')
     result: List[IpRecordDto] = []
+    db_session: AsyncSession | None = None
+    read_error: Exception | None = None
     try:
-      db_session: AsyncSession = await self.__read_connect()
+      db_session = await self.__read_connect()
       ips_result: Sequence[Row[Tuple[int, str, int]]] = await IpRecordsDbo.get_ips_on_domain_id_extend(db_session=db_session, domain_id=domain_id)
       result = [IpRecordDto(id=ip[0], ip_address=ip[1], addr_type=ip[2]) for ip in ips_result]
-      return result
     except Exception as err:
-      logger.error(f'Try get all IP address records for Domain {domain_id=} failed : {err}', exc_info=True)
-      await db_session.rollback()
-      return result
+      read_error = err
+      if db_session is not None:
+        try:
+          await db_session.rollback()
+        except Exception:
+          logger.error('Rollback of domain IP snapshot read failed')
     finally:
-      await db_session.close()
+      if db_session is not None:
+        try:
+          await db_session.close()
+        except Exception as err:
+          if read_error is None:
+            read_error = err
+          logger.error('Closing the domain IP snapshot read session failed')
+    if read_error is not None:
+      raise DomainIpReadError('Unable to read domain IP records') from read_error
+    return result
 
   async def get_all_ips_on_ips_list(self: Self, ips_list_id: int) -> List[IpRecordDto]:
     logger.debug(f'Try get all IP address records for ips list {ips_list_id=} ...')
@@ -1825,6 +1843,7 @@ class DataBase:
         for queue_element in queue_elements
         if queue_element.target == TargetAction.DOMAINS_RESOLVED
         for domain in queue_element.elements # item = DomainResult
+        if domain.resolution_complete
       ]
       # IPS LISTS
       ips_lists_add: List[Dict[str, str | None]] = [
@@ -1891,6 +1910,7 @@ class DataBase:
         for queue_element in queue_elements
         if queue_element.target == TargetAction.DOMAINS_RESOLVED
         for domain_result in queue_element.elements # item = DomainResult
+        if domain_result.resolution_complete
         for ip_id in domain_result.insert.ips_delete # ip_id = int
       ]
       ips_id_delete: List[int] = [

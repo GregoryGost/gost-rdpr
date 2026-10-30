@@ -1,12 +1,33 @@
 from dataclasses import dataclass, field
+from enum import StrEnum
 from dns.rdata import Rdata
 from dns.rrset import RRset
-from dns.rdatatype import A, AAAA
+from dns.rdatatype import A, AAAA, RdataType
 from typing import List
 
 from utils.utils import check_ip_allow
 
 from models.dto.ip_record_dto import IpRecordDto
+
+
+class DnsQueryStatus(StrEnum):
+  ADDRESSES = 'ADDRESSES'
+  ABSENT = 'ABSENT'
+  FAILURE = 'FAILURE'
+
+
+@dataclass(frozen=True)
+class DnsQueryOutcome:
+  """Evidence from one server query, before storage policy is applied."""
+
+  server: str
+  server_type: str
+  lookup_type: RdataType
+  status: DnsQueryStatus
+  addresses: tuple[str, ...] = ()
+  cnames: tuple[str, ...] = ()
+  reason: str | None = None
+
 
 @dataclass
 class DomainLookupElement:
@@ -25,6 +46,7 @@ class DomainResult:
   result: DomainLookupElement = field(default_factory=DomainLookupElement)
   insert: DomainSqlData = field(default_factory=DomainSqlData)
   list_id: int | None = None
+  resolution_complete: bool = False
 
   def append_lookup(self: DomainResult, result_list: List[Rdata]) -> None:
     for result in result_list:

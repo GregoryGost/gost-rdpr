@@ -196,3 +196,6 @@ test/
 # LLM
 .codex/config.toml
 .agent-handoffs/
+
+# local tasks
+TASKS.md

@@ -9,32 +9,27 @@ from asyncio import (
   TimeoutError,
   Semaphore
 )
-from dns.resolver import Answer, NoAnswer
+from dns.resolver import Answer, NoAnswer, NXDOMAIN
 from dns.asyncresolver import Resolver
 from dns.exception import DNSException
-from dns.rdata import Rdata
-from dns.rdatatype import RdataType, A, CNAME
-from dns.message import QueryMessage, make_query, from_wire
-from dns.rrset import RRset
+from dns.flags import QR, TC
+from dns.name import Name, from_text, root
+from dns.opcode import QUERY
+from dns.rcode import NOERROR, NXDOMAIN as NXDOMAIN_RCODE
+from dns.rdataclass import IN
+from dns.rdatatype import RdataType, A, AAAA, CNAME, SOA, NS, RRSIG, NSEC, NSEC3, NSEC3PARAM, SIG
+from dns.message import Message, MAX_CHAIN, make_query, from_wire
 from itertools import product
 from base64 import urlsafe_b64encode
 from ipaddress import IPv4Address, IPv4Network, ip_address, ip_network
-from httpx import (
-  AsyncClient,
-  Response,
-  ConnectTimeout,
-  ReadError,
-  RemoteProtocolError,
-  ConnectError,
-  HTTPError
-)
+from httpx import AsyncClient, HTTPError
 from types import CoroutineType
 from typing import Self, List, Tuple, Dict, Literal
 
 from logger.logger import logger
 from config.config import settings
 from jobs.job_registry import job_registry, Jobs
-from database.db import db
+from database.db import db, DomainIpReadError
 from client.http_base_client import HttpClient
 from client.ripe_stat_client import RipeStatClient, RipeStatClientError
 from utils.utils import get_ip_network_address, get_ip_version
@@ -43,9 +38,148 @@ from models.http.domains_req import DomainsPostElementReq
 from models.http.domains_resp import DomainElementResp
 from models.http.dns_servers_resp import DnsElementResp
 
-from models.dto.domains_dto import DomainResult, CheckDomainResultDto, DnsServerResolveResultDto
+from models.dto.domains_dto import (
+  DomainResult,
+  CheckDomainResultDto,
+  DnsServerResolveResultDto,
+  DnsQueryOutcome,
+  DnsQueryStatus
+)
 from models.dto.dns_server_dto import DnsServerDto
 from models.dto.ip_record_dto import IpRecordDto
+
+
+class _DnsResponseError(ValueError):
+  """A DNS response failed a semantic or transport check."""
+
+
+def _absolute_name(name: Name) -> Name:
+  return name.derelativize(root).canonicalize()
+
+
+def _validated_dns_response(
+  response: Message | None,
+  domain_name: str,
+  lookup_type: RdataType,
+  query_id: int | None = None
+) -> Message:
+  if response is None:
+    raise _DnsResponseError('missing_response')
+  # Original wire preserves CNAME records merged by dnspython's singleton sets.
+  if response.wire is not None:
+    response = from_wire(response.wire, one_rr_per_rrset=True)
+  if (
+    not response.flags & QR
+    or response.flags & TC
+    or response.opcode() != QUERY
+    or len(response.question) != 1
+    or (query_id is not None and response.id != query_id)
+  ):
+    raise _DnsResponseError('invalid_envelope')
+  question = response.question[0]
+  if (
+    _absolute_name(question.name) != _absolute_name(from_text(domain_name))
+    or question.rdclass != IN
+    or question.rdtype != lookup_type
+  ):
+    raise _DnsResponseError('unexpected_question')
+  if response.rcode() not in (NOERROR, NXDOMAIN_RCODE):
+    raise _DnsResponseError('unsuccessful_rcode')
+  return response
+
+
+def _reachable_cnames(response: Message) -> tuple[Name, tuple[str, ...], set[Name]]:
+  terminal = _absolute_name(response.question[0].name)
+  visited: set[Name] = set()
+  owners: set[Name] = set()
+  cnames: list[str] = []
+  while True:
+    if terminal in visited:
+      raise _DnsResponseError('cname_cycle')
+    visited.add(terminal)
+    owner_records = [
+      rrset for rrset in response.answer
+      if rrset.rdclass == IN and _absolute_name(rrset.name) == terminal
+    ]
+    cname_records = [rrset for rrset in owner_records if rrset.rdtype == CNAME]
+    if not cname_records:
+      return terminal, tuple(cnames), owners
+    targets = {
+      _absolute_name(from_text(record.to_text()))
+      for rrset in cname_records
+      for record in rrset
+    }
+    if len(targets) != 1 or any(not rrset for rrset in cname_records):
+      raise _DnsResponseError('ambiguous_cname')
+    if any(rrset.rdtype in (A, AAAA) and rrset for rrset in owner_records):
+      raise _DnsResponseError('cname_address_conflict')
+    owners.add(terminal)
+    terminal = targets.pop()
+    cnames.append(terminal.to_text().rstrip('.'))
+    if len(cnames) >= MAX_CHAIN:
+      raise _DnsResponseError('cname_chain_too_long')
+
+
+def classify_dns_response(
+  response: Message | None,
+  domain_name: str,
+  server: str,
+  server_type: str,
+  lookup_type: RdataType = A,
+  query_id: int | None = None
+) -> DnsQueryOutcome:
+  """Classify one A response without applying address storage policy."""
+  try:
+    if lookup_type != A:
+      raise _DnsResponseError('unsupported_lookup_type')
+    response = _validated_dns_response(response, domain_name, lookup_type, query_id)
+    terminal, cnames, cname_owners = _reachable_cnames(response)
+    addresses = tuple(sorted({
+      str(IPv4Address(record.to_text()))
+      for rrset in response.answer
+      if rrset.rdclass == IN and rrset.rdtype == A
+      and _absolute_name(rrset.name) == terminal
+      for record in rrset
+    }))
+    if addresses:
+      if response.rcode() != NOERROR:
+        raise _DnsResponseError('nxdomain_with_addresses')
+      return DnsQueryOutcome(
+        server, server_type, lookup_type, DnsQueryStatus.ADDRESSES,
+        addresses=addresses, cnames=cnames
+      )
+    dnssec_metadata = (RRSIG, NSEC, NSEC3, NSEC3PARAM, SIG)
+    for rrset in response.answer:
+      if rrset.rdtype in dnssec_metadata:
+        continue
+      if (
+        rrset.rdclass == IN and rrset.rdtype == CNAME
+        and _absolute_name(rrset.name) in cname_owners
+      ):
+        continue
+      raise _DnsResponseError('unrelated_negative_answer')
+    covering_soa = any(
+      rrset.rdclass == IN and rrset.rdtype == SOA and rrset
+      and terminal.is_subdomain(_absolute_name(rrset.name))
+      for rrset in response.authority
+    )
+    if response.rcode() == NOERROR and not covering_soa and any(
+      rrset.rdtype == NS for rrset in response.authority
+    ):
+      raise _DnsResponseError('referral')
+    if response.rcode() == NOERROR and not covering_soa:
+      raise _DnsResponseError('unconfirmed_absence')
+    return DnsQueryOutcome(
+      server, server_type, lookup_type, DnsQueryStatus.ABSENT, cnames=cnames
+    )
+  except _DnsResponseError as err:
+    reason = str(err)
+  except (DNSException, ValueError, TypeError, AttributeError, IndexError):
+    reason = 'malformed_response'
+  return DnsQueryOutcome(
+    server, server_type, lookup_type, DnsQueryStatus.FAILURE, reason=reason
+  )
+
 
 class DomainsResolver:
 
@@ -94,12 +228,13 @@ class DomainsResolver:
         )
         if len(domain_cname) > 0:
           logger.debug(f'{domain_cname=}')
-          await db.put_add_domains_to_queue(domains=domain_cname)
+          await self.__persist_cnames(domain_cname)
         # resolve
         await self.__dns_main_tasker(
           domain=domain,
           default_dns_servers=dns_servers[0],
-          doh_dns_servers=dns_servers[1]
+          doh_dns_servers=dns_servers[1],
+          discovered_cnames=domain_cname
         )
         logger.debug(f'END resolving domain element {domain=}')
       except Exception as err:
@@ -113,8 +248,18 @@ class DomainsResolver:
           logger.info(f'Domains resolved: {processed}, residue: {residue}')
     logger.info('STOP FLOW - Resolve domains')
 
-  async def __dns_main_tasker(self: Self, domain: DomainResult, default_dns_servers: List[DnsServerDto], doh_dns_servers: List[DnsServerDto]) -> None:
+  async def __dns_main_tasker(
+    self: Self,
+    domain: DomainResult,
+    default_dns_servers: List[DnsServerDto],
+    doh_dns_servers: List[DnsServerDto],
+    discovered_cnames: list[DomainsPostElementReq] | None = None
+  ) -> None:
     logger.debug(f'START resolve domain {domain=} ...')
+    domain.resolution_complete = False
+    domain.result.A.clear()
+    domain.insert.ips_insert.clear()
+    domain.insert.ips_delete.clear()
     try:
       tasks: List[CoroutineType] = []
       # Default DNS
@@ -128,18 +273,59 @@ class DomainsResolver:
           task: CoroutineType = self.__doh_resolver(domain=domain_result, dns_server=dns_server, lookup_type=lookup_type)
           tasks.append(task)
       # Run parallel tasks
-      await gather(*tasks)
+      outcomes: list[DnsQueryOutcome] = list(await gather(*tasks))
+      try:
+        known_cnames = {
+          _absolute_name(from_text(cname.domain))
+          for cname in discovered_cnames or []
+        }
+        additional_cnames = [
+          DomainsPostElementReq(domain=cname, list_id=domain.list_id)
+          for cname in dict.fromkeys(
+            cname for outcome in outcomes
+            if outcome.status != DnsQueryStatus.FAILURE
+            for cname in outcome.cnames
+          )
+          if _absolute_name(from_text(cname)) not in known_cnames
+        ]
+        if additional_cnames:
+          await self.__persist_cnames(additional_cnames)
+      except Exception as err:
+        logger.warning(f'[{err.__class__.__name__}]: additional CNAME discovery failed')
+      statuses = {outcome.status for outcome in outcomes}
+      complete = bool(outcomes) and statuses in (
+        {DnsQueryStatus.ADDRESSES}, {DnsQueryStatus.ABSENT}
+      )
+      domain.result.A = sorted({
+        address for outcome in outcomes
+        if outcome.status == DnsQueryStatus.ADDRESSES
+        for address in outcome.addresses
+      })
+      if not complete and not domain.result.A:
+        return
       # Ips processing for domain
       current_ips: List[IpRecordDto] = await db.get_all_ips_for_domain(domain_id=domain.id)
+      domain.resolution_complete = complete
       # add new ips, remove not resolved ips but current exists
       await self.__ips_processing(domain=domain, current_ips=current_ips)
       # INSERT IPS (send to Queue)
       # DELETE IPS (send to Queue)
       # UPDATE DOMAINS (send to Queue)
-      await db.put_domain_after_resolve(domain=domain)
+      if complete or domain.insert.ips_insert:
+        await db.put_domain_after_resolve(domain=domain)
       logger.debug(f'FINAL resolve domain {domain=}')
+    except DomainIpReadError:
+      domain.resolution_complete = False
+      logger.warning('Domain IP snapshot unavailable; resolving cycle skipped')
     except Exception as err:
-      logger.error(f'[{err.__class__.__name__}]: __dns_main_tasker - {err}', exc_info=True)
+      domain.resolution_complete = False
+      logger.error(f'[{err.__class__.__name__}]: domain resolving cycle failed')
+
+  async def __persist_cnames(self: Self, cnames: list[DomainsPostElementReq]) -> None:
+    try:
+      await db.put_add_domains_to_queue(domains=cnames)
+    except Exception as err:
+      logger.warning(f'[{err.__class__.__name__}]: CNAME discovery could not be queued')
 
   async def __dns_cname_tasker(self: Self, domain: DomainResult, default_dns_servers: List[DnsServerDto], doh_dns_servers: List[DnsServerDto]) -> List[DomainsPostElementReq]:
     logger.debug(f'CNAME resolve for domains ...')
@@ -166,40 +352,87 @@ class DomainsResolver:
 
   # Resolvers
 
-  async def __doh_resolver(self: Self, domain: DomainResult, dns_server: DnsServerDto, lookup_type: RdataType) -> None:
-    '''
-    DNS over HTTPS function  
-    tested on:  
-    - https://dns.adguard-dns.com/dns-query
-    - https://cloudflare-dns.com/dns-query
-    - https://dns.google/dns-query
-    - https://dns.quad9.net:5053/dns-query
-    - https://dns.nextdns.io/dns-query
-    '''
-    logger.debug(f'Run doh dns resolve ...')
-    logger.debug(f'{domain=} {dns_server=} {lookup_type=}')
+  async def __query_doh(
+    self: Self,
+    domain_name: str,
+    dns_server: DnsServerDto,
+    lookup_type: RdataType
+  ) -> Message:
+    query = make_query(qname=domain_name, rdtype=lookup_type)
+    query_base64 = urlsafe_b64encode(query.to_wire()).decode('ascii').rstrip('=')
+    response = await self.__http_client.get(
+      url=dns_server.server,
+      params={'dns': query_base64},
+      headers={'Accept': 'application/dns-message'}
+    )
+    if response.status_code != 200:
+      raise _DnsResponseError('http_status')
+    media_type = response.headers.get('content-type', '').split(';', 1)[0].strip().lower()
+    if media_type != 'application/dns-message':
+      raise _DnsResponseError('unexpected_media_type')
+    message = from_wire(response.content, one_rr_per_rrset=True)
+    return _validated_dns_response(message, domain_name, lookup_type, query.id)
+
+  async def __query_default(
+    self: Self,
+    domain_name: str,
+    dns_server: DnsServerDto,
+    lookup_type: RdataType
+  ) -> Message:
+    resolver = Resolver(configure=False)
+    resolver.nameservers = [dns_server.server]
+    try:
+      answer: Answer = await resolver.resolve(
+        qname=domain_name, rdtype=lookup_type, search=False
+      )
+      response = answer.response
+    except NoAnswer as err:
+      response = err.response()
+    except NXDOMAIN as err:
+      response = err.response(from_text(domain_name))
+    return _validated_dns_response(response, domain_name, lookup_type)
+
+  async def __doh_resolver(
+    self: Self,
+    domain: DomainResult,
+    dns_server: DnsServerDto,
+    lookup_type: RdataType
+  ) -> DnsQueryOutcome:
     async with self.__semaphore:
       try:
-        doh_query: QueryMessage = make_query(qname=domain.name, rdtype=lookup_type)
-        doh_query_binary: bytes = doh_query.to_wire()
-        doh_query_base64: str = urlsafe_b64encode(doh_query_binary).decode('utf-8').rstrip('=')
-        params: Dict[str, str] = {
-          'dns': doh_query_base64
-        }
-        headers: Dict[str, str] = {
-          'Accept': 'application/dns-message'
-        }
-        response: Response = await self.__http_client.get(url=dns_server.server, params=params, headers=headers)
-        if response.status_code == 200:
-          result: List[RRset] = [rrset for rrset in from_wire(response.content).answer]
-          if len(result) > 0:
-            domain.append_doh_lookup(result)
-        else:
-          logger.warning(f"__doh_resolver for {domain=} : {response.status_code} - {response.content.decode('utf-8')}")
-      except (ConnectTimeout, ReadError, RemoteProtocolError, ConnectError) as err:
-        logger.debug(f'[{err.__class__.__name__}] : __doh_resolver warning err : {err}')
+        response = await self.__query_doh(domain.name, dns_server, lookup_type)
+        return classify_dns_response(
+          response, domain.name, dns_server.server, 'doh', lookup_type
+        )
+      except _DnsResponseError as err:
+        reason = str(err)
       except Exception as err:
-        logger.error(f'[{err.__class__.__name__}] : __doh_resolver unknown err : {err}')
+        reason = err.__class__.__name__
+      return DnsQueryOutcome(
+        dns_server.server, 'doh', lookup_type, DnsQueryStatus.FAILURE,
+        reason=reason
+      )
+
+  async def __default_resolver(
+    self: Self,
+    domain: DomainResult,
+    dns_server: DnsServerDto,
+    lookup_type: RdataType
+  ) -> DnsQueryOutcome:
+    async with self.__semaphore:
+      try:
+        response = await self.__query_default(domain.name, dns_server, lookup_type)
+        return classify_dns_response(
+          response, domain.name, dns_server.server, 'classic', lookup_type
+        )
+      except _DnsResponseError as err:
+        reason = str(err)
+      except Exception as err:
+        reason = err.__class__.__name__
+      return DnsQueryOutcome(
+        dns_server.server, 'classic', lookup_type, DnsQueryStatus.FAILURE,
+        reason=reason
+      )
 
   async def __cname_doh_resolver(
     self: Self,
@@ -207,54 +440,16 @@ class DomainsResolver:
     dns_server: DnsServerDto,
     cname_domains: List[DomainsPostElementReq]
   ) -> None:
-    logger.debug(f'Run doh cname resolve ...')
-    logger.debug(f'{domain=} {dns_server=}')
     async with self.__semaphore:
       try:
-        doh_query: QueryMessage = make_query(qname=domain.name, rdtype=CNAME)
-        doh_query_binary: bytes = doh_query.to_wire()
-        doh_query_base64: str = urlsafe_b64encode(doh_query_binary).decode('utf-8').rstrip('=')
-        params: Dict[str, str] = {
-          'dns': doh_query_base64
-        }
-        headers: Dict[str, str] = {
-          'Accept': 'application/dns-message'
-        }
-        response: Response = await self.__http_client.get(url=dns_server.server, params=params, headers=headers)
-        if response.status_code == 200:
-          result_list: List[RRset] = [rrset for rrset in from_wire(response.content).answer]
-          if len(result_list) > 0:
-            for result in result_list:
-              if result.rdtype == CNAME:
-                for value in result:
-                  cname_domains.append(DomainsPostElementReq(
-                    domain=value.to_text().strip().strip('.'),
-                    list_id=domain.list_id
-                  ))
-        else:
-          logger.warning(f"__cname_doh_resolver for {domain=} : {response.status_code} - {response.content.decode('utf-8')}")
-      except (ConnectError, ConnectTimeout, ReadError, RemoteProtocolError) as err:
-        logger.debug(f'[{err.__class__.__name__}] : __cname_doh_resolver debug err : {err}')
+        response = await self.__query_doh(domain.name, dns_server, CNAME)
+        _, cnames, _ = _reachable_cnames(response)
+        cname_domains.extend(
+          DomainsPostElementReq(domain=cname, list_id=domain.list_id)
+          for cname in cnames
+        )
       except Exception as err:
-        logger.error(f'[{err.__class__.__name__}] : __cname_doh_resolver unknown err : {err}')
-
-  async def __default_resolver(self: Self, domain: DomainResult, dns_server: DnsServerDto, lookup_type: RdataType) -> None:
-    logger.debug(f'Run default dns resolve ...')
-    logger.debug(f'{domain=} {dns_server=} {lookup_type=}')
-    async with self.__semaphore:
-      try:
-        resolver: Resolver = Resolver(configure=False)
-        resolver.nameservers = [dns_server.server]
-        answer: Answer = await resolver.resolve(qname=domain.name, rdtype=lookup_type)
-        result: List[Rdata] = [rdata for rdata in answer]
-        if len(result) > 0:
-          domain.append_lookup(result)
-      except NoAnswer:
-        logger.debug(f'NoAnswer for {domain=}')
-      except DNSException as err:
-        logger.debug(f'[{err.__class__.__name__}] : __default_resolver : {err}')
-      except Exception as err:
-        logger.error(f'[{err.__class__.__name__}] : __default_resolver : {err}')
+        logger.debug(f'[{err.__class__.__name__}]: DoH CNAME discovery failed')
 
   async def __cname_default_resolver(
     self: Self,
@@ -262,27 +457,16 @@ class DomainsResolver:
     dns_server: DnsServerDto,
     cname_domains: List[DomainsPostElementReq]
   ) -> None:
-    logger.debug(f'Run default cname resolve ...')
-    logger.debug(f'{domain=} {dns_server=}')
     async with self.__semaphore:
       try:
-        resolver: Resolver = Resolver(configure=False)
-        resolver.nameservers = [dns_server.server]
-        answer: Answer = await resolver.resolve(qname=domain.name, rdtype=CNAME)
-        result_list: List[Rdata] = [rdata for rdata in answer]
-        if len(result_list) > 0:
-          for result in result_list:
-            if result.rdtype == CNAME:
-              cname_domains.append(DomainsPostElementReq(
-                domain=result.to_text().strip().strip('.'),
-                list_id=domain.list_id
-              ))
-      except NoAnswer:
-        logger.debug(f'NoAnswer for {domain=}')
-      except DNSException as err:
-        logger.debug(f'[{err.__class__.__name__}] : __cname_default_resolver : {err}')
+        response = await self.__query_default(domain.name, dns_server, CNAME)
+        _, cnames, _ = _reachable_cnames(response)
+        cname_domains.extend(
+          DomainsPostElementReq(domain=cname, list_id=domain.list_id)
+          for cname in cnames
+        )
       except Exception as err:
-        logger.error(f'[{err.__class__.__name__}] : __cname_default_resolver : {err}')
+        logger.debug(f'[{err.__class__.__name__}]: classic CNAME discovery failed')
 
   async def __resolve_once_default_server(self: Self, domain_name: str, dns_server: DnsServerDto) -> DnsServerResolveResultDto:
     domain: DomainResult = DomainResult(
@@ -305,16 +489,25 @@ class DomainsResolver:
         cname_domains=cname_domains
       )
     )
-    await gather(*tasks)
+    outcomes = await gather(*tasks)
     return DnsServerResolveResultDto(
       server=dns_server.server,
       server_type='classic',
-      ips_v4=domain.result.A,
+      ips_v4=sorted({
+        address for outcome in outcomes
+        if isinstance(outcome, DnsQueryOutcome)
+        and outcome.status == DnsQueryStatus.ADDRESSES
+        for address in outcome.addresses
+      }),
       ips_v6=domain.result.AAAA,
-      cnames=[
-        cname.domain
-        for cname in cname_domains
-      ]
+      cnames=list(dict.fromkeys(
+        [cname.domain for cname in cname_domains] + [
+          cname for outcome in outcomes
+          if isinstance(outcome, DnsQueryOutcome)
+          and outcome.status != DnsQueryStatus.FAILURE
+          for cname in outcome.cnames
+        ]
+      ))
     )
   
   async def __resolve_once_doh_server(self: Self, domain_name: str, doh_server: DnsServerDto) -> DnsServerResolveResultDto:
@@ -338,16 +531,25 @@ class DomainsResolver:
         cname_domains=cname_domains
       )
     )
-    await gather(*tasks)
+    outcomes = await gather(*tasks)
     return DnsServerResolveResultDto(
       server=doh_server.server,
       server_type='doh',
-      ips_v4=domain.result.A,
+      ips_v4=sorted({
+        address for outcome in outcomes
+        if isinstance(outcome, DnsQueryOutcome)
+        and outcome.status == DnsQueryStatus.ADDRESSES
+        for address in outcome.addresses
+      }),
       ips_v6=domain.result.AAAA,
-      cnames=[
-        cname.domain
-        for cname in cname_domains
-      ]
+      cnames=list(dict.fromkeys(
+        [cname.domain for cname in cname_domains] + [
+          cname for outcome in outcomes
+          if isinstance(outcome, DnsQueryOutcome)
+          and outcome.status != DnsQueryStatus.FAILURE
+          for cname in outcome.cnames
+        ]
+      ))
     )
 
   # IPS
@@ -436,7 +638,7 @@ class DomainsResolver:
     logger.debug(f'{domain=}, {current_ips=}')
     try:
       resolved_ips: List[str] = list(dict.fromkeys(
-        domain.result.A + domain.result.AAAA
+        str(IPv4Address(address)) for address in domain.result.A
       ))
       current_ips_by_network_address: Dict[str, List[IpRecordDto]] = {}
       desired_ips_by_network_address: Dict[str, IpRecordDto] = {}
@@ -444,12 +646,16 @@ class DomainsResolver:
       remove_ips: List[IpRecordDto] = []
 
       for record in current_ips:
+        if get_ip_version(record.ip_address) != 4:
+          continue
         network_address = get_ip_network_address(record.ip_address)
         if network_address not in current_ips_by_network_address:
           current_ips_by_network_address[network_address] = []
         current_ips_by_network_address[network_address].append(record)
 
       for resolved_ip in resolved_ips:
+        if not domain.resolution_complete and resolved_ip in current_ips_by_network_address:
+          continue
         current_ip_records = current_ips_by_network_address.get(
           resolved_ip,
           []
@@ -487,13 +693,15 @@ class DomainsResolver:
           ):
             is_current_value_present = True
             continue
-          remove_ips.append(current_ip)
+          if domain.resolution_complete:
+            remove_ips.append(current_ip)
 
         if not is_current_value_present:
           new_ips.append(desired_ip)
 
-      for stale_ip_records in current_ips_by_network_address.values():
-        remove_ips.extend(stale_ip_records)
+      if domain.resolution_complete:
+        for stale_ip_records in current_ips_by_network_address.values():
+          remove_ips.extend(stale_ip_records)
 
       if len(new_ips) > 0:
         domain.append_ips_to_insert(ips=new_ips)
@@ -613,12 +821,13 @@ class DomainsResolver:
         doh_dns_servers=doh_dns
       )
       if cname_domains:
-        await db.put_add_domains_to_queue(domains=cname_domains)
+        await self.__persist_cnames(cname_domains)
       #
       await self.__dns_main_tasker(
         domain=domain,
         default_dns_servers=default_dns,
-        doh_dns_servers=doh_dns
+        doh_dns_servers=doh_dns,
+        discovered_cnames=cname_domains
       )
     except Exception as err:
       logger.error(f'Resolving domain ID={domain_id} failed: [{err.__class__.__name__}]: {err}', exc_info=True)
