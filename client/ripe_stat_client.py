@@ -1,9 +1,13 @@
-from asyncio import CancelledError
+from asyncio import CancelledError, Task, current_task, timeout
+from asyncio import Timeout as OperationTimeout
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from ipaddress import ip_address
 from time import perf_counter
 from typing import Any, Dict, Self
 
-from httpx import AsyncClient, Response
+from httpx import AsyncClient, HTTPError, Response, Timeout
 
 from cache.cache import ripe_stat_cache
 from client.http_base_client import HttpClient
@@ -12,63 +16,110 @@ from logger.logger import logger
 from metrics.metrics import observe_duration, ripe_duration
 from models.dto.ripe_stat_dto import RipeStatAddressPrefixDto
 
+_lookup_budget: ContextVar[tuple[Task[Any] | None, OperationTimeout] | None] = ContextVar(
+  'ripe_lookup_budget', default=None
+)
+
 
 class RipeStatClientError(Exception):
   pass
 
 
 class RipeStatClient:
-  __client: AsyncClient = HttpClient.get_client('ripe_stat')
+  __client: AsyncClient = HttpClient.get_client(
+    'ripe_stat',
+    timeout=Timeout(
+      connect=settings.ripe_stat_timeout_connect,
+      read=settings.ripe_stat_timeout_read,
+      write=settings.ripe_stat_timeout_write,
+      pool=settings.ripe_stat_timeout_pool,
+    ),
+    connection_retries=settings.ripe_stat_connection_retries,
+    retry_total_timeout=settings.ripe_stat_retry_total_timeout,
+  )
 
   def __init__(self: Self) -> None:
     self.__base_url: str = settings.ripe_stat_base_url.rstrip('/')
+
+  @staticmethod
+  @asynccontextmanager
+  async def lookup_budget() -> AsyncGenerator[None]:
+    """Share one task-local deadline across admission, cache, and network waits."""
+    active = _lookup_budget.get()
+    owner = current_task()
+    if active is not None and active[0] is owner:
+      yield
+      return
+    deadline = timeout(settings.ripe_stat_operation_timeout)
+    token = _lookup_budget.set((owner, deadline))
+    try:
+      async with deadline:
+        yield
+    except TimeoutError as err:
+      raise RipeStatClientError('RIPEstat lookup operation timed out') from err
+    finally:
+      _lookup_budget.reset(token)
+
+  @staticmethod
+  def __cancelled_outcome() -> str:
+    active = _lookup_budget.get()
+    return 'failure' if active is not None and active[0] is current_task() and active[1].expired() else 'cancelled'
 
   async def get_prefix(self: Self, address: str) -> RipeStatAddressPrefixDto:
     started = perf_counter()
     source = 'cache'
     outcome = 'failure'
     try:
-      normalized_address: str = str(ip_address(address))
-      cache_key: str = f'prefix:{normalized_address}'
-      cached_result = await self.__get_cached_prefix(
-        address=normalized_address, cache_key=cache_key, phase='cache_lookup'
-      )
-      if cached_result is not None:
-        outcome = 'prefix' if cached_result.prefix is not None else 'empty'
-        return cached_result
-      source = 'cache_after_lock'
-      lock_started = perf_counter()
-      lock_acquired = False
-      try:
-        async with ripe_stat_cache.lock(key=f'lock:{cache_key}', expire=settings.ripe_stat_cache_lock_ttl_sec):
-          lock_acquired = True
-          observe_duration(ripe_duration, lock_started, phase='lock_wait', source='lock', outcome='acquired')
-          cached_result = await self.__get_cached_prefix(
-            address=normalized_address, cache_key=cache_key, phase='cache_recheck'
-          )
-          if cached_result is not None:
-            outcome = 'prefix' if cached_result.prefix is not None else 'empty'
-            return cached_result
-          source = 'network'
-          result = await self.__get_prefix_from_ripe_stat(address=normalized_address)
-          cache_ttl = (
-            settings.ripe_stat_prefix_cache_ttl_sec
-            if result.prefix is not None
-            else settings.ripe_stat_empty_prefix_cache_ttl_sec
-          )
-          await ripe_stat_cache.set(key=cache_key, value=result.prefix or '', expire=cache_ttl)
-          outcome = 'prefix' if result.prefix is not None else 'empty'
-          return result
-      except CancelledError:
-        if not lock_acquired:
-          observe_duration(ripe_duration, lock_started, phase='lock_wait', source='lock', outcome='cancelled')
-        raise
-      except Exception:
-        if not lock_acquired:
-          observe_duration(ripe_duration, lock_started, phase='lock_wait', source='lock', outcome='failure')
-        raise
+      async with self.lookup_budget():
+        normalized_address: str = str(ip_address(address))
+        cache_key: str = f'prefix:{normalized_address}'
+        cached_result = await self.__get_cached_prefix(
+          address=normalized_address, cache_key=cache_key, phase='cache_lookup'
+        )
+        if cached_result is not None:
+          outcome = 'prefix' if cached_result.prefix is not None else 'empty'
+          return cached_result
+        source = 'cache_after_lock'
+        lock_started = perf_counter()
+        lock_acquired = False
+        try:
+          async with ripe_stat_cache.lock(key=f'lock:{cache_key}', expire=settings.ripe_stat_cache_lock_ttl_sec):
+            lock_acquired = True
+            observe_duration(ripe_duration, lock_started, phase='lock_wait', source='lock', outcome='acquired')
+            cached_result = await self.__get_cached_prefix(
+              address=normalized_address, cache_key=cache_key, phase='cache_recheck'
+            )
+            if cached_result is not None:
+              outcome = 'prefix' if cached_result.prefix is not None else 'empty'
+              return cached_result
+            source = 'network'
+            result = await self.__get_prefix_from_ripe_stat(address=normalized_address)
+            cache_ttl = (
+              settings.ripe_stat_prefix_cache_ttl_sec
+              if result.prefix is not None
+              else settings.ripe_stat_empty_prefix_cache_ttl_sec
+            )
+            await ripe_stat_cache.set(key=cache_key, value=result.prefix or '', expire=cache_ttl)
+            outcome = 'prefix' if result.prefix is not None else 'empty'
+            return result
+        except CancelledError:
+          if not lock_acquired:
+            observe_duration(
+              ripe_duration,
+              lock_started,
+              phase='lock_wait',
+              source='lock',
+              outcome=self.__cancelled_outcome(),
+            )
+          raise
+        except Exception:
+          if not lock_acquired:
+            observe_duration(ripe_duration, lock_started, phase='lock_wait', source='lock', outcome='failure')
+          raise
+    except HTTPError as err:
+      raise RipeStatClientError('RIPEstat lookup transport failed') from err
     except CancelledError:
-      outcome = 'cancelled'
+      outcome = self.__cancelled_outcome()
       raise
     finally:
       observe_duration(ripe_duration, started, phase='lookup', source=source, outcome=outcome)
@@ -81,7 +132,7 @@ class RipeStatClient:
       outcome = 'prefix' if result.prefix is not None else 'empty'
       return result
     except CancelledError:
-      outcome = 'cancelled'
+      outcome = self.__cancelled_outcome()
       raise
     finally:
       observe_duration(ripe_duration, started, phase='network', source='network', outcome=outcome)
@@ -122,7 +173,7 @@ class RipeStatClient:
       outcome = 'hit' if result is not None else 'miss'
       return result
     except CancelledError:
-      outcome = 'cancelled'
+      outcome = RipeStatClient.__cancelled_outcome()
       raise
     finally:
       observe_duration(ripe_duration, started, phase=phase, source='cache', outcome=outcome)

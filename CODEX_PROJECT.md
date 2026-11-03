@@ -565,7 +565,9 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
 - Active HTTP client skill: `python-httpx-client`.
 - Timeout policy source: `config/config.py` and the integration-specific client contract. Connect, read, write and pool
   phases are explicit; unset write/pool overrides inherit the integration default. Defaults remain `20/30/20/20`
-  seconds for ordinary clients and `20/59/59/59` for RouterOS.
+  seconds for general clients and `20/59/59/59` for RouterOS. DoH and RIPEstat have independent `3/5/3/2` phase
+  defaults, one additional HTTP attempt, a one-second cumulative retry-sleep budget and a ten-second operation budget.
+  Ordinary DNS explicitly configures timeout/lifetime at `2/5` seconds and a ten-second operation budget.
 - External dependency stub policy: `httpx.MockTransport` for outbound unit tests;
   `httpx.ASGITransport` where the tested boundary is an in-process ASGI app.
 - Dependency versions source: `pyproject.toml` and `poetry.lock`.
@@ -574,7 +576,12 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
   RouterOS currently uses `POST` only for `/print` reads and `PUT` for creation; preserve this operation boundary.
   Only explicitly selected statuses/exceptions retry; `PoolTimeout`, cancellation and returned response-body failures
   do not. Backoff, jitter and `Retry-After` are bounded; `req_retry_total_timeout` limits cumulative sleep, not full
-  request duration. Separate per-provider network budgets remain outside this common transport policy.
+  request duration. DoH and RIPEstat select their own retry counts and sleep budgets through the same transport owner.
+  Their client/resolver operation budgets remain outside the retry transport and cover body consumption plus relevant
+  semaphore/cache-lock waits. DNS query budgets cover A/CNAME and bulk/stored/one-shot entrypoints. Expiry is failed
+  evidence, while external cancellation propagates. Budgets are per query/lookup, not per whole domain/job.
+  Independent eligible RIPEstat lookups use bounded workers and the existing shared semaphore; timeout/error handling
+  retains the stored-CIDR/host policy and never caches failures as successful empty results.
 - Named client profiles are immutable: reuse matching effective configuration and reject conflicting configuration.
   Limits apply independently to each pool; HTTPcore caps idle connections by the open-connection limit.
 - `ObservedAsyncTransport` stays outside the retry layer, preserving one measured exchange across its attempts.

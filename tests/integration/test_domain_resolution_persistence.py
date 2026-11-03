@@ -3180,7 +3180,7 @@ async def test_reproducible_local_measurement_baseline(e2e_service, tmp_path):
   settings = {
     key: value
     for key, value in service.environment.items()
-    if key.startswith(('DB_', 'REQ_', 'DOMAINS_', 'QUEUE_', 'RIPE_'))
+    if key.startswith(('DB_', 'REQ_', 'DNS_', 'DOH_', 'DOMAINS_', 'QUEUE_', 'RIPE_'))
   }
   for schedule, delay, unavailable in [('fast', 0.0, False), ('slow', 0.02, False), ('unavailable', 0.0, True)]:
     await service.stop()
@@ -3476,7 +3476,9 @@ async def test_public_http_retries_preserve_resolution_persistence_and_logical_m
   """Drive production wiring and writer against transient or exhausted wire-level failures."""
   service = e2e_service
   await service.stop()
-  service.environment.update({'REQ_CONNECTION_RETRIES': '2', 'REQ_RETRY_BACKOFF_FACTOR': '0'})
+  service.environment.update(
+    {'REQ_CONNECTION_RETRIES': '2', 'DOH_CONNECTION_RETRIES': '2', 'REQ_RETRY_BACKOFF_FACTOR': '0'}
+  )
   await service.start()
   domain_id = await configure_public_domain(service)
   before = public_flow_snapshot(service, domain_id)
@@ -3504,3 +3506,211 @@ async def test_public_http_retries_preserve_resolution_persistence_and_logical_m
     assert after[0][1] != before[0][1]
     assert set(after[1]) == {'8.8.8.8', '8.8.4.4', '2001:4860:4860::8888'}
     assert after[1]['2001:4860:4860::8888'] == before[1]['2001:4860:4860::8888']
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+@pytest.mark.parametrize('slow_transport', ['classic', 'doh'])
+async def test_public_dns_deadline_keeps_stale_data_and_retry_checkpoint_then_recovers(e2e_service, slow_transport):
+  service = e2e_service
+  service.environment['DOH_OPERATION_TIMEOUT'] = '0.15'
+  service.environment['DNS_OPERATION_TIMEOUT'] = '0.15'
+  service.environment['DNS_TIMEOUT'] = '0.03'
+  service.environment['DNS_LIFETIME'] = '0.06'
+  await service.start()
+  domain_id = await configure_public_domain(service)
+  before_domain, before_ips = public_flow_snapshot(service, domain_id)
+  service.providers.hold_dns = slow_transport == 'doh'
+  service.providers.drop_classic = slow_transport == 'classic'
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    assert (await client.post(f'/domains/{domain_id}/resolve')).status_code == 202
+    async with asyncio.timeout(3):
+      samples, fields = await completed_metrics(client, mode='stored', selected=1)
+    if slow_transport == 'doh':
+      assert service.providers.dns_entered.is_set()
+    assert fields['partial'] == fields['admitted'] == fields['confirmed'] == 1
+    assert fields['success'] == fields['failure'] == 0
+    assert sample_total(samples, 'httpx_exchanges_in_flight') == 0
+    assert (
+      sample_total(samples, 'resolution_dns_duration_seconds_count', transport=slow_transport, outcome='failure') == 2
+    )
+    assert (
+      sample_total(samples, 'resolution_dns_duration_seconds_count', transport=slow_transport, outcome='cancelled') == 0
+    )
+    after_domain, after_ips = public_flow_snapshot(service, domain_id)
+    assert after_domain == before_domain
+    assert {address: after_ips[address] for address in before_ips} == before_ips
+    assert set(after_ips) == set(before_ips) | ({'8.8.8.8'} if slow_transport == 'doh' else {'8.8.4.4'})
+    service.providers.hold_dns = False
+    service.providers.drop_classic = False
+    service.providers.dns_release.set()
+    previous = sample_total(samples, 'resolution_run_elapsed_seconds_count', mode='stored')
+    assert (await client.post(f'/domains/{domain_id}/resolve')).status_code == 202
+    samples, fields = await completed_metrics(client, mode='stored', selected=1, previous_completed=previous)
+    assert fields['success'] == fields['confirmed'] == 1
+    after_domain, after_ips = public_flow_snapshot(service, domain_id)
+    assert after_domain[0] == 1
+    assert after_domain[1] != before_domain[1]
+    assert set(after_ips) == {'8.8.8.8', '8.8.4.4', '2001:4860:4860::8888'}
+    assert after_ips['2001:4860:4860::8888'] == before_ips['2001:4860:4860::8888']
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+async def test_public_ripe_deadline_preserves_existing_cidr_and_adds_host_fallback(e2e_service):
+  service = e2e_service
+  service.environment['RIPE_STAT_OPERATION_TIMEOUT'] = '0.15'
+  await service.start()
+  domain_id = await configure_public_domain(service)
+  service.providers.classic_addresses = ('8.8.8.0',)
+  service.providers.doh_addresses = ('8.8.4.0',)
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    connection.execute(
+      'INSERT INTO rdpr_ip_records (domain_id, addr_type, ip_address) VALUES (?, 4, ?)',
+      (domain_id, '8.8.8.0/25'),
+    )
+  before = public_flow_snapshot(service, domain_id)
+  service.providers.hold_ripe = True
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    assert (await client.post(f'/domains/{domain_id}/resolve')).status_code == 202
+    async with asyncio.timeout(3):
+      samples, fields = await completed_metrics(client, mode='stored', selected=1)
+    assert service.providers.ripe_entered.is_set()
+    assert fields['success'] == fields['admitted'] == fields['confirmed'] == 1
+    assert (
+      sample_total(samples, 'resolution_ripe_duration_seconds_count', phase='fallback', outcome='stored_prefix') == 1
+    )
+    assert sample_total(samples, 'resolution_ripe_duration_seconds_count', phase='fallback', outcome='host') == 1
+    assert sample_total(samples, 'httpx_exchanges_in_flight') == 0
+  after_domain, after_ips = public_flow_snapshot(service, domain_id)
+  assert after_domain[0] == 1
+  assert after_domain[1] != before[0][1]
+  assert set(after_ips) == {'8.8.8.0/25', '8.8.4.0', '2001:4860:4860::8888'}
+  assert after_ips['8.8.8.0/25'] == before[1]['8.8.8.0/25']
+  assert after_ips['2001:4860:4860::8888'] == before[1]['2001:4860:4860::8888']
+
+
+@pytest.mark.e2e
+@pytest.mark.e2e_load
+async def test_slow_independent_ripe_requests_share_bounded_capacity(e2e_service, tmp_path):
+  """Measure one domain with independent network-base addresses and a slow local RIPE provider."""
+  service = e2e_service
+  domain_id = await configure_public_domain(service)
+  await service.stop()
+  service.environment['RIPE_STAT_REQUESTS_SEMAPHORE_LIMIT'] = '2'
+  addresses = ('8.8.8.0', '8.8.4.0', '9.9.9.0', '1.1.1.0', '1.0.0.0', '208.67.222.0')
+  service.providers.classic_addresses = addresses[:3]
+  service.providers.doh_addresses = addresses[3:]
+  service.providers.ripe_delay = 0.04
+  await service.start()
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    samples = parse_samples((await client.get('/metrics')).text)
+    pid = application_pid(samples)
+    before_resources = service.resource_snapshot(pid)
+    started = perf_counter()
+    assert (await client.post(f'/domains/{domain_id}/resolve')).status_code == 202
+    samples, fields = await completed_metrics(client, mode='stored', selected=1)
+    elapsed = perf_counter() - started
+    after_resources = service.resource_snapshot(pid)
+    assert fields['success'] == fields['confirmed'] == 1
+  actual = public_flow_snapshot(service, domain_id)
+  assert set(actual[1]) == set(addresses) | {'2001:4860:4860::8888'}
+  assert actual[0][0] == 1
+  assert actual[0][1] is not None
+  ripe_calls = [row[1] for row in service.providers.requests if row[0] == 'ripe']
+  assert sorted(ripe_calls) == sorted(addresses)
+  assert service.providers.ripe_active == 0
+  (tmp_path / 'slow-ripe-measurement.json').write_text(
+    json.dumps(
+      {
+        'dataset': addresses,
+        'provider_delay_seconds': service.providers.ripe_delay,
+        'concurrency_limit': 2,
+        'peak_provider_concurrency': service.providers.ripe_peak_active,
+        'wall_elapsed_seconds': elapsed,
+        'run': fields,
+        'child_cpu_seconds': after_resources['cpu_seconds'] - before_resources['cpu_seconds'],
+        'child_peak_rss_bytes': after_resources['peak_rss_bytes'],
+        'source_sha256': {
+          name: sha256((service.root / name).read_bytes()).hexdigest()
+          for name in (
+            'config/config.py',
+            'client/domains_resolving_client.py',
+            'client/ripe_stat_client.py',
+            'client/http_base_client.py',
+            'tests/conftest.py',
+            'tests/integration/test_domain_resolution_persistence.py',
+          )
+        },
+      },
+      indent=2,
+      allow_nan=False,
+    ),
+    encoding='utf-8',
+  )
+  assert service.providers.ripe_peak_active == 2
+
+
+async def test_ripe_operation_deadline_includes_real_http_pool_wait_and_allows_recovery(app, monkeypatch):
+  """A generous pool timeout must not extend the caller's smaller operation budget."""
+  factory = importlib.import_module('client.http_base_client').HttpClient
+  await factory.close()
+  monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', app.real_http_send)
+  monkeypatch.setattr(app.settings, 'req_max_connections', 1)
+  monkeypatch.setattr(app.settings, 'ripe_stat_operation_timeout', 0.03)
+  release = asyncio.Event()
+  handlers, writers, paths = set(), set(), []
+
+  async def serve(reader, writer):
+    task = asyncio.current_task()
+    handlers.add(task)
+    writers.add(writer)
+    try:
+      async with asyncio.timeout(3):
+        request = await reader.readuntil(b'\r\n\r\n')
+        target = request.split(b' ', 2)[1]
+        paths.append(target)
+        if target == b'/hold':
+          writer.write(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nx')
+          await writer.drain()
+          await release.wait()
+        else:
+          body = b'{"status":"ok","data":{"prefix":null}}'
+          writer.write(f'HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n'.encode() + body)
+          await writer.drain()
+    except ConnectionError:
+      pass
+    finally:
+      writer.close()
+      await writer.wait_closed()
+      writers.discard(writer)
+      handlers.discard(task)
+
+  server = await asyncio.start_server(serve, '127.0.0.1', 0)
+  url = f'http://127.0.0.1:{server.sockets[0].getsockname()[1]}'
+  monkeypatch.setattr(app.settings, 'ripe_stat_base_url', url)
+  client = factory.get_client('ripe-pool', timeout=httpx.Timeout(1), connection_retries=0)
+  ripe = app.ripe.RipeStatClient()
+  ripe._RipeStatClient__client = client
+  held = None
+  try:
+    held = await asyncio.wait_for(client.send(client.build_request('GET', url + '/hold'), stream=True), timeout=1)
+    with pytest.raises(app.ripe.RipeStatClientError):
+      await asyncio.wait_for(ripe.get_prefix('8.8.8.0'), timeout=0.5)
+    assert paths == [b'/hold']
+    await held.aclose()
+    monkeypatch.setattr(app.settings, 'ripe_stat_operation_timeout', 1)
+    result = await asyncio.wait_for(ripe.get_prefix('8.8.8.0'), timeout=1)
+    assert result.prefix is None
+    assert paths == [b'/hold', b'/data/network-info/data.json?resource=8.8.8.0']
+  finally:
+    if held is not None:
+      await held.aclose()
+    release.set()
+    await factory.close()
+    server.close()
+    await server.wait_closed()
+    for writer in tuple(writers):
+      writer.close()
+    if handlers:
+      await asyncio.wait_for(asyncio.gather(*tuple(handlers)), timeout=2)

@@ -56,6 +56,8 @@ class HttpClient:
     timeout: Timeout | None = None,
     *,
     retry_methods: frozenset[str] = frozenset({'GET', 'HEAD'}),
+    connection_retries: int | None = None,
+    retry_total_timeout: float | None = None,
   ) -> AsyncClient:
     """Reuse an identical named policy, rejecting conflicts and automatic PUT retries."""
     methods = frozenset(method.upper() for method in retry_methods)
@@ -78,11 +80,11 @@ class HttpClient:
       max_keepalive_connections=settings.req_max_keepalive_connections,
       ssl_verify=settings.req_ssl_verify,
       retry_methods=methods,
-      retries=settings.req_connection_retries,
+      retries=settings.req_connection_retries if connection_retries is None else connection_retries,
       backoff_factor=settings.req_retry_backoff_factor,
       backoff_jitter=settings.req_retry_backoff_jitter,
       max_backoff_wait=settings.req_retry_max_backoff_wait,
-      total_sleep=settings.req_retry_total_timeout,
+      total_sleep=settings.req_retry_total_timeout if retry_total_timeout is None else retry_total_timeout,
       headers=tuple(sorted(headers.multi_items())),
     )
     if name in cls.__clients:

@@ -1,6 +1,16 @@
-from asyncio import CancelledError, Queue, Semaphore, TimeoutError, create_task, gather, sleep, wait_for
+from asyncio import (
+  CancelledError,
+  Queue,
+  Semaphore,
+  TaskGroup,
+  create_task,
+  gather,
+  sleep,
+  timeout,
+  wait_for,
+)
 from base64 import urlsafe_b64encode
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
 from ipaddress import IPv4Address, IPv4Network, ip_address, ip_network
 from itertools import product
@@ -21,7 +31,7 @@ from dns.rcode import NXDOMAIN as NXDOMAIN_RCODE
 from dns.rdataclass import IN
 from dns.rdatatype import AAAA, CNAME, NS, NSEC, NSEC3, NSEC3PARAM, RRSIG, SIG, SOA, A, RdataType
 from dns.resolver import NXDOMAIN, Answer, NoAnswer
-from httpx import AsyncClient, HTTPError
+from httpx import AsyncClient, HTTPError, Timeout
 
 from client.http_base_client import HttpClient
 from client.ripe_stat_client import RipeStatClient, RipeStatClientError
@@ -182,7 +192,17 @@ class DomainsResolver:
   __lookup_types: tuple[Literal[RdataType.A]] = (A,)  # (A, AAAA)
   __semaphore: Semaphore = Semaphore(settings.domains_resolve_semaphore_limit)
 
-  __http_client: AsyncClient = HttpClient.get_client('domains_resolver')
+  __http_client: AsyncClient = HttpClient.get_client(
+    'domains_resolver',
+    timeout=Timeout(
+      connect=settings.doh_timeout_connect,
+      read=settings.doh_timeout_read,
+      write=settings.doh_timeout_write,
+      pool=settings.doh_timeout_pool,
+    ),
+    connection_retries=settings.doh_connection_retries,
+    retry_total_timeout=settings.doh_retry_total_timeout,
+  )
 
   __ripe_stat_client: RipeStatClient = RipeStatClient()
   __ripe_stat_semaphore: Semaphore = Semaphore(settings.ripe_stat_requests_semaphore_limit)
@@ -400,8 +420,12 @@ class DomainsResolver:
   async def __query_default(self: Self, domain_name: str, dns_server: DnsServerDto, lookup_type: RdataType) -> Message:
     resolver = Resolver(configure=False)
     resolver.nameservers = [dns_server.server]
+    resolver.timeout = settings.dns_timeout
+    resolver.lifetime = settings.dns_lifetime
     try:
-      answer: Answer = await resolver.resolve(qname=domain_name, rdtype=lookup_type, search=False)
+      answer: Answer = await resolver.resolve(
+        qname=domain_name, rdtype=lookup_type, search=False, lifetime=settings.dns_lifetime
+      )
       response = answer.response
     except NoAnswer as err:
       response = err.response()
@@ -419,12 +443,13 @@ class DomainsResolver:
   @asynccontextmanager
   async def __dns_observation(
     self, dns_server: DnsServerDto, transport: str, record_type: str
-  ) -> AsyncIterator[dict[str, str]]:
+  ) -> AsyncGenerator[dict[str, str]]:
     wait_started = perf_counter()
     acquired = False
     measurement = dict(outcome='failure', reason='none')
+    deadline = timeout(settings.doh_operation_timeout if transport == 'doh' else settings.dns_operation_timeout)
     try:
-      async with self.__semaphore:
+      async with deadline, self.__semaphore:
         acquired = True
         observe_duration(
           dns_semaphore_wait, wait_started, **dns_labels(dns_server.id, transport, record_type, 'acquired')
@@ -433,7 +458,10 @@ class DomainsResolver:
         try:
           yield measurement
         except CancelledError:
-          measurement.update(outcome='cancelled', reason='none')
+          measurement.update(
+            outcome='failure' if deadline.expired() else 'cancelled',
+            reason='Timeout' if deadline.expired() else 'none',
+          )
           raise
         finally:
           observe_duration(
@@ -441,6 +469,12 @@ class DomainsResolver:
             query_started,
             **dns_labels(dns_server.id, transport, record_type, measurement['outcome'], measurement['reason']),
           )
+    except TimeoutError:
+      if not acquired:
+        observe_duration(
+          dns_semaphore_wait, wait_started, **dns_labels(dns_server.id, transport, record_type, 'timeout')
+        )
+      raise
     except CancelledError:
       if not acquired:
         observe_duration(
@@ -451,60 +485,72 @@ class DomainsResolver:
   async def __doh_resolver(
     self: Self, domain: DomainResult, dns_server: DnsServerDto, lookup_type: RdataType
   ) -> DnsQueryOutcome:
-    async with self.__dns_observation(dns_server, 'doh', lookup_type.name) as measurement:
-      try:
-        response = await self.__query_doh(domain.name, dns_server, lookup_type)
-        outcome = classify_dns_response(response, domain.name, dns_server.server, 'doh', lookup_type)
-        measurement.update(outcome=outcome.status.value.lower(), reason=outcome.reason or 'none')
-        return outcome
-      except _DnsResponseError as err:
-        reason = str(err)
-      except Exception as err:
-        reason = err.__class__.__name__
-      measurement.update(reason=reason)
-      return DnsQueryOutcome(dns_server.server, 'doh', lookup_type, DnsQueryStatus.FAILURE, reason=reason)
+    try:
+      async with self.__dns_observation(dns_server, 'doh', lookup_type.name) as measurement:
+        try:
+          response = await self.__query_doh(domain.name, dns_server, lookup_type)
+          outcome = classify_dns_response(response, domain.name, dns_server.server, 'doh', lookup_type)
+          measurement.update(outcome=outcome.status.value.lower(), reason=outcome.reason or 'none')
+          return outcome
+        except _DnsResponseError as err:
+          reason = str(err)
+        except Exception as err:
+          reason = err.__class__.__name__
+        measurement.update(reason=reason)
+        return DnsQueryOutcome(dns_server.server, 'doh', lookup_type, DnsQueryStatus.FAILURE, reason=reason)
+    except TimeoutError:
+      return DnsQueryOutcome(dns_server.server, 'doh', lookup_type, DnsQueryStatus.FAILURE, reason='timeout')
 
   async def __default_resolver(
     self: Self, domain: DomainResult, dns_server: DnsServerDto, lookup_type: RdataType
   ) -> DnsQueryOutcome:
-    async with self.__dns_observation(dns_server, 'classic', lookup_type.name) as measurement:
-      try:
-        response = await self.__query_default(domain.name, dns_server, lookup_type)
-        outcome = classify_dns_response(response, domain.name, dns_server.server, 'classic', lookup_type)
-        measurement.update(outcome=outcome.status.value.lower(), reason=outcome.reason or 'none')
-        return outcome
-      except _DnsResponseError as err:
-        reason = str(err)
-      except Exception as err:
-        reason = err.__class__.__name__
-      measurement.update(reason=reason)
-      return DnsQueryOutcome(dns_server.server, 'classic', lookup_type, DnsQueryStatus.FAILURE, reason=reason)
+    try:
+      async with self.__dns_observation(dns_server, 'classic', lookup_type.name) as measurement:
+        try:
+          response = await self.__query_default(domain.name, dns_server, lookup_type)
+          outcome = classify_dns_response(response, domain.name, dns_server.server, 'classic', lookup_type)
+          measurement.update(outcome=outcome.status.value.lower(), reason=outcome.reason or 'none')
+          return outcome
+        except _DnsResponseError as err:
+          reason = str(err)
+        except Exception as err:
+          reason = err.__class__.__name__
+        measurement.update(reason=reason)
+        return DnsQueryOutcome(dns_server.server, 'classic', lookup_type, DnsQueryStatus.FAILURE, reason=reason)
+    except TimeoutError:
+      return DnsQueryOutcome(dns_server.server, 'classic', lookup_type, DnsQueryStatus.FAILURE, reason='timeout')
 
   async def __cname_doh_resolver(
     self: Self, domain: DomainResult, dns_server: DnsServerDto, cname_domains: List[DomainsPostElementReq]
   ) -> None:
-    async with self.__dns_observation(dns_server, 'doh', 'CNAME') as measurement:
-      try:
-        response = await self.__query_doh(domain.name, dns_server, CNAME)
-        _, cnames, _ = _reachable_cnames(response)
-        measurement.update(outcome='aliases' if cnames else 'no_alias')
-        cname_domains.extend(DomainsPostElementReq(domain=cname, list_id=domain.list_id) for cname in cnames)
-      except Exception as err:
-        measurement.update(reason=str(err) if isinstance(err, _DnsResponseError) else type(err).__name__)
-        logger.debug(f'[{err.__class__.__name__}]: DoH CNAME discovery failed')
+    try:
+      async with self.__dns_observation(dns_server, 'doh', 'CNAME') as measurement:
+        try:
+          response = await self.__query_doh(domain.name, dns_server, CNAME)
+          _, cnames, _ = _reachable_cnames(response)
+          measurement.update(outcome='aliases' if cnames else 'no_alias')
+          cname_domains.extend(DomainsPostElementReq(domain=cname, list_id=domain.list_id) for cname in cnames)
+        except Exception as err:
+          measurement.update(reason=str(err) if isinstance(err, _DnsResponseError) else type(err).__name__)
+          logger.debug(f'[{err.__class__.__name__}]: DoH CNAME discovery failed')
+    except TimeoutError:
+      logger.debug('CNAME discovery operation timed out')
 
   async def __cname_default_resolver(
     self: Self, domain: DomainResult, dns_server: DnsServerDto, cname_domains: List[DomainsPostElementReq]
   ) -> None:
-    async with self.__dns_observation(dns_server, 'classic', 'CNAME') as measurement:
-      try:
-        response = await self.__query_default(domain.name, dns_server, CNAME)
-        _, cnames, _ = _reachable_cnames(response)
-        measurement.update(outcome='aliases' if cnames else 'no_alias')
-        cname_domains.extend(DomainsPostElementReq(domain=cname, list_id=domain.list_id) for cname in cnames)
-      except Exception as err:
-        measurement.update(reason=str(err) if isinstance(err, _DnsResponseError) else type(err).__name__)
-        logger.debug(f'[{err.__class__.__name__}]: classic CNAME discovery failed')
+    try:
+      async with self.__dns_observation(dns_server, 'classic', 'CNAME') as measurement:
+        try:
+          response = await self.__query_default(domain.name, dns_server, CNAME)
+          _, cnames, _ = _reachable_cnames(response)
+          measurement.update(outcome='aliases' if cnames else 'no_alias')
+          cname_domains.extend(DomainsPostElementReq(domain=cname, list_id=domain.list_id) for cname in cnames)
+        except Exception as err:
+          measurement.update(reason=str(err) if isinstance(err, _DnsResponseError) else type(err).__name__)
+          logger.debug(f'[{err.__class__.__name__}]: classic CNAME discovery failed')
+    except TimeoutError:
+      logger.debug('CNAME discovery operation timed out')
 
   async def __resolve_once_default_server(
     self: Self, domain_name: str, dns_server: DnsServerDto
@@ -602,10 +648,14 @@ class DomainsResolver:
       wait_started = perf_counter()
       acquired = False
       try:
-        async with self.__ripe_stat_semaphore:
+        async with RipeStatClient.lookup_budget(), self.__ripe_stat_semaphore:
           acquired = True
           observe_duration(ripe_duration, wait_started, phase='semaphore_wait', source='resolver', outcome='acquired')
           ripe_result = await self.__ripe_stat_client.get_prefix(address=resolved_ip)
+      except RipeStatClientError:
+        if not acquired:
+          observe_duration(ripe_duration, wait_started, phase='semaphore_wait', source='resolver', outcome='timeout')
+        raise
       except CancelledError:
         if not acquired:
           observe_duration(ripe_duration, wait_started, phase='semaphore_wait', source='resolver', outcome='cancelled')
@@ -668,13 +718,27 @@ class DomainsResolver:
           current_ips_by_network_address[network_address] = []
         current_ips_by_network_address[network_address].append(record)
 
-      for resolved_ip in resolved_ips:
-        if not domain.resolution_complete and resolved_ip in current_ips_by_network_address:
-          continue
-        current_ip_records = current_ips_by_network_address.get(resolved_ip, [])
-        storage_ip = await self.__get_ip_address_for_storage(
-          resolved_ip=resolved_ip, current_ip_records=current_ip_records
-        )
+      pending_ips = [
+        address
+        for address in resolved_ips
+        if domain.resolution_complete or address not in current_ips_by_network_address
+      ]
+      storage_ips: dict[str, str] = {}
+      pending = iter(pending_ips)
+
+      async def enrich_addresses() -> None:
+        for address in pending:
+          storage_ips[address] = await self.__get_ip_address_for_storage(
+            resolved_ip=address, current_ip_records=current_ips_by_network_address.get(address, [])
+          )
+
+      # A fixed worker set bounds task allocation as well as shared provider admission.
+      async with TaskGroup() as workers:
+        for _ in range(min(settings.ripe_stat_requests_semaphore_limit, len(pending_ips))):
+          workers.create_task(enrich_addresses())
+
+      for resolved_ip in pending_ips:
+        storage_ip = storage_ips[resolved_ip]
         network_address = get_ip_network_address(storage_ip)
 
         if network_address != resolved_ip:

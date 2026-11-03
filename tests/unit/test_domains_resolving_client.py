@@ -40,7 +40,7 @@ async def http_factory(app, monkeypatch):
 
   monkeypatch.setattr(Retry, 'asleep', skip_wait)
 
-  def install(handler, *, name='default', timeout=None, retry_methods=None):
+  def install(handler, *, name='default', timeout=None, retry_methods=None, **policy):
     async def send(transport, request):
       calls.append(request)
       result = handler(request)
@@ -54,7 +54,7 @@ async def http_factory(app, monkeypatch):
     monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', send)
     monkeypatch.setattr(httpx.AsyncHTTPTransport, 'aclose', close)
     kwargs = {} if retry_methods is None else {'retry_methods': retry_methods}
-    return module.HttpClient.get_client(name, timeout=timeout, **kwargs)
+    return module.HttpClient.get_client(name, timeout=timeout, **kwargs, **policy)
 
   yield SimpleNamespace(install=install, calls=calls, closes=closes, factory=module.HttpClient)
   await module.HttpClient.close()
@@ -1718,3 +1718,539 @@ async def test_job_copies_dns_collections_before_network_work(
   assert repository.put_domain_after_resolve.await_count == 2
   assert all(domain.resolution_complete for domain in domains)
   assert resolver.domains_resolve_queue._unfinished_tasks == 0
+
+
+@pytest.mark.parametrize(
+  'field',
+  [
+    'dns_timeout',
+    'dns_lifetime',
+    'dns_operation_timeout',
+    'doh_timeout_connect',
+    'doh_timeout_read',
+    'doh_timeout_write',
+    'doh_timeout_pool',
+    'doh_retry_total_timeout',
+    'doh_operation_timeout',
+    'ripe_stat_timeout_connect',
+    'ripe_stat_timeout_read',
+    'ripe_stat_timeout_write',
+    'ripe_stat_timeout_pool',
+    'ripe_stat_retry_total_timeout',
+    'ripe_stat_operation_timeout',
+  ],
+)
+@pytest.mark.parametrize('invalid', [0, -1, math.inf, math.nan])
+async def test_provider_duration_settings_reject_unbounded_or_nonpositive_values(app, field, invalid):
+  from pydantic import ValidationError
+
+  with pytest.raises(ValidationError) as caught:
+    type(app.settings)(_env_file=None, **{field: invalid})
+  assert field in {error['loc'][0] for error in caught.value.errors()}
+
+
+@pytest.mark.parametrize('field', ['doh_connection_retries', 'ripe_stat_connection_retries'])
+async def test_provider_retry_counts_allow_zero_and_reject_negative_values(app, field):
+  from pydantic import ValidationError
+
+  assert getattr(type(app.settings)(_env_file=None, **{field: 0}), field) == 0
+  with pytest.raises(ValidationError) as caught:
+    type(app.settings)(_env_file=None, **{field: -1})
+  assert field in {error['loc'][0] for error in caught.value.errors()}
+
+
+@pytest.mark.parametrize('value', [0, -1])
+async def test_ripe_concurrency_setting_rejects_permanent_admission_deadlock(app, value):
+  from pydantic import ValidationError
+
+  with pytest.raises(ValidationError) as caught:
+    type(app.settings)(_env_file=None, ripe_stat_requests_semaphore_limit=value)
+  assert 'ripe_stat_requests_semaphore_limit' in {error['loc'][0] for error in caught.value.errors()}
+
+
+async def test_provider_retry_override_is_independent_and_immutable(app, http_factory, monkeypatch):
+  monkeypatch.setattr(app.settings, 'req_connection_retries', 9)
+  client = http_factory.install(
+    lambda request: httpx.Response(503), name='bounded-provider', connection_retries=1, retry_total_timeout=0.5
+  )
+  assert (await client.get('https://provider.example.test/')).status_code == 503
+  assert len(http_factory.calls) == 2
+  assert http_factory.factory.get_client('bounded-provider', connection_retries=1, retry_total_timeout=0.5) is client
+  for policy in (
+    {'connection_retries': 2, 'retry_total_timeout': 0.5},
+    {'connection_retries': 1, 'retry_total_timeout': 0.6},
+  ):
+    with pytest.raises(ValueError, match='bounded-provider'):
+      http_factory.factory.get_client('bounded-provider', **policy)
+
+
+async def test_provider_retry_sleep_override_bounds_backoff_without_changing_general_policy(app, monkeypatch):
+  import httpx_retries.retry as retry_module
+
+  factory = importlib.import_module('client.http_base_client').HttpClient
+  await factory.close()
+  monkeypatch.setattr(app.settings, 'req_connection_retries', 9)
+  monkeypatch.setattr(app.settings, 'req_retry_total_timeout', 5)
+  monkeypatch.setattr(app.settings, 'req_retry_max_backoff_wait', 2)
+  delays, calls = [], []
+
+  async def sleep(delay):
+    delays.append(delay)
+
+  async def upstream(transport, request):
+    calls.append(request)
+    return httpx.Response(429, headers={'Retry-After': '999999'})
+
+  monkeypatch.setattr(retry_module, 'asyncio', SimpleNamespace(sleep=sleep))
+  monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', upstream)
+  try:
+    client = factory.get_client('limited', connection_retries=9, retry_total_timeout=0.5)
+    assert (await client.get('https://provider.example.test/')).status_code == 429
+    assert delays == [0.5]
+    assert len(calls) == 2
+    assert app.settings.req_retry_total_timeout == 5
+  finally:
+    await factory.close()
+
+
+@pytest.mark.parametrize('provider', ['doh', 'ripe_stat'])
+@pytest.mark.parametrize('retries', [0, 2])
+async def test_provider_composition_uses_its_own_phase_and_retry_settings(app, monkeypatch, provider, retries):
+  from httpx_retries import Retry
+
+  factory = importlib.import_module('client.http_base_client').HttpClient
+  await factory.close()
+  monkeypatch.setattr(app.settings, 'req_connection_retries', 9)
+  monkeypatch.setattr(app.settings, f'{provider}_connection_retries', retries)
+  phases = dict(connect=0.3, read=0.4, write=0.5, pool=0.6)
+  for phase, value in phases.items():
+    monkeypatch.setattr(app.settings, f'{provider}_timeout_{phase}', value)
+  calls = []
+
+  async def upstream(transport, request):
+    calls.append(request)
+    return httpx.Response(503)
+
+  async def no_sleep(self, response):
+    pass
+
+  monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', upstream)
+  monkeypatch.setattr(Retry, 'asleep', no_sleep)
+  module_name = 'client.domains_resolving_client' if provider == 'doh' else 'client.ripe_stat_client'
+  monkeypatch.delitem(sys.modules, module_name, raising=False)
+  module = importlib.import_module(module_name)
+  client = (
+    module.DomainsResolver._DomainsResolver__http_client
+    if provider == 'doh'
+    else module.RipeStatClient._RipeStatClient__client
+  )
+  try:
+    assert (await client.get('https://provider.example.test/')).status_code == 503
+    assert len(calls) == retries + 1
+    assert all(request.extensions['timeout'] == phases for request in calls)
+  finally:
+    await factory.close()
+
+
+@pytest.mark.parametrize('record_type', ['A', 'CNAME'])
+async def test_classic_dns_passes_explicit_timeout_and_lifetime(app, resolver, dns_message, monkeypatch, record_type):
+  monkeypatch.setattr(app.settings, 'dns_timeout', 0.4)
+  monkeypatch.setattr(app.settings, 'dns_lifetime', 0.9)
+  seen = []
+
+  async def classic(boundary, qname, rdtype, **kwargs):
+    seen.append((boundary.timeout, kwargs.get('lifetime', boundary.lifetime), rdtype, kwargs['search']))
+    return SimpleNamespace(response=dns_message('nodata', query=dns.message.make_query(qname, rdtype)))
+
+  monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
+  domain = app.dto.DomainResult(id=1, name='www.example.test')
+  server = app.Server(server='192.0.2.53')
+  if record_type == 'A':
+    result = await resolver._DomainsResolver__default_resolver(domain, server, dns.rdatatype.A)
+    assert result.status == app.dto.DnsQueryStatus.ABSENT
+  else:
+    aliases = []
+    await resolver._DomainsResolver__cname_default_resolver(domain, server, aliases)
+    assert aliases == []
+  assert seen == [(0.4, 0.9, getattr(dns.rdatatype, record_type), False)]
+
+
+@pytest.mark.parametrize('transport', ['classic', 'doh'])
+@pytest.mark.parametrize('record_type', ['A', 'CNAME'])
+@pytest.mark.parametrize('phase', ['semaphore', 'query'])
+async def test_dns_total_deadline_bounds_admission_and_query_without_external_cancellation(
+  app, resolver, monkeypatch, transport, record_type, phase
+):
+  monkeypatch.setattr(
+    app.settings, 'dns_operation_timeout' if transport == 'classic' else 'doh_operation_timeout', 0.02
+  )
+  entered = asyncio.Event()
+  exited = asyncio.Event()
+  calls = []
+
+  async def blocked(*args, **kwargs):
+    calls.append('query')
+    entered.set()
+    try:
+      await asyncio.Future()
+    finally:
+      exited.set()
+
+  semaphore = asyncio.Semaphore(1)
+  resolver._DomainsResolver__semaphore = semaphore
+  if phase == 'semaphore':
+    await semaphore.acquire()
+  if transport == 'classic':
+    monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', blocked)
+  else:
+    resolver._DomainsResolver__http_client = app.make_http(blocked)
+  prefix = 'default' if transport == 'classic' else 'doh'
+  arguments = dict(
+    domain=app.dto.DomainResult(id=1, name='www.example.test'),
+    dns_server=app.Server(server='192.0.2.53' if transport == 'classic' else 'https://dns.example.test/'),
+  )
+  aliases = []
+  if record_type == 'A':
+    method = getattr(resolver, f'_DomainsResolver__{prefix}_resolver')
+    arguments['lookup_type'] = dns.rdatatype.A
+  else:
+    method = getattr(resolver, f'_DomainsResolver__cname_{prefix}_resolver')
+    arguments['cname_domains'] = aliases
+  try:
+    result = await asyncio.wait_for(method(**arguments), timeout=1)
+  finally:
+    if phase == 'semaphore':
+      semaphore.release()
+  if record_type == 'A':
+    assert result.status == app.dto.DnsQueryStatus.FAILURE
+    assert result.addresses == ()
+  else:
+    assert aliases == []
+  assert calls == (['query'] if phase == 'query' else [])
+  assert entered.is_set() is (phase == 'query')
+  assert exited.is_set() is (phase == 'query')
+  await asyncio.wait_for(semaphore.acquire(), timeout=1)
+  semaphore.release()
+
+
+@pytest.mark.parametrize('provider', ['doh', 'ripe'])
+async def test_provider_deadline_closes_a_stalled_response_body(app, resolver, monkeypatch, provider):
+  setting = 'doh_operation_timeout' if provider == 'doh' else 'ripe_stat_operation_timeout'
+  monkeypatch.setattr(app.settings, setting, 0.02)
+  closed = []
+
+  class Stream(httpx.AsyncByteStream):
+    async def __aiter__(self):
+      yield b'partial'
+      await asyncio.Future()
+
+    async def aclose(self):
+      closed.append(True)
+
+  client = app.make_http(lambda request: httpx.Response(200, stream=Stream()))
+  if provider == 'doh':
+    resolver._DomainsResolver__http_client = client
+    result = await asyncio.wait_for(
+      resolver._DomainsResolver__doh_resolver(
+        app.dto.DomainResult(id=1, name='www.example.test'),
+        app.Server(server='https://dns.example.test/'),
+        dns.rdatatype.A,
+      ),
+      timeout=1,
+    )
+    assert result.status == app.dto.DnsQueryStatus.FAILURE
+  else:
+    ripe = app.ripe.RipeStatClient()
+    ripe._RipeStatClient__client = client
+    with pytest.raises(app.ripe.RipeStatClientError):
+      await asyncio.wait_for(ripe.get_prefix('8.8.8.0'), timeout=1)
+  assert closed == [True]
+
+
+@pytest.mark.parametrize('phase', ['cache_read', 'cache_recheck', 'lock', 'network'])
+@pytest.mark.parametrize('cancelled', [False, True])
+async def test_ripe_total_deadline_and_external_cancellation_cover_every_wait(app, monkeypatch, phase, cancelled):
+  cache = importlib.import_module('cache.cache').ripe_stat_cache
+  monkeypatch.setattr(app.settings, 'ripe_stat_operation_timeout', 1 if cancelled else 0.02)
+  entered, exited = asyncio.Event(), asyncio.Event()
+  calls, reads, releases = [], [], []
+
+  async def block():
+    entered.set()
+    try:
+      await asyncio.Future()
+    finally:
+      exited.set()
+
+  async def cache_read(key):
+    reads.append(key)
+    if phase == 'cache_read' or (phase == 'cache_recheck' and len(reads) == 2):
+      await block()
+    return None
+
+  @asynccontextmanager
+  async def lock(**kwargs):
+    if phase == 'lock':
+      await block()
+    try:
+      yield
+    finally:
+      releases.append(True)
+
+  async def upstream(request):
+    calls.append(request)
+    await block()
+
+  monkeypatch.setattr(cache, 'get', cache_read)
+  monkeypatch.setattr(cache, 'lock', lock)
+  ripe = app.ripe.RipeStatClient()
+  ripe._RipeStatClient__client = app.make_http(upstream)
+  metric_phase = {
+    'cache_read': 'cache_lookup',
+    'cache_recheck': 'cache_recheck',
+    'lock': 'lock_wait',
+    'network': 'network',
+  }[phase]
+  before_cancelled = metric_total('resolution_ripe_duration_seconds_count', phase=metric_phase, outcome='cancelled')
+  before_failure = metric_total('resolution_ripe_duration_seconds_count', phase=metric_phase, outcome='failure')
+  task = asyncio.create_task(ripe.get_prefix('8.8.8.0'))
+  try:
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    if cancelled:
+      task.cancel()
+    with pytest.raises(asyncio.CancelledError if cancelled else app.ripe.RipeStatClientError):
+      await asyncio.wait_for(task, timeout=1)
+    assert exited.is_set()
+    assert len(calls) == int(phase == 'network')
+    assert releases == ([True] if phase in {'cache_recheck', 'network'} else [])
+    assert metric_total(
+      'resolution_ripe_duration_seconds_count', phase=metric_phase, outcome='cancelled'
+    ) - before_cancelled == int(cancelled)
+    assert metric_total(
+      'resolution_ripe_duration_seconds_count', phase=metric_phase, outcome='failure'
+    ) - before_failure == int(not cancelled)
+  finally:
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_ripe_deadline_failure_releases_real_cache_lock_and_is_not_cached(app, monkeypatch):
+  monkeypatch.setattr(app.settings, 'ripe_stat_operation_timeout', 0.02)
+  calls = []
+
+  async def upstream(request):
+    calls.append(request)
+    if len(calls) == 1:
+      await asyncio.Future()
+    return httpx.Response(200, json={'status': 'ok', 'data': {'prefix': '8.8.8.0/24'}})
+
+  ripe = app.ripe.RipeStatClient()
+  ripe._RipeStatClient__client = app.make_http(upstream)
+  with pytest.raises(app.ripe.RipeStatClientError):
+    await asyncio.wait_for(ripe.get_prefix('8.8.8.0'), timeout=1)
+  assert (await asyncio.wait_for(ripe.get_prefix('8.8.8.0'), timeout=1)).prefix == '8.8.8.0/24'
+  assert (await asyncio.wait_for(ripe.get_prefix('8.8.8.0'), timeout=1)).prefix == '8.8.8.0/24'
+  assert len(calls) == 2
+
+
+async def test_ripe_admission_time_consumes_the_same_budget_as_network_wait(app, resolver, monkeypatch):
+  monkeypatch.setattr(app.settings, 'ripe_stat_operation_timeout', 0.6)
+  semaphore = asyncio.Semaphore(1)
+  await semaphore.acquire()
+  resolver._DomainsResolver__ripe_stat_semaphore = semaphore
+  entered, exited = asyncio.Event(), asyncio.Event()
+
+  async def upstream(request):
+    entered.set()
+    try:
+      await asyncio.Future()
+    finally:
+      exited.set()
+
+  ripe = app.ripe.RipeStatClient()
+  ripe._RipeStatClient__client = app.make_http(upstream)
+  resolver._DomainsResolver__ripe_stat_client = ripe
+  # This controlled admission delay consumes most of the operation's real timer.
+  release = asyncio.get_running_loop().call_later(0.4, semaphore.release)
+  task = asyncio.create_task(resolver._DomainsResolver__get_ip_address_for_storage('8.8.8.0', []))
+  try:
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    # A fresh network budget would still be blocked after this remaining window.
+    assert await asyncio.wait_for(task, timeout=0.4) == '8.8.8.0'
+    assert exited.is_set()
+  finally:
+    release.cancel()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_ripe_child_task_owns_deadline_after_parent_budget_scope_exits(app, monkeypatch):
+  monkeypatch.setattr(app.settings, 'ripe_stat_operation_timeout', 0.03)
+  entered, exited = asyncio.Event(), asyncio.Event()
+
+  async def upstream(request):
+    entered.set()
+    try:
+      await asyncio.Future()
+    finally:
+      exited.set()
+
+  ripe = app.ripe.RipeStatClient()
+  ripe._RipeStatClient__client = app.make_http(upstream)
+  task = None
+  try:
+    async with ripe.lookup_budget():
+      task = asyncio.create_task(ripe.get_prefix('8.8.8.0'))
+      await asyncio.wait_for(entered.wait(), timeout=1)
+    with pytest.raises(app.ripe.RipeStatClientError):
+      await asyncio.wait_for(task, timeout=1)
+    assert exited.is_set()
+  finally:
+    if task is not None:
+      task.cancel()
+      await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize('cancelled', [False, True])
+async def test_resolver_ripe_deadline_and_external_cancellation_keep_distinct_metrics(
+  app, resolver, monkeypatch, cancelled
+):
+  monkeypatch.setattr(app.settings, 'ripe_stat_operation_timeout', 1 if cancelled else 0.02)
+  entered = asyncio.Event()
+
+  async def upstream(request):
+    entered.set()
+    await asyncio.Future()
+
+  ripe = app.ripe.RipeStatClient()
+  ripe._RipeStatClient__client = app.make_http(upstream)
+  resolver._DomainsResolver__ripe_stat_client = ripe
+  before_cancelled = metric_total('resolution_ripe_duration_seconds_count', phase='lookup', outcome='cancelled')
+  before_failure = metric_total('resolution_ripe_duration_seconds_count', phase='lookup', outcome='failure')
+  task = asyncio.create_task(resolver._DomainsResolver__get_ip_address_for_storage('8.8.8.0', []))
+  try:
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    if cancelled:
+      task.cancel()
+      with pytest.raises(asyncio.CancelledError):
+        await task
+    else:
+      assert await asyncio.wait_for(task, timeout=1) == '8.8.8.0'
+    assert metric_total(
+      'resolution_ripe_duration_seconds_count', phase='lookup', outcome='cancelled'
+    ) - before_cancelled == int(cancelled)
+    assert metric_total(
+      'resolution_ripe_duration_seconds_count', phase='lookup', outcome='failure'
+    ) - before_failure == int(not cancelled)
+  finally:
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize('stored', [None, '8.8.8.0/25'])
+async def test_ripe_semaphore_deadline_preserves_stored_prefix_or_host(app, resolver, monkeypatch, stored):
+  monkeypatch.setattr(app.settings, 'ripe_stat_operation_timeout', 0.02)
+  semaphore = asyncio.Semaphore(1)
+  await semaphore.acquire()
+  resolver._DomainsResolver__ripe_stat_semaphore = semaphore
+  boundary = AsyncMock(side_effect=AssertionError('Admission timeout must not call the provider'))
+  resolver._DomainsResolver__ripe_stat_client = SimpleNamespace(get_prefix=boundary)
+  current = [] if stored is None else [app.Ip(id=10, ip_address=stored, addr_type=4)]
+  try:
+    result = await asyncio.wait_for(
+      resolver._DomainsResolver__get_ip_address_for_storage('8.8.8.0', current), timeout=1
+    )
+  finally:
+    semaphore.release()
+  assert result == (stored or '8.8.8.0')
+  boundary.assert_not_awaited()
+  await asyncio.wait_for(semaphore.acquire(), timeout=1)
+  semaphore.release()
+
+
+async def test_independent_ripe_lookups_overlap_and_share_one_global_limit(app, resolver, monkeypatch):
+  monkeypatch.setattr(app.settings, 'ripe_stat_requests_semaphore_limit', 2)
+  monkeypatch.setattr(app.settings, 'ripe_stat_operation_timeout', 2)
+  resolver._DomainsResolver__ripe_stat_semaphore = asyncio.Semaphore(2)
+  release, overlapped = asyncio.Event(), asyncio.Event()
+  active, peak = 0, 0
+  addresses = []
+
+  async def upstream(address):
+    nonlocal active, peak
+    addresses.append(address)
+    active += 1
+    peak = max(peak, active)
+    if active == 2:
+      overlapped.set()
+    try:
+      await release.wait()
+      return SimpleNamespace(prefix=f'{address}/24')
+    finally:
+      active -= 1
+
+  resolver._DomainsResolver__ripe_stat_client = SimpleNamespace(get_prefix=upstream)
+  domains = [
+    app.dto.DomainResult(id=index, name=f'domain-{index}.example.test', resolution_complete=True) for index in (1, 2)
+  ]
+  domains[0].result.A = ['8.8.8.0', '8.8.4.0', '8.8.8.0']
+  domains[1].result.A = ['9.9.9.0', '1.1.1.0']
+  tasks = [asyncio.create_task(resolver._DomainsResolver__ips_processing(domain, [])) for domain in domains]
+  try:
+    await asyncio.wait_for(overlapped.wait(), timeout=1)
+    assert peak == active == 2
+    release.set()
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+  finally:
+    release.set()
+    for task in tasks:
+      task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+  assert peak == 2
+  assert active == 0
+  assert sorted(addresses) == ['1.1.1.0', '8.8.4.0', '8.8.8.0', '9.9.9.0']
+  assert [{ip.ip_address for ip in domain.insert.ips_insert} for domain in domains] == [
+    {'8.8.8.0/24', '8.8.4.0/24'},
+    {'9.9.9.0/24', '1.1.1.0/24'},
+  ]
+  assert all(domain.insert.ips_delete == [] for domain in domains)
+
+
+async def test_ripe_worker_cancellation_drains_started_requests_and_releases_global_limit(app, resolver, monkeypatch):
+  monkeypatch.setattr(app.settings, 'ripe_stat_requests_semaphore_limit', 2)
+  resolver._DomainsResolver__ripe_stat_semaphore = asyncio.Semaphore(2)
+  entered = asyncio.Event()
+  active = 0
+
+  async def blocked(address):
+    nonlocal active
+    active += 1
+    if active == 2:
+      entered.set()
+    try:
+      await asyncio.Future()
+    finally:
+      active -= 1
+
+  resolver._DomainsResolver__ripe_stat_client = SimpleNamespace(get_prefix=blocked)
+  domain = app.dto.DomainResult(id=1, name='www.example.test', resolution_complete=True)
+  domain.result.A = [f'8.8.{index}.0' for index in range(64)]
+  original_tasks = asyncio.all_tasks()
+  task = asyncio.create_task(resolver._DomainsResolver__ips_processing(domain, []))
+  try:
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    # Waiting IPs must not each retain a separate task behind the provider semaphore.
+    assert len(asyncio.all_tasks() - original_tasks) <= 3
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+    assert active == 0
+    assert domain.insert.ips_insert == domain.insert.ips_delete == []
+    semaphore = resolver._DomainsResolver__ripe_stat_semaphore
+    await asyncio.wait_for(semaphore.acquire(), timeout=1)
+    await asyncio.wait_for(semaphore.acquire(), timeout=1)
+    semaphore.release()
+    semaphore.release()
+  finally:
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)

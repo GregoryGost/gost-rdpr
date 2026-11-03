@@ -532,8 +532,15 @@ async def e2e_service(tmp_path, dns_message, request):
     delay=0.0,
     unavailable=False,
     hold_dns=False,
+    drop_classic=False,
     dns_entered=asyncio.Event(),
     dns_release=asyncio.Event(),
+    hold_ripe=False,
+    ripe_entered=asyncio.Event(),
+    ripe_release=asyncio.Event(),
+    ripe_delay=0.0,
+    ripe_active=0,
+    ripe_peak_active=0,
   )
 
   def response_wire(query, transport):
@@ -551,6 +558,8 @@ async def e2e_service(tmp_path, dns_message, request):
     def datagram_received(self, data, address):
       query = dns.message.from_wire(data)
       wire = response_wire(query, 'classic')
+      if providers.drop_classic:
+        return
       if providers.delay:
         loop.call_later(providers.delay, self.transport.sendto, wire, address)
       else:
@@ -599,8 +608,18 @@ async def e2e_service(tmp_path, dns_message, request):
           media = 'application/dns-message'
         elif method == 'GET' and url.path == '/data/network-info/data.json':
           providers.requests.append(('ripe', params['resource'][0], None))
-          body = json.dumps({'status': 'ok', 'data': {'prefix': None}}).encode()
-          media = 'application/json'
+          providers.ripe_active += 1
+          providers.ripe_peak_active = max(providers.ripe_peak_active, providers.ripe_active)
+          providers.ripe_entered.set()
+          try:
+            if providers.hold_ripe:
+              await providers.ripe_release.wait()
+            if providers.ripe_delay:
+              await asyncio.sleep(providers.ripe_delay)
+            body = json.dumps({'status': 'ok', 'data': {'prefix': None}}).encode()
+            media = 'application/json'
+          finally:
+            providers.ripe_active -= 1
         else:
           raise AssertionError(f'Unexpected provider request: {method} {target}')
         writer.write(
@@ -647,6 +666,16 @@ async def e2e_service(tmp_path, dns_message, request):
         'DB_SHUTDOWN_TIMEOUT': '5',
         'RIPE_STAT_BASE_URL': provider_url,
         'REQ_CONNECTION_RETRIES': '0',
+        'DOH_CONNECTION_RETRIES': '0',
+        'RIPE_STAT_CONNECTION_RETRIES': '0',
+        'DOH_TIMEOUT_CONNECT': '2',
+        'DOH_TIMEOUT_READ': '2',
+        'DOH_TIMEOUT_WRITE': '2',
+        'DOH_TIMEOUT_POOL': '2',
+        'RIPE_STAT_TIMEOUT_CONNECT': '2',
+        'RIPE_STAT_TIMEOUT_READ': '2',
+        'RIPE_STAT_TIMEOUT_WRITE': '2',
+        'RIPE_STAT_TIMEOUT_POOL': '2',
         'REQ_TIMEOUT_DEFAULT': '2',
         'REQ_TIMEOUT_CONNECT': '2',
         'REQ_TIMEOUT_READ': '2',
@@ -670,6 +699,7 @@ async def e2e_service(tmp_path, dns_message, request):
     yield service
   finally:
     providers.dns_release.set()
+    providers.ripe_release.set()
     try:
       if service is not None:
         await service.stop()

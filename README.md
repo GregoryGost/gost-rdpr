@@ -98,6 +98,16 @@ Available environment variables
 | `REQ_MAX_KEEPALIVE_CONNECTIONS` | int | `30` | Maximum idle connections per named pool, capped by `REQ_MAX_CONNECTIONS` |
 | `REQ_SSL_VERIFY` | bool | `True` | When making a request over HTTPS, HTTPX needs to verify the identity of the requested host. To do this, it uses a bundle of SSL certificates (a.k.a. CA bundle) delivered by a trusted certificate authority (CA). You can disable SSL verification completely and allow insecure requests |
 | `REQ_DEFAULT_LIMIT` | int | `100` | Maximum number of records returned by a paginated API request |
+| `DNS_TIMEOUT` | float | `2.0` | Time in seconds for one ordinary DNS server response |
+| `DNS_LIFETIME` | float | `5.0` | Total ordinary DNS resolution lifetime, including its internal attempts |
+| `DNS_OPERATION_TIMEOUT` | float | `10.0` | Total budget for one ordinary A or CNAME operation, including semaphore admission |
+| `DOH_TIMEOUT_CONNECT` | float | `3.0` | DoH connect timeout |
+| `DOH_TIMEOUT_READ` | float | `5.0` | DoH timeout for an individual response read |
+| `DOH_TIMEOUT_WRITE` | float | `3.0` | DoH write timeout |
+| `DOH_TIMEOUT_POOL` | float | `2.0` | DoH connection-pool acquisition timeout |
+| `DOH_CONNECTION_RETRIES` | int | `1` | Maximum additional DoH HTTP attempts within the operation budget |
+| `DOH_RETRY_TOTAL_TIMEOUT` | float | `1.0` | Maximum cumulative DoH retry sleep |
+| `DOH_OPERATION_TIMEOUT` | float | `10.0` | Total budget for one DoH A or CNAME operation, including semaphore, pool, retry and response-body waits |
 | `DOMAINS_FILTERED_MIN_LEN` | int | `3` | The minimum domain length required to save it to the database. This is necessary to filter out empty domains that, for some reason, are generated in MikroTik scripts |
 | `DOMAINS_UPDATE_INTERVAL` | int | `172800` | Domain selection period. This means that if a domain has been processed, it will not be processed again until this period has passed. Specified in seconds. 172800s = 2days |
 | `DOMAINS_RESOLVE_SEMAPHORE_LIMIT` | int | `60` | Limit of concurrent domain resolving tasks |
@@ -111,6 +121,13 @@ Available environment variables
 | `ROS_REST_API_WRITE_TIMEOUT` | float or null | `None` | RouterOS write timeout; unset values inherit `ROS_REST_API_DEFAULT_TIMEOUT` |
 | `ROS_REST_API_POOL_TIMEOUT` | float or null | `None` | RouterOS pool-slot timeout; unset values inherit `ROS_REST_API_DEFAULT_TIMEOUT` |
 | `RIPE_STAT_BASE_URL` | str | `https://stat.ripe.net` | RIPEstat API base URL for IPv4 prefix lookups |
+| `RIPE_STAT_TIMEOUT_CONNECT` | float | `3.0` | RIPEstat connect timeout |
+| `RIPE_STAT_TIMEOUT_READ` | float | `5.0` | RIPEstat timeout for an individual response read |
+| `RIPE_STAT_TIMEOUT_WRITE` | float | `3.0` | RIPEstat write timeout |
+| `RIPE_STAT_TIMEOUT_POOL` | float | `2.0` | RIPEstat connection-pool acquisition timeout |
+| `RIPE_STAT_CONNECTION_RETRIES` | int | `1` | Maximum additional RIPEstat HTTP attempts within the lookup budget |
+| `RIPE_STAT_RETRY_TOTAL_TIMEOUT` | float | `1.0` | Maximum cumulative RIPEstat retry sleep |
+| `RIPE_STAT_OPERATION_TIMEOUT` | float | `10.0` | Total budget for one prefix lookup, including cache, cache-lock, retry and response-body waits; resolver lookups also include semaphore admission |
 | `RIPE_STAT_REQUESTS_SEMAPHORE_LIMIT` | int | `5` | Maximum number of concurrent RIPEstat prefix lookups during domain resolving |
 | `RIPE_STAT_CACHE_SIZE` | int | `10000` | Maximum number of RIPEstat prefix records in the in-memory cache |
 | `RIPE_STAT_PREFIX_CACHE_TTL_SEC` | int | `28800` | TTL in seconds for a RIPEstat result with a prefix |
@@ -135,11 +152,30 @@ cancellation and response-body failures after the transport returns are not repl
 additional attempts, and exponential backoff, jitter and `Retry-After` are bounded by the delay settings above.
 `REQ_RETRY_TOTAL_TIMEOUT` caps cumulative sleep only; it is not an end-to-end request deadline.
 
-All clients have explicit connect, read, write and pool timeouts. Defaults are respectively `20/30/20/20` seconds;
-RouterOS uses `20/59/59/59`. Write and pool overrides inherit their integration's default when unset. Read and write
+All clients have explicit connect, read, write and pool timeouts. General defaults are `20/30/20/20` seconds;
+DoH and RIPEstat each use `3/5/3/2`, and RouterOS uses `20/59/59/59`. General and RouterOS write and pool overrides
+inherit their integration's default when unset. Read and write
 timeouts bound individual I/O waits, not an entire streamed response. Reusing a client name with a conflicting
 effective configuration raises an error. Application shutdown closes the retry and base transports through the
 existing metrics wrapper. Environment certificate configuration remains supported; environment proxies are not used.
+
+DoH and RIPEstat use their own retry-count and cumulative-sleep settings instead of `REQ_CONNECTION_RETRIES` and
+`REQ_RETRY_TOTAL_TIMEOUT`. The common retryable methods, statuses, exceptions, backoff and jitter still apply.
+Use `DOH_TIMEOUT_*` and `RIPE_STAT_TIMEOUT_*` to override their phase timeouts; general `REQ_TIMEOUT_*` settings
+continue to configure the other HTTP clients.
+Their operation deadlines bound the complete asynchronous lookup, including response-body consumption; a slow stream
+cannot extend a lookup indefinitely by delivering small chunks. Duration settings must be positive and finite;
+retry counts may be zero to disable retries.
+
+Ordinary DNS explicitly uses `DNS_TIMEOUT` and `DNS_LIFETIME`. Each ordinary DNS or DoH A/CNAME query has its own
+operation budget, including admission to the shared DNS semaphore. These budgets apply to bulk, stored-domain and
+one-shot resolution. They are per-query budgets, not a deadline for an entire domain or job. All configured server
+results are combined; a timeout is failed evidence and cannot confirm the disappearance of stored addresses.
+
+Independent eligible IPv4 prefix lookups run concurrently through a bounded set of workers and the existing shared
+RIPEstat semaphore. Each lookup includes its semaphore wait in its operation budget. External cancellation propagates
+after workers are stopped and awaited. A failed or expired RIPEstat lookup retains the matching stored CIDR when one
+exists, otherwise the host address; failures are not cached as successful empty prefixes.
 
 ## Database connections
 
