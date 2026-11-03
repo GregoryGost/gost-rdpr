@@ -57,12 +57,18 @@ class Settings(BaseSettings):
   attempts_limit: int = Field(default=5) # Files download attempts limit
   httpx_log_level: str = Field(default='error')
   # HTTP client Requests section
-  req_connection_retries: int = Field(default=3)
-  req_timeout_default: float = Field(default=20.0)
-  req_timeout_connect: float = Field(default=20.0)
-  req_timeout_read: float = Field(default=30.0)
-  req_max_connections: int = Field(default=5)
-  req_max_keepalive_connections: int = Field(default=30)
+  req_connection_retries: int = Field(default=3, ge=0)
+  req_retry_backoff_factor: float = Field(default=0.25, ge=0, allow_inf_nan=False)
+  req_retry_backoff_jitter: float = Field(default=1.0, ge=0, le=1, allow_inf_nan=False)
+  req_retry_max_backoff_wait: float = Field(default=2.0, gt=0, allow_inf_nan=False)
+  req_retry_total_timeout: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+  req_timeout_default: float = Field(default=20.0, gt=0, allow_inf_nan=False)
+  req_timeout_connect: float = Field(default=20.0, gt=0, allow_inf_nan=False)
+  req_timeout_read: float = Field(default=30.0, gt=0, allow_inf_nan=False)
+  req_timeout_write: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+  req_timeout_pool: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+  req_max_connections: int = Field(default=5, gt=0)
+  req_max_keepalive_connections: int = Field(default=30, ge=0)
   req_ssl_verify: bool = Field(default=True)
   # Requests, Response models section
   req_default_limit: int = Field(default=100)
@@ -85,8 +91,14 @@ class Settings(BaseSettings):
     'ff00::/8, 2001:db8::/32'
   ))
   # ROUTEROS section
-  ros_rest_api_read_timeout: float = Field(default=59.0) # ROS REST API server read timeout = 60s
-  ros_rest_api_default_timeout: float = Field(default=59.0) # ROS REST API server base default timeout = 60s
+  ros_rest_api_read_timeout: float = Field(
+    default=59.0, gt=0, allow_inf_nan=False
+  )  # ROS REST API server read timeout = 60s
+  ros_rest_api_default_timeout: float = Field(
+    default=59.0, gt=0, allow_inf_nan=False
+  )  # ROS REST API server base default timeout = 60s
+  ros_rest_api_write_timeout: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+  ros_rest_api_pool_timeout: float | None = Field(default=None, gt=0, allow_inf_nan=False)
   # RIPE
   ripe_stat_base_url: str = Field(default='https://stat.ripe.net')
   ripe_stat_requests_semaphore_limit: int = Field(default=5)

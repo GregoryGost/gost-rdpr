@@ -5,6 +5,7 @@ import dataclasses
 import importlib
 import logging
 import math
+import sys
 import threading
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -20,6 +21,511 @@ import pytest
 from prometheus_client import REGISTRY
 
 pytestmark = pytest.mark.unit
+
+ROS_RETRY_METHODS = frozenset({'GET', 'POST', 'PATCH', 'DELETE'})
+
+
+@pytest.fixture
+async def http_factory(app, monkeypatch):
+  """Exercise the production retry chain while replacing only its wire boundary."""
+  from httpx_retries import Retry
+
+  module = importlib.import_module('client.http_base_client')
+  await module.HttpClient.close()
+  monkeypatch.setattr(app.settings, 'req_connection_retries', 3)
+  calls, closes = [], []
+
+  async def skip_wait(self, response):
+    pass
+
+  monkeypatch.setattr(Retry, 'asleep', skip_wait)
+
+  def install(handler, *, name='default', timeout=None, retry_methods=None):
+    async def send(transport, request):
+      calls.append(request)
+      result = handler(request)
+      if asyncio.iscoroutine(result):
+        result = await result
+      return result
+
+    async def close(transport):
+      closes.append(transport)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', send)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, 'aclose', close)
+    kwargs = {} if retry_methods is None else {'retry_methods': retry_methods}
+    return module.HttpClient.get_client(name, timeout=timeout, **kwargs)
+
+  yield SimpleNamespace(install=install, calls=calls, closes=closes, factory=module.HttpClient)
+  await module.HttpClient.close()
+
+
+@pytest.mark.parametrize('method', ['GET', 'POST', 'PATCH', 'DELETE'])
+@pytest.mark.parametrize('status', [429, 502, 503, 504])
+async def test_router_retryable_methods_recover_from_transient_status(http_factory, method, status):
+  def upstream(request):
+    assert request.content == b'fixed payload'
+    return httpx.Response(status if len(http_factory.calls) == 1 else 200, content=b'result')
+
+  client = http_factory.install(upstream, name='ros', retry_methods=ROS_RETRY_METHODS)
+  response = await client.request(method, 'http://router.example.test/rest/ip/route/print', content=b'fixed payload')
+  assert response.status_code == 200
+  assert response.content == b'result'
+  assert len(http_factory.calls) == 2
+
+
+@pytest.mark.parametrize('method', ['GET', 'POST', 'PATCH', 'DELETE'])
+@pytest.mark.parametrize('error_type', [httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteError])
+async def test_router_retryable_methods_recover_from_transport_failure(http_factory, method, error_type):
+  error = error_type('Synthetic transport failure')
+
+  def upstream(request):
+    if len(http_factory.calls) == 1:
+      raise error
+    return httpx.Response(200, content=b'recovered')
+
+  client = http_factory.install(upstream, name='ros', retry_methods=ROS_RETRY_METHODS)
+  assert (await client.request(method, 'http://router.example.test/rest/ip/route/print')).content == b'recovered'
+  assert len(http_factory.calls) == 2
+
+
+@pytest.mark.parametrize('method', ['GET', 'HEAD'])
+@pytest.mark.parametrize('failure', [503, httpx.ConnectError])
+async def test_general_read_methods_retry_transient_provider_failures(http_factory, method, failure):
+  def upstream(request):
+    if len(http_factory.calls) == 1:
+      if isinstance(failure, type):
+        raise failure('Synthetic read attempt failure')
+      return httpx.Response(failure)
+    return httpx.Response(200)
+
+  client = http_factory.install(upstream)
+  assert (await client.request(method, 'https://provider.example.test/')).status_code == 200
+  assert len(http_factory.calls) == 2
+
+
+@pytest.mark.parametrize(
+  'failure', [429, 502, 503, 504, httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError]
+)
+async def test_router_creation_put_is_never_automatically_replayed(http_factory, failure):
+  error = failure('Synthetic uncertain creation') if isinstance(failure, type) else None
+
+  def upstream(request):
+    if error is not None:
+      raise error
+    return httpx.Response(failure)
+
+  client = http_factory.install(upstream, name='ros', retry_methods=ROS_RETRY_METHODS)
+  if error is None:
+    assert (
+      await client.put('http://router.example.test/rest/routing/table', json={'name': 'test'})
+    ).status_code == failure
+  else:
+    with pytest.raises(type(error)) as caught:
+      await client.put('http://router.example.test/rest/routing/table', json={'name': 'test'})
+    assert caught.value is error
+  assert len(http_factory.calls) == 1
+
+
+@pytest.mark.parametrize('failure', [503, httpx.ConnectError])
+async def test_retry_count_is_additional_attempts_and_final_outcome_is_preserved(http_factory, failure):
+  error = failure('Synthetic unavailable provider') if isinstance(failure, type) else None
+
+  def upstream(request):
+    if error is not None:
+      raise error
+    return httpx.Response(failure, content=b'final provider response')
+
+  client = http_factory.install(upstream)
+  before_started = metric_total('httpx_exchanges_started_total')
+  before_terminal = metric_total('httpx_exchanges_terminal_total')
+  before_in_flight = metric_total('httpx_exchanges_in_flight')
+  if error is None:
+    response = await client.get('https://provider.example.test/')
+    assert response.status_code == 503
+    assert response.content == b'final provider response'
+  else:
+    with pytest.raises(type(error)) as caught:
+      await client.get('https://provider.example.test/')
+    assert caught.value is error
+  assert len(http_factory.calls) == 4
+  # Metrics describe one caller-visible exchange, including its hidden retry attempts.
+  assert metric_total('httpx_exchanges_started_total') - before_started == 1
+  assert metric_total('httpx_exchanges_terminal_total') - before_terminal == 1
+  assert metric_total('httpx_exchanges_in_flight') == before_in_flight
+
+
+@pytest.mark.parametrize('method', ['POST', 'PATCH', 'DELETE', 'PUT', 'OPTIONS'])
+async def test_general_clients_do_not_retry_unselected_methods(http_factory, method):
+  client = http_factory.install(lambda request: httpx.Response(503))
+  assert (await client.request(method, 'https://provider.example.test/')).status_code == 503
+  assert len(http_factory.calls) == 1
+
+
+@pytest.mark.parametrize('status', [400, 401, 403, 404, 409, 422, 500])
+async def test_retry_does_not_hide_permanent_http_failures(http_factory, status):
+  client = http_factory.install(lambda request: httpx.Response(status, content=b'permanent'))
+  response = await client.get('https://provider.example.test/')
+  assert response.status_code == status
+  assert response.content == b'permanent'
+  assert len(http_factory.calls) == 1
+
+
+@pytest.mark.parametrize(
+  'error_type', [httpx.PoolTimeout, httpx.LocalProtocolError, ValueError, asyncio.CancelledError]
+)
+async def test_retry_does_not_replay_pool_pressure_programming_errors_or_cancellation(http_factory, error_type):
+  error = error_type('Synthetic terminal failure')
+
+  def upstream(request):
+    raise error
+
+  client = http_factory.install(upstream)
+  with pytest.raises(error_type) as caught:
+    await client.get('https://provider.example.test/')
+  assert caught.value is error
+  assert len(http_factory.calls) == 1
+  assert metric_total('httpx_exchanges_in_flight') == 0
+
+
+@pytest.mark.parametrize('terminal', ['eof', 'closed', 'read_error', 'cancelled'])
+async def test_retry_chain_never_replays_returned_stream_and_closes_once(http_factory, terminal):
+  touches = []
+  error = asyncio.CancelledError() if terminal == 'cancelled' else httpx.ReadError('Synthetic body failure')
+
+  class Stream(httpx.AsyncByteStream):
+    async def __aiter__(self):
+      touches.append('read')
+      yield b'prefix'
+      if terminal in {'read_error', 'cancelled'}:
+        raise error
+      yield b'suffix'
+
+    async def aclose(self):
+      touches.append('close')
+
+  client = http_factory.install(lambda request: httpx.Response(200, stream=Stream()))
+  before = metric_total('httpx_exchanges_terminal_total')
+  response = await client.send(client.build_request('GET', 'https://provider.example.test/'), stream=True)
+  assert touches == []
+  assert metric_total('httpx_exchanges_in_flight') == 1
+  if terminal == 'closed':
+    await response.aclose()
+  elif terminal == 'eof':
+    assert await response.aread() == b'prefixsuffix'
+  else:
+    with pytest.raises(type(error)) as caught:
+      await response.aread()
+    assert caught.value is error
+  await response.aclose()
+  await response.aclose()
+  assert touches.count('close') == 1
+  assert len(http_factory.calls) == 1
+  assert metric_total('httpx_exchanges_terminal_total') - before == 1
+  assert metric_total('httpx_exchanges_in_flight') == 0
+
+
+async def test_retry_discards_failed_response_stream_before_next_attempt(http_factory):
+  touches = []
+
+  class UnreadFailure(httpx.AsyncByteStream):
+    async def __aiter__(self):
+      pytest.fail('The discarded transient error body must not be consumed')
+      yield b''
+
+    async def aclose(self):
+      touches.append('closed')
+
+  def upstream(request):
+    if len(http_factory.calls) == 1:
+      return httpx.Response(503, stream=UnreadFailure())
+    assert touches == ['closed']
+    return httpx.Response(200, content=b'final')
+
+  client = http_factory.install(upstream)
+  assert (await client.get('https://provider.example.test/')).content == b'final'
+  assert touches == ['closed']
+  assert len(http_factory.calls) == 2
+
+
+async def test_named_client_reuse_requires_matching_timeout_and_retry_policy(http_factory):
+  timeout = httpx.Timeout(connect=1, read=2, write=3, pool=4)
+  first = http_factory.install(lambda request: httpx.Response(200), name='named', timeout=timeout)
+  assert http_factory.factory.get_client('named', timeout=httpx.Timeout(connect=1, read=2, write=3, pool=4)) is first
+  with pytest.raises(ValueError, match='named'):
+    http_factory.factory.get_client('named', timeout=httpx.Timeout(connect=1, read=2, write=3, pool=5))
+  with pytest.raises(ValueError, match='named'):
+    http_factory.factory.get_client('named', timeout=timeout, retry_methods=ROS_RETRY_METHODS)
+  assert (await first.get('https://provider.example.test/')).status_code == 200
+
+
+async def test_explicit_timeout_reaches_every_request_phase(http_factory):
+  timeout = httpx.Timeout(connect=1, read=2, write=3, pool=4)
+
+  def upstream(request):
+    assert request.extensions['timeout'] == {'connect': 1, 'read': 2, 'write': 3, 'pool': 4}
+    return httpx.Response(200)
+
+  client = http_factory.install(upstream, timeout=timeout)
+  assert client.timeout == timeout
+  await client.get('https://provider.example.test/')
+
+
+async def test_named_clients_close_underlying_transport_and_can_be_recreated(http_factory):
+  first = http_factory.install(lambda request: httpx.Response(200), name='first')
+  second = http_factory.install(lambda request: httpx.Response(200), name='second')
+  await http_factory.factory.close()
+  assert first.is_closed
+  assert second.is_closed
+  assert len(http_factory.closes) == 2
+  await http_factory.factory.close()
+  assert len(http_factory.closes) == 2
+  replacement = http_factory.factory.get_client('first')
+  assert replacement is not first
+  assert not replacement.is_closed
+
+
+@pytest.mark.parametrize('overrides', [False, True])
+async def test_default_timeout_inherits_legacy_write_and_pool_defaults(app, http_factory, monkeypatch, overrides):
+  monkeypatch.setattr(app.settings, 'req_timeout_default', 13)
+  monkeypatch.setattr(app.settings, 'req_timeout_connect', 2)
+  monkeypatch.setattr(app.settings, 'req_timeout_read', 7)
+  monkeypatch.setattr(app.settings, 'req_timeout_write', 3 if overrides else None)
+  monkeypatch.setattr(app.settings, 'req_timeout_pool', 4 if overrides else None)
+  client = http_factory.install(lambda request: httpx.Response(200))
+  await client.get('https://provider.example.test/')
+  assert http_factory.calls[0].extensions['timeout'] == {
+    'connect': 2,
+    'read': 7,
+    'write': 3 if overrides else 13,
+    'pool': 4 if overrides else 13,
+  }
+
+
+@pytest.mark.parametrize(
+  ('field', 'invalid'),
+  [
+    ('req_max_connections', 0),
+    ('req_max_keepalive_connections', -1),
+    ('req_connection_retries', -1),
+    ('req_timeout_default', 0),
+    ('req_timeout_connect', -1),
+    ('req_timeout_read', math.inf),
+    ('req_timeout_write', 0),
+    ('req_timeout_pool', math.nan),
+    ('req_retry_backoff_factor', -1),
+    ('req_retry_backoff_jitter', 1.1),
+    ('req_retry_max_backoff_wait', 0),
+    ('req_retry_total_timeout', math.inf),
+    ('ros_rest_api_default_timeout', 0),
+    ('ros_rest_api_read_timeout', math.nan),
+    ('ros_rest_api_write_timeout', -1),
+    ('ros_rest_api_pool_timeout', 0),
+  ],
+)
+async def test_http_settings_reject_unbounded_or_invalid_resource_policy(app, field, invalid):
+  from pydantic import ValidationError
+
+  settings_type = type(app.settings)
+  with pytest.raises(ValidationError) as caught:
+    settings_type(_env_file=None, **{field: invalid})
+  assert field in {error['loc'][0] for error in caught.value.errors()}
+
+
+async def test_http_settings_allow_disabled_retry_and_keepalive_and_inherited_timeouts(app):
+  configured = type(app.settings)(
+    _env_file=None,
+    req_connection_retries=0,
+    req_max_keepalive_connections=0,
+    req_retry_backoff_factor=0,
+    req_retry_backoff_jitter=0,
+    req_timeout_write=None,
+    req_timeout_pool=None,
+    ros_rest_api_write_timeout=None,
+    ros_rest_api_pool_timeout=None,
+  )
+  assert configured.req_connection_retries == configured.req_max_keepalive_connections == 0
+  assert configured.req_timeout_write is configured.req_timeout_pool is None
+
+
+@pytest.mark.parametrize(
+  ('field', 'changed'),
+  [
+    ('req_max_connections', 8),
+    ('req_max_keepalive_connections', 2),
+    ('req_ssl_verify', False),
+    ('req_connection_retries', 1),
+    ('req_retry_backoff_factor', 0.5),
+    ('req_retry_backoff_jitter', 0.5),
+    ('req_retry_max_backoff_wait', 4),
+    ('req_retry_total_timeout', 8),
+    ('req_timeout_read', 8),
+  ],
+)
+async def test_named_clients_reject_changed_effective_transport_policy(app, http_factory, monkeypatch, field, changed):
+  first = http_factory.install(lambda request: httpx.Response(200), name='policy')
+  monkeypatch.setattr(app.settings, field, changed)
+  with pytest.raises(ValueError, match='policy'):
+    http_factory.factory.get_client('policy')
+  assert not first.is_closed
+  assert (await first.get('https://provider.example.test/')).status_code == 200
+
+
+@pytest.mark.parametrize('methods', [frozenset(), frozenset({'PUT'}), frozenset({'GET', 'PUT'})])
+async def test_factory_rejects_unsafe_or_empty_retry_method_policy(http_factory, methods):
+  with pytest.raises(ValueError, match='method'):
+    http_factory.factory.get_client('invalid', retry_methods=methods)
+  assert http_factory.calls == []
+
+
+@pytest.mark.parametrize('overrides', [False, True])
+async def test_real_router_client_selects_retry_methods_and_four_timeout_phases(
+  app, http_factory, monkeypatch, overrides
+):
+  monkeypatch.setattr(app.settings, 'req_timeout_connect', 2)
+  monkeypatch.setattr(app.settings, 'ros_rest_api_default_timeout', 59)
+  monkeypatch.setattr(app.settings, 'ros_rest_api_read_timeout', 58)
+  monkeypatch.setattr(app.settings, 'ros_rest_api_write_timeout', 7 if overrides else None)
+  monkeypatch.setattr(app.settings, 'ros_rest_api_pool_timeout', 8 if overrides else None)
+  # Re-import only the integration class so its import-owned policy uses this test's settings.
+  monkeypatch.delitem(sys.modules, 'client.ros_updater_client', raising=False)
+  module = importlib.import_module('client.ros_updater_client')
+  client = module.RosClient._RosClient__client
+  assert client.timeout == httpx.Timeout(connect=2, read=58, write=7 if overrides else 59, pool=8 if overrides else 59)
+  outcomes = []
+
+  async def send(transport, request):
+    outcomes.append(request.method)
+    return httpx.Response(503 if outcomes.count(request.method) == 1 else 200)
+
+  monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', send)
+  for method in ('GET', 'POST', 'PATCH', 'DELETE'):
+    assert (await client.request(method, 'http://router.example.test/rest/ip/route/print')).status_code == 200
+    assert outcomes.count(method) == 2
+  assert (await client.put('http://router.example.test/rest/routing/table')).status_code == 503
+  assert outcomes.count('PUT') == 1
+
+
+@pytest.mark.parametrize('retry_after', ['999999', 'Wed, 01 Jan 2098 00:00:00 GMT', 'malformed', None])
+async def test_retry_after_and_backoff_have_per_wait_and_total_sleep_bounds(app, monkeypatch, retry_after):
+  import httpx_retries.retry as retry_module
+
+  factory = importlib.import_module('client.http_base_client').HttpClient
+  await factory.close()
+  monkeypatch.setattr(app.settings, 'req_connection_retries', 10)
+  monkeypatch.setattr(app.settings, 'req_retry_backoff_factor', 1)
+  monkeypatch.setattr(app.settings, 'req_retry_backoff_jitter', 0)
+  monkeypatch.setattr(app.settings, 'req_retry_max_backoff_wait', 2)
+  monkeypatch.setattr(app.settings, 'req_retry_total_timeout', 5)
+  calls, delays = [], []
+
+  async def fake_sleep(delay):
+    delays.append(delay)
+
+  async def upstream(transport, request):
+    calls.append(request)
+    return httpx.Response(429, headers={} if retry_after is None else {'Retry-After': retry_after}, content=b'limited')
+
+  monkeypatch.setattr(retry_module, 'asyncio', SimpleNamespace(sleep=fake_sleep))
+  monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', upstream)
+  try:
+    response = await factory.get_client().get('https://provider.example.test/')
+    assert response.status_code == 429
+    assert response.content == b'limited'
+    assert delays == [2, 2, 1]
+    assert len(calls) == 4
+    if retry_after is not None:
+      assert response.headers['Retry-After'] == retry_after
+  finally:
+    await factory.close()
+
+
+@pytest.mark.parametrize('fraction', [0.0, 0.5, 1.0])
+async def test_retry_jitter_uses_configured_full_range_and_stays_within_wait_caps(app, monkeypatch, fraction):
+  import httpx_retries.retry as retry_module
+
+  factory = importlib.import_module('client.http_base_client').HttpClient
+  await factory.close()
+  monkeypatch.setattr(app.settings, 'req_connection_retries', 3)
+  monkeypatch.setattr(app.settings, 'req_retry_backoff_factor', 0.25)
+  monkeypatch.setattr(app.settings, 'req_retry_backoff_jitter', 1)
+  monkeypatch.setattr(app.settings, 'req_retry_max_backoff_wait', 2)
+  monkeypatch.setattr(app.settings, 'req_retry_total_timeout', 5)
+  draws, delays, calls = [], [], []
+
+  def uniform(low, high):
+    draws.append((low, high))
+    return low + (high - low) * fraction
+
+  async def fake_sleep(delay):
+    delays.append(delay)
+
+  async def upstream(transport, request):
+    calls.append(request)
+    return httpx.Response(503)
+
+  monkeypatch.setattr(retry_module, 'random', SimpleNamespace(uniform=uniform))
+  monkeypatch.setattr(retry_module, 'asyncio', SimpleNamespace(sleep=fake_sleep))
+  monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', upstream)
+  try:
+    assert (await factory.get_client().get('https://provider.example.test/')).status_code == 503
+    assert len(calls) == 4
+    assert draws == [(0, 1)] * 3
+    assert delays == [0.5 * fraction, fraction, 2 * fraction]
+    assert all(0 <= delay <= 2 for delay in delays)
+    assert sum(delays) <= 5
+  finally:
+    await factory.close()
+
+
+@pytest.mark.parametrize('verify', [False, True])
+async def test_transport_preserves_environment_certificate_policy(app, http_factory, monkeypatch, tmp_path, verify):
+  """A configured CA file must be honored when verification is enabled."""
+  monkeypatch.setenv('SSL_CERT_FILE', str(tmp_path / 'missing-test-ca.pem'))
+  monkeypatch.setattr(app.settings, 'req_ssl_verify', verify)
+  if verify:
+    with pytest.raises(FileNotFoundError):
+      http_factory.factory.get_client('certificate-policy')
+  else:
+    client = http_factory.factory.get_client('certificate-policy')
+    assert not client.is_closed
+
+
+@pytest.mark.parametrize('kind', ['firewall', 'route'])
+@pytest.mark.parametrize('final_status', [204, 404, 403])
+async def test_router_delete_recovers_lost_response_and_accepts_already_absent(
+  app, http_factory, monkeypatch, caplog, kind, final_status
+):
+  module = importlib.import_module('client.ros_updater_client')
+  config_module = importlib.import_module('models.dto.ros_config_dto')
+  responses = importlib.import_module('models.http.ros_rest_api_resp')
+  config = config_module.RosConfigDto(
+    id=1, host='router.example.test', user='dummy-user', passwd='dummy-password', bgp_list_name='test'
+  )
+  address = (
+    responses.RosFirewallIpResp(**{'.id': '*A', 'address': '8.8.8.8', 'list': 'test'})
+    if kind == 'firewall'
+    else responses.RosRoutingIpResp(**{'.id': '*A', 'dst-address': '8.8.8.8', 'gateway': '1.1.1.1'})
+  )
+
+  def upstream(request):
+    if len(http_factory.calls) == 1:
+      raise httpx.ReadError('Synthetic lost deletion response')
+    return httpx.Response(final_status)
+
+  client = http_factory.install(upstream, name='delete', retry_methods=ROS_RETRY_METHODS)
+  instance = module.RosClient()
+  monkeypatch.setattr(instance, '_RosClient__client', client)
+
+  async def no_pause(delay):
+    pass
+
+  monkeypatch.setattr(module, 'sleep', no_pause)
+  action = config_module.RosAction.FIREWALL_DELETE if kind == 'firewall' else config_module.RosAction.ROUTING_DELETE
+  await instance._RosClient__delete_from_ros(config, action, [address])
+  assert len(http_factory.calls) == 2
+  assert all(request.method == 'DELETE' and request.url.path.endswith('/*A') for request in http_factory.calls)
+  assert ('Delete failed' in caplog.text) is (final_status == 403)
 
 
 def metric_total(name, **labels):

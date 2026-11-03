@@ -106,6 +106,7 @@ def pytest_runtestloop(session):
 @pytest.fixture
 async def app(tmp_path, monkeypatch):
   """Prevent secret-file reads and production I/O before importing globals."""
+  real_http_send = httpx.AsyncHTTPTransport.handle_async_request
   _coverage_migration_directories.add(tmp_path / 'migrations')
   monkeypatch.setattr(dotenv, 'load_dotenv', lambda *args, **kwargs: False)
   monkeypatch.setattr(DotEnvSettingsSource, '_read_env_files', lambda self: {})
@@ -157,6 +158,7 @@ async def app(tmp_path, monkeypatch):
     Ip=ip_dto.IpRecordDto,
     ripe=ripe,
     make_http=make_http,
+    real_http_send=real_http_send,
   )
   try:
     yield value
@@ -522,6 +524,7 @@ async def e2e_service(tmp_path, dns_message, request):
     doh='positive',
     requests=[],
     http_requests=[],
+    http_statuses={},
     errors=[],
     classic_addresses=('8.8.8.8',),
     doh_addresses=('8.8.4.4',),
@@ -576,6 +579,14 @@ async def e2e_service(tmp_path, dns_message, request):
         if providers.delay:
           await asyncio.sleep(providers.delay)
         if providers.unavailable:
+          return
+        pending_statuses = providers.http_statuses.get(url.path, [])
+        if pending_statuses:
+          status = pending_statuses.pop(0)
+          writer.write(
+            f'HTTP/1.1 {status} Synthetic Provider Failure\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.encode()
+          )
+          await writer.drain()
           return
         if method == 'GET' and url.path == '/dns-query':
           assert headers.get('accept') == 'application/dns-message'

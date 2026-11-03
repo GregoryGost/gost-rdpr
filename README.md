@@ -84,12 +84,18 @@ Available environment variables
 | `DB_POOL_SIZE_OVERFLOW` | int | `2` | The number of connections to allow in connection pool `overflow`, that is connections that can be opened above and beyond the `db_pool_size` setting, which defaults to five |
 | `ATTEMPTS_LIMIT` | int | `5` | How many times a file must be checked with a negative result before it (and all its child entities) are deleted from the database |
 | `HTTPX_LOG_LEVEL` | str | `error` | HTTPX logging level |
-| `REQ_CONNECTION_RETRIES` | int | `3` | Requests will be retried the given number of times in case an `httpx.ConnectError` or an `httpx.ConnectTimeout` occurs, allowing smoother operation under flaky networks |
-| `REQ_TIMEOUT_DEFAULT` | float | `20.0` | General timeout for connections parameters `connect`, `read`, `write` or `pool` |
+| `REQ_CONNECTION_RETRIES` | int | `3` | Maximum additional attempts through `httpx-retries`, subject to the named client's method, status, exception and retry-sleep policy |
+| `REQ_RETRY_BACKOFF_FACTOR` | float | `0.25` | Exponential retry-backoff factor in seconds |
+| `REQ_RETRY_BACKOFF_JITTER` | float | `1.0` | Retry-backoff jitter fraction, between zero and one |
+| `REQ_RETRY_MAX_BACKOFF_WAIT` | float | `2.0` | Maximum delay for one retry, including `Retry-After` |
+| `REQ_RETRY_TOTAL_TIMEOUT` | float | `5.0` | Maximum cumulative retry sleep; excludes network I/O and pool waiting |
+| `REQ_TIMEOUT_DEFAULT` | float | `20.0` | Fallback for HTTP write and pool timeouts |
 | `REQ_TIMEOUT_CONNECT` | float | `20.0` | Individual timeout for `connect` |
 | `REQ_TIMEOUT_READ` | float | `30.0` | Individual timeout for `read` |
-| `REQ_MAX_CONNECTIONS` | int | `5` | The maximum number of allowable connections. `None` for no limits |
-| `REQ_MAX_KEEPALIVE_CONNECTIONS` | int | `30` | Number of allowable keep-alive connections. `None` to always allow |
+| `REQ_TIMEOUT_WRITE` | float or null | `None` | HTTP write timeout; unset values inherit `REQ_TIMEOUT_DEFAULT` |
+| `REQ_TIMEOUT_POOL` | float or null | `None` | Pool-slot acquisition timeout; unset values inherit `REQ_TIMEOUT_DEFAULT` |
+| `REQ_MAX_CONNECTIONS` | int | `5` | Maximum open connections in each named client's transport pool |
+| `REQ_MAX_KEEPALIVE_CONNECTIONS` | int | `30` | Maximum idle connections per named pool, capped by `REQ_MAX_CONNECTIONS` |
 | `REQ_SSL_VERIFY` | bool | `True` | When making a request over HTTPS, HTTPX needs to verify the identity of the requested host. To do this, it uses a bundle of SSL certificates (a.k.a. CA bundle) delivered by a trusted certificate authority (CA). You can disable SSL verification completely and allow insecure requests |
 | `REQ_DEFAULT_LIMIT` | int | `100` | Maximum number of records returned by a paginated API request |
 | `DOMAINS_FILTERED_MIN_LEN` | int | `3` | The minimum domain length required to save it to the database. This is necessary to filter out empty domains that, for some reason, are generated in MikroTik scripts |
@@ -102,12 +108,38 @@ Available environment variables
 | `IP_NOT_ALLOWED` | str | `0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4, ::/128, ::1/128, fc00::/7, fe80::/10, ff00::/8, 2001:db8::/32` | Comma-separated CIDR networks that must not be saved in the database. |
 | `ROS_REST_API_READ_TIMEOUT` | float | `59.0` | ROS REST API server timeout = 60s |
 | `ROS_REST_API_DEFAULT_TIMEOUT` | float | `59.0` | Default timeout for RouterOS REST API requests |
+| `ROS_REST_API_WRITE_TIMEOUT` | float or null | `None` | RouterOS write timeout; unset values inherit `ROS_REST_API_DEFAULT_TIMEOUT` |
+| `ROS_REST_API_POOL_TIMEOUT` | float or null | `None` | RouterOS pool-slot timeout; unset values inherit `ROS_REST_API_DEFAULT_TIMEOUT` |
 | `RIPE_STAT_BASE_URL` | str | `https://stat.ripe.net` | RIPEstat API base URL for IPv4 prefix lookups |
 | `RIPE_STAT_REQUESTS_SEMAPHORE_LIMIT` | int | `5` | Maximum number of concurrent RIPEstat prefix lookups during domain resolving |
 | `RIPE_STAT_CACHE_SIZE` | int | `10000` | Maximum number of RIPEstat prefix records in the in-memory cache |
 | `RIPE_STAT_PREFIX_CACHE_TTL_SEC` | int | `28800` | TTL in seconds for a RIPEstat result with a prefix |
 | `RIPE_STAT_EMPTY_PREFIX_CACHE_TTL_SEC` | int | `3600` | TTL in seconds for a RIPEstat result without a prefix |
 | `RIPE_STAT_CACHE_LOCK_TTL_SEC` | int | `120` | Maximum lifetime in seconds of a per-IP RIPEstat cache lock |
+
+## Outbound HTTP connections
+
+`HttpClient` owns one reusable client and transport pool per name. Connection limits are passed to the base
+`AsyncHTTPTransport`; they do not limit requests per second or all clients together. With the defaults, each pool
+allows five open connections and at most five idle connections, despite the configured idle limit of thirty.
+HTTPX retains its five-second idle connection expiry.
+
+`RetryTransport` is the only automatic retry owner; native transport retries are disabled. Ordinary clients retry
+`GET` and `HEAD`. The RouterOS profile retries `GET`, `POST`, `PATCH` and `DELETE`; `PUT` is always sent once,
+including on connection failure. Existing RouterOS `POST` calls only read `/print` output, while `PUT` creates
+tables, firewall entries and routes. A missing object (`404`) during deletion already satisfies the desired state.
+
+Retryable HTTP statuses are `429`, `502`, `503` and `504`. The selected transport exceptions are `ConnectError`,
+`ConnectTimeout`, `ReadError`, `ReadTimeout`, `WriteError`, `WriteTimeout` and `RemoteProtocolError`. Pool exhaustion,
+cancellation and response-body failures after the transport returns are not replayed. The retry count limits
+additional attempts, and exponential backoff, jitter and `Retry-After` are bounded by the delay settings above.
+`REQ_RETRY_TOTAL_TIMEOUT` caps cumulative sleep only; it is not an end-to-end request deadline.
+
+All clients have explicit connect, read, write and pool timeouts. Defaults are respectively `20/30/20/20` seconds;
+RouterOS uses `20/59/59/59`. Write and pool overrides inherit their integration's default when unset. Read and write
+timeouts bound individual I/O waits, not an entire streamed response. Reusing a client name with a conflicting
+effective configuration raises an error. Application shutdown closes the retry and base transports through the
+existing metrics wrapper. Environment certificate configuration remains supported; environment proxies are not used.
 
 ## Database connections
 

@@ -40,11 +40,23 @@ class RosClient:
     'User-Agent': f'{settings.app_title} [{settings.app_version}]'
   }
   __timeout: Timeout = Timeout(
-    timeout=settings.ros_rest_api_default_timeout,
     connect=settings.req_timeout_connect,
-    read=settings.ros_rest_api_read_timeout
+    read=settings.ros_rest_api_read_timeout,
+    write=(
+      settings.ros_rest_api_write_timeout
+      if settings.ros_rest_api_write_timeout is not None
+      else settings.ros_rest_api_default_timeout
+    ),
+    pool=(
+      settings.ros_rest_api_pool_timeout
+      if settings.ros_rest_api_pool_timeout is not None
+      else settings.ros_rest_api_default_timeout
+    ),
   )
-  __client: AsyncClient = HttpClient.get_client('ros', timeout=__timeout)
+  # POST only reads /print; PATCH sets a fixed gateway; DELETE targets an exact object ID.
+  __client: AsyncClient = HttpClient.get_client(
+    'ros', timeout=__timeout, retry_methods=frozenset({'GET', 'POST', 'PATCH', 'DELETE'})
+  )
   __fw_strict_addr_list_postfix: str = 'strict'
 
   def __init__(self: Self) -> None:
@@ -460,12 +472,14 @@ class RosClient:
           if action == RosAction.FIREWALL_DELETE:
             url = f'http://{config.host}/rest/ip/firewall/address-list/{address.id}'
             response: Response = await self.__client.delete(url=url, auth=auth, headers=self.__headers)
-            response.raise_for_status()
+            if response.status_code != 404:
+              response.raise_for_status()
           if action == RosAction.ROUTING_DELETE:
             if address.type == 4:
               url = f'http://{config.host}/rest/ip/route/{address.id}'
               response: Response = await self.__client.delete(url=url, auth=auth, headers=self.__headers)
-              response.raise_for_status()
+              if response.status_code != 404:
+                response.raise_for_status()
             else:
               url = f'http://{config.host}/rest/ipv6/route/{address.id}'
               continue

@@ -3345,3 +3345,162 @@ async def test_reproducible_local_measurement_baseline(e2e_service, tmp_path):
     encoding='utf-8',
   )
   assert len(scenarios) == 6
+
+
+async def test_http_pool_enforces_capacity_and_cancelled_stream_releases_connection(app, monkeypatch):
+  """Use real sockets: a MockTransport cannot establish connection-pool admission."""
+  factory = importlib.import_module('client.http_base_client').HttpClient
+  await factory.close()
+  monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', app.real_http_send)
+  monkeypatch.setattr(app.settings, 'req_max_connections', 2)
+  monkeypatch.setattr(app.settings, 'req_max_keepalive_connections', 1)
+  monkeypatch.setattr(app.settings, 'req_connection_retries', 0)
+  # Custom transports historically bypass ambient proxies; keep local admission direct.
+  for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY'):
+    monkeypatch.setenv(key, 'http://127.0.0.1:1')
+  monkeypatch.setenv('NO_PROXY', '')
+  accepted, writers, handlers = [], set(), set()
+  release = asyncio.Event()
+
+  async def serve(reader, writer):
+    task = asyncio.current_task()
+    handlers.add(task)
+    writers.add(writer)
+    try:
+      async with asyncio.timeout(5):
+        await reader.readuntil(b'\r\n\r\n')
+        accepted.append(writer)
+        writer.write(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nx')
+        await writer.drain()
+        await release.wait()
+        writer.write(b'y')
+        await writer.drain()
+    except ConnectionError:
+      pass
+    finally:
+      writer.close()
+      await writer.wait_closed()
+      writers.discard(writer)
+      handlers.discard(task)
+
+  server = await asyncio.start_server(serve, '127.0.0.1', 0)
+  url = f'http://127.0.0.1:{server.sockets[0].getsockname()[1]}/'
+  client = factory.get_client('default', timeout=httpx.Timeout(connect=1, read=2, write=1, pool=0.05))
+  pool = client._transport._transport._async_transport._pool
+  assert pool._max_connections == 2
+  assert pool._max_keepalive_connections == 1
+  assert pool._retries == 0
+  opened = [asyncio.Event(), asyncio.Event()]
+
+  async def hold(index):
+    async with client.stream('GET', url) as response:
+      assert response.status_code == 200
+      opened[index].set()
+      await asyncio.Future()
+
+  tasks = [asyncio.create_task(hold(index)) for index in range(2)]
+  try:
+    await asyncio.wait_for(asyncio.gather(*(event.wait() for event in opened)), timeout=2)
+    assert len(accepted) == 2
+    with pytest.raises(httpx.PoolTimeout):
+      await asyncio.wait_for(client.get(url), timeout=1)
+    assert len(accepted) == 2
+    tasks[0].cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await tasks[0]
+    response = await asyncio.wait_for(client.send(client.build_request('GET', url), stream=True), timeout=1)
+    assert response.status_code == 200
+    assert len(accepted) == 3
+    await response.aclose()
+  finally:
+    for task in tasks:
+      task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    release.set()
+    await factory.close()
+    server.close()
+    await server.wait_closed()
+    for writer in tuple(writers):
+      writer.close()
+    if handlers:
+      await asyncio.wait_for(asyncio.gather(*tuple(handlers)), timeout=2)
+  assert client.is_closed
+  assert (
+    sum(
+      sample.value
+      for family in REGISTRY.collect()
+      for sample in family.samples
+      if sample.name == 'httpx_exchanges_in_flight'
+    )
+    == 0
+  )
+
+
+async def test_router_put_has_no_hidden_native_connect_retries(app, monkeypatch):
+  """Fail below HTTPX to detect retries hidden inside the real transport pool."""
+  import httpcore
+  from httpcore._backends.auto import AutoBackend
+  from httpx_retries import Retry
+
+  factory = importlib.import_module('client.http_base_client').HttpClient
+  await factory.close()
+  monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', app.real_http_send)
+  monkeypatch.setattr(app.settings, 'req_connection_retries', 3)
+  calls = []
+
+  async def unavailable(self, *args, **kwargs):
+    calls.append((args, kwargs))
+    raise httpcore.ConnectError('Synthetic connection refused')
+
+  async def skip_wait(self, response):
+    pass
+
+  monkeypatch.setattr(AutoBackend, 'connect_tcp', unavailable)
+  monkeypatch.setattr(Retry, 'asleep', skip_wait)
+  client = factory.get_client('ros', retry_methods=frozenset({'GET', 'POST', 'PATCH', 'DELETE'}))
+  try:
+    with pytest.raises(httpx.ConnectError):
+      await client.put('http://127.0.0.1:1/rest/routing/table', json={'name': 'test'})
+    assert len(calls) == 1
+    calls.clear()
+    with pytest.raises(httpx.ConnectError):
+      await client.get('http://127.0.0.1:1/rest/system/resource')
+    assert len(calls) == 4
+  finally:
+    await factory.close()
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('exhausted', [False, True])
+async def test_public_http_retries_preserve_resolution_persistence_and_logical_metrics(e2e_service, exhausted):
+  """Drive production wiring and writer against transient or exhausted wire-level failures."""
+  service = e2e_service
+  await service.stop()
+  service.environment.update({'REQ_CONNECTION_RETRIES': '2', 'REQ_RETRY_BACKOFF_FACTOR': '0'})
+  await service.start()
+  domain_id = await configure_public_domain(service)
+  before = public_flow_snapshot(service, domain_id)
+  service.providers.classic = 'servfail' if exhausted else 'positive'
+  service.providers.http_statuses['/dns-query'] = [503] * (6 if exhausted else 1)
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    response = await client.post(f'/domains/{domain_id}/resolve')
+    assert response.status_code == 202
+    samples, fields = await completed_metrics(client, mode='stored', selected=1)
+    assert fields['attempted'] == fields['failure' if exhausted else 'success'] == 1
+    assert fields['admitted'] == fields['confirmed'] == int(not exhausted)
+    assert fields['pending'] == fields['unknown'] == 0
+    assert sample_total(samples, 'httpx_exchanges_in_flight') == 0
+    assert sample_total(samples, 'httpx_exchanges_started_total') == sample_total(
+      samples, 'httpx_exchanges_terminal_total'
+    )
+    assert sample_total(samples, 'httpx_exchanges_started_total', integration='domains_resolver') == 2
+  assert service.providers.http_requests.count(('GET', '/dns-query')) == (6 if exhausted else 3)
+  assert service.providers.http_statuses['/dns-query'] == []
+  after = public_flow_snapshot(service, domain_id)
+  if exhausted:
+    assert after == before
+  else:
+    assert after[0][0] == 1
+    assert after[0][1] != before[0][1]
+    assert set(after[1]) == {'8.8.8.8', '8.8.4.4', '2001:4860:4860::8888'}
+    assert after[1]['2001:4860:4860::8888'] == before[1]['2001:4860:4860::8888']

@@ -563,14 +563,22 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
 - HTTP client library: HTTPX.
 - Retry layer: `httpx-retries`.
 - Active HTTP client skill: `python-httpx-client`.
-- Timeout policy source: `config/config.py` and the integration-specific client contract.
+- Timeout policy source: `config/config.py` and the integration-specific client contract. Connect, read, write and pool
+  phases are explicit; unset write/pool overrides inherit the integration default. Defaults remain `20/30/20/20`
+  seconds for ordinary clients and `20/59/59/59` for RouterOS.
 - External dependency stub policy: `httpx.MockTransport` for outbound unit tests;
   `httpx.ASGITransport` where the tested boundary is an in-process ASGI app.
 - Dependency versions source: `pyproject.toml` and `poetry.lock`.
-- Migration direction: use `RetryTransport` as the single retry owner; do not stack it with native transport retries.
-- Current implementation baseline: `client/http_base_client.py::HttpClient` still uses
-  `AsyncHTTPTransport(retries=settings.req_connection_retries)`. The user explicitly selected the
-  `httpx-retries` profile for the forthcoming transition. This activation does not itself migrate application code.
+- Retry owner: `RetryTransport` wraps a base `AsyncHTTPTransport` with native retries disabled and configured pool
+  limits. Ordinary profiles allow `GET`/`HEAD`; RouterOS allows `GET`/`POST`/`PATCH`/`DELETE`, never `PUT`.
+  RouterOS currently uses `POST` only for `/print` reads and `PUT` for creation; preserve this operation boundary.
+  Only explicitly selected statuses/exceptions retry; `PoolTimeout`, cancellation and returned response-body failures
+  do not. Backoff, jitter and `Retry-After` are bounded; `req_retry_total_timeout` limits cumulative sleep, not full
+  request duration. Separate per-provider network budgets remain outside this common transport policy.
+- Named client profiles are immutable: reuse matching effective configuration and reject conflicting configuration.
+  Limits apply independently to each pool; HTTPcore caps idle connections by the open-connection limit.
+- `ObservedAsyncTransport` stays outside the retry layer, preserving one measured exchange across its attempts.
+  Environment certificate configuration remains supported, while environment proxy mounts remain disabled.
 - Client owner: `HttpClient`; named clients are closed by FastAPI lifespan.
 - Preserve RouterOS integration contracts; private router targets can be intentional.
   Determine trust boundaries separately for configured devices and user-supplied list URLs before security changes.
