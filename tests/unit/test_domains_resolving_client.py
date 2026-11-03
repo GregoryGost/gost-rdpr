@@ -1135,3 +1135,80 @@ async def test_resolve_queue_measures_admission_and_residence_from_successful_pu
   )
   assert domain.admitted_at is None
   assert domain.processing_outcome == 'success'
+
+
+async def test_dns_snapshot_elements_reject_mutation(app):
+  server = app.Server(server='192.0.2.53', id=42)
+  with pytest.raises(dataclasses.FrozenInstanceError):
+    server.server = '192.0.2.54'
+  with pytest.raises(dataclasses.FrozenInstanceError):
+    server.id = 43
+  assert dataclasses.asdict(server) == {'server': '192.0.2.53', 'id': 42}
+
+
+async def test_single_checks_reload_dns_and_explicit_selection_bypasses_configuration(
+  app, resolver, repository, network
+):
+  requests = network({'192.0.2.53': 'positive', '192.0.2.54': 'nodata', '192.0.2.55': 'positive'})
+  repository.get_dns_servers_for_resolve.side_effect = [
+    ([app.Server(server='192.0.2.53', id=42)], []),
+    ([app.Server(server='192.0.2.54', id=43)], []),
+  ]
+  first = await resolver.resolve_once('www.example.test')
+  second = await resolver.resolve_once('www.example.test')
+  assert [(row.server, row.ips_v4) for row in first.results] == [('192.0.2.53', ['8.8.8.8'])]
+  assert [(row.server, row.ips_v4) for row in second.results] == [('192.0.2.54', [])]
+  repository.get_dns_servers_for_resolve.side_effect = RuntimeError('Configuration must be bypassed')
+  before = metric_total('resolution_dns_duration_seconds_count', server_id='88', transport='classic')
+  selected = SimpleNamespace(id=88, server='192.0.2.55', doh_server=None)
+  third = await resolver.resolve_once('www.example.test', selected_dns_servers=[selected])
+  assert [(row.server, row.ips_v4) for row in third.results] == [('192.0.2.55', ['8.8.8.8'])]
+  assert repository.get_dns_servers_for_resolve.await_count == 2
+  assert {server for server, _ in requests} == {'192.0.2.53', '192.0.2.54', '192.0.2.55'}
+  assert metric_total('resolution_dns_duration_seconds_count', server_id='88', transport='classic') - before == 2
+  repository.put_domain_after_resolve.assert_not_awaited()
+
+
+@pytest.mark.parametrize('mode', ['new', 'stale'])
+async def test_empty_job_does_not_read_dns_or_admit_work(app, resolver, repository, monkeypatch, mode):
+  jobs = importlib.import_module('jobs.job_registry')
+  monkeypatch.setattr(resolver, 'domains_resolve_queue', asyncio.Queue(maxsize=1))
+  repository.get_new_domains_for_resolve = AsyncMock(return_value=[])
+  repository.get_stale_domains_for_resolve = AsyncMock(return_value=[])
+  repository.get_dns_servers_for_resolve.side_effect = RuntimeError('An empty job needs no configuration')
+  await asyncio.wait_for(resolver.domains_resolve(getattr(jobs.Jobs, f'DOMAINS_RESOLVE_{mode.upper()}')), timeout=2)
+  repository.get_dns_servers_for_resolve.assert_not_awaited()
+  repository.put_domain_after_resolve.assert_not_awaited()
+  assert resolver.domains_resolve_queue.qsize() == resolver.domains_resolve_queue._unfinished_tasks == 0
+
+
+@pytest.mark.parametrize('mode', ['new', 'stale'])
+async def test_job_copies_dns_collections_before_network_work(
+  app, resolver, repository, monkeypatch, dns_message, mode
+):
+  jobs = importlib.import_module('jobs.job_registry')
+  monkeypatch.setattr(resolver, 'domains_resolve_queue', asyncio.Queue(maxsize=1))
+  monkeypatch.setattr(resolver, '_DomainsResolver__stop_domains_resolve_event', threading.Event())
+  domains = [app.dto.DomainResult(id=index, name=f'domain-{index}.example.test') for index in (1, 2)]
+  repository.get_new_domains_for_resolve = AsyncMock(return_value=domains)
+  repository.get_stale_domains_for_resolve = AsyncMock(return_value=domains)
+  source_servers = [app.Server(server='192.0.2.53', id=42)]
+  repository.get_dns_servers_for_resolve.return_value = (source_servers, [])
+  requests = []
+
+  async def classic(boundary, qname, rdtype, **kwargs):
+    requests.append((boundary.nameservers[0], qname, rdtype))
+    source_servers[:] = [app.Server(server='192.0.2.54', id=43)]
+    return SimpleNamespace(response=dns_message('nodata', query=dns.message.make_query(qname, rdtype)))
+
+  monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
+  await asyncio.wait_for(resolver.domains_resolve(getattr(jobs.Jobs, f'DOMAINS_RESOLVE_{mode.upper()}')), timeout=2)
+  assert set(requests) == {
+    ('192.0.2.53', domain.name, record_type)
+    for domain in domains
+    for record_type in (dns.rdatatype.A, dns.rdatatype.CNAME)
+  }
+  repository.get_dns_servers_for_resolve.assert_awaited_once_with()
+  assert repository.put_domain_after_resolve.await_count == 2
+  assert all(domain.resolution_complete for domain in domains)
+  assert resolver.domains_resolve_queue._unfinished_tasks == 0

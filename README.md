@@ -71,11 +71,11 @@ Available environment variables
 | `DB_SAVE_BATCH_SIZE` | int | `1000` | The maximum number of all insert, update, and delete events in the database queue. This means we write a maximum of 1000 events to the file at a time (which can be very frequent). But you should also look at the timeout parameter |
 | `DB_SAVE_BATCH_TIMEOUT` | float | `5.0` | Maximum time in seconds from the first event in a pending batch until that partial batch is flushed |
 | `DB_SHUTDOWN_TIMEOUT` | float | `20.0` | Time in seconds to wait for the database writer during shutdown. Expiry reports unresolved writes; it does not imply a successful drain |
-| `DB_TUNE_JOURNAL_MODE` | str | `WAL` | Write-Ahead Logging - better concurrent access |
+| `DB_TUNE_JOURNAL_MODE` | str | `WAL` | SQLite journal mode: `WAL`, `DELETE`, `TRUNCATE`, `PERSIST` or `MEMORY`. `OFF` is rejected because transactions require rollback support |
 | `DB_TUNE_WAL_AUTOCHECKPOINT` | int | `1000` | Initiate a checkpoint approximately every 1000 WAL pages (choose experimentally: if WAL grows too quickly, decrease it; if checkpoints interfere, increase it) |
 | `DB_TUNE_SYNCHRONOUS` | str | `NORMAL` | NORMAL - A good balance of performance and reliability for most VDS applications. `FULL`` provides maximum reliability, but is more expensive in terms of I/O. |
 | `DB_TUNE_TEMP_STORE` | str | `FILE` | Defines where SQLite stores temporary tables and indexes. `MEMORY` can improve performance but increases memory consumption |
-| `DB_TUNE_MMAP_SIZE` | int | `0` | Defines the maximum amount of database file memory mapping. `0` disables memory-mapped I/O. Higher values may improve read performance but increase container memory usage |
+| `DB_TUNE_MMAP_SIZE` | int | `0` | Maximum database file memory mapping in bytes. `0` disables mapping; a negative value restores the SQLite build default. The effective size may be capped by SQLite or the platform |
 | `DB_TUNE_CACHE_SIZE` | int | `-2048` | If the value is negative, SQLite treats it as kibibytes; `-2048` means about 2 MiB cache. Positive values are interpreted as number of database pages. Lower values reduce RAM usage; higher values may improve performance at the cost of memory |
 | `DB_TUNE_BUSY_TIMEOUT` | int | `2000` | This is the timeout (in milliseconds) during which SQLite will retry acquiring a lock instead of immediately failing with a "database is locked" error. Defaults in SQLite to 0 (no wait). |
 | `DB_POOL_SIZE` | int | `10` | The number of connections to keep open inside the connection pool |
@@ -109,6 +109,22 @@ Available environment variables
 | `RIPE_STAT_EMPTY_PREFIX_CACHE_TTL_SEC` | int | `3600` | TTL in seconds for a RIPEstat result without a prefix |
 | `RIPE_STAT_CACHE_LOCK_TTL_SEC` | int | `120` | Maximum lifetime in seconds of a per-IP RIPEstat cache lock |
 
+## Database connections
+
+Both database engines configure each new physical SQLite connection before application SQL runs.
+Connection settings are validated and checked against the effective PRAGMA values. A configuration failure prevents
+the connection from being used. Memory mapping may be limited by the SQLite build or platform.
+Pooled read connections retain their settings between reads; replacement connections and every new writer connection
+receive the same setup. Ordinary reads do not repeat the configuration commands.
+
+The configured journal mode is requested and checked before a transaction starts. `WAL` remains the default.
+`DELETE`, `TRUNCATE`, `PERSIST` and `MEMORY` are also supported. `OFF` is rejected instead of silently substituting
+another mode. `MEMORY` supports ordinary rollback but does not provide a journal that survives a process crash.
+
+Schema initialization temporarily disables foreign-key enforcement on its dedicated write connection before
+`BEGIN IMMEDIATE`, then validates managed foreign keys before committing. That connection is physically closed;
+runtime connections start with foreign-key enforcement enabled.
+
 ## Database writes and shutdown
 
 Runtime database changes pass through one bounded in-memory writer queue. Enqueue success means that a command was
@@ -121,14 +137,28 @@ Commit errors and cancellation are not automatically replayed because their pers
 On a permanent failure, the writer rejects further commands and reports pending or unknown outcomes instead of
 discarding the failed batch. The nonblocking IP-record deletion API retains its boolean rejection result.
 
-The writer applies the configured SQLite settings to its active session, including foreign-key constraints and
-deletion cascades. A resolution command referencing a domain that has already been deleted fails its batch rather
+New writer connections receive the configured SQLite settings, including foreign-key constraints and deletion
+cascades, before the batch transaction. A resolution command referencing a deleted domain fails its batch rather
 than creating orphan IP records; the normal terminal-failure policy then applies.
 
 Graceful shutdown closes queue admission, finishes accepted commands and the final partial batch, then releases the
 database engines. A deadline or forced cancellation reports unresolved work and retains ownership of any ongoing
 cleanup. `DB_SHUTDOWN_TIMEOUT` covers the database wait, not the total application or container shutdown time.
 The queue is process-local and does not recover pending commands after a crash or forced process termination.
+
+## DNS configuration during resolution
+
+Each nonempty new-domain or stale-domain job reads its DNS configuration once before starting queue processing.
+All domains and their A/CNAME queries use that job's immutable snapshot, including the DNS row IDs used by metrics.
+The database session is released before network operations begin.
+
+DNS changes committed after the snapshot is read apply to the next job. Accepting an HTTP request or enqueueing a
+configuration change does not establish commit visibility; rolled-back changes are not published.
+Single-domain operations read committed configuration when they start. An explicit selection of DNS server IDs
+continues to use those selected servers. When no custom servers remain, selection falls back to the default row `0`.
+
+A DNS configuration read failure aborts a job before domains are enqueued, preserving previously stored IP records.
+No previous job's snapshot is reused after a failed read.
 
 ## Resolution measurements
 

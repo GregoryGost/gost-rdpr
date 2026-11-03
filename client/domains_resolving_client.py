@@ -1,6 +1,6 @@
 from asyncio import CancelledError, Queue, Semaphore, TimeoutError, create_task, gather, sleep, wait_for
 from base64 import urlsafe_b64encode
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from ipaddress import IPv4Address, IPv4Network, ip_address, ip_network
 from itertools import product
@@ -8,7 +8,7 @@ from math import ceil
 from threading import Event
 from time import perf_counter
 from types import CoroutineType
-from typing import Dict, List, Literal, Self, Tuple
+from typing import Dict, List, Literal, Self
 
 from dns.asyncresolver import Resolver
 from dns.exception import DNSException
@@ -26,7 +26,7 @@ from httpx import AsyncClient, HTTPError
 from client.http_base_client import HttpClient
 from client.ripe_stat_client import RipeStatClient, RipeStatClientError
 from config.config import settings
-from database.db import DomainIpReadError, db
+from database.db import DnsConfigurationReadError, DomainIpReadError, db
 from jobs.job_registry import Jobs, job_registry
 from logger.logger import logger
 from metrics.metrics import (
@@ -53,6 +53,8 @@ from models.http.dns_servers_resp import DnsElementResp
 from models.http.domains_req import DomainsPostElementReq
 from models.http.domains_resp import DomainElementResp
 from utils.utils import get_ip_network_address, get_ip_version
+
+type _DnsServersSnapshot = tuple[tuple[DnsServerDto, ...], tuple[DnsServerDto, ...]]
 
 
 class _DnsResponseError(ValueError):
@@ -190,8 +192,25 @@ class DomainsResolver:
   def __init__(self: Self) -> None:
     logger.info(f'{self.__class__.__name__} init')
 
+  @staticmethod
+  async def __dns_snapshot() -> _DnsServersSnapshot:
+    """Copy committed DNS configuration into immutable task-owned values."""
+    default, doh = await db.get_dns_servers_for_resolve()
+    if not default and not doh:
+      raise DnsConfigurationReadError('Cannot read DNS configuration')
+    return (
+      tuple(DnsServerDto(server=server.server, id=server.id) for server in default),
+      tuple(DnsServerDto(server=server.server, id=server.id) for server in doh),
+    )
+
   # Get domains from Queue
-  async def __task_process_domains_resolve_from_queue(self: Self, count_all: int, log_every: int) -> None:
+  async def __task_process_domains_resolve_from_queue(
+    self: Self, count_all: int, log_every: int, dns_servers: _DnsServersSnapshot | None = None
+  ) -> None:
+    if count_all > 0 and dns_servers is None:
+      dns_servers = await self.__dns_snapshot()
+    if dns_servers is None:
+      return
     logger.info('STARTING A FLOW - Resolve domains')
     processed: int = 0
     while not self.__stop_domains_resolve_event.is_set() and processed < count_all:
@@ -206,10 +225,6 @@ class DomainsResolver:
           domain.admitted_at = None
         notify_observation(domain.observation, 'processing_started', perf_counter())
         logger.debug(f'START resolving domain element {domain=}')
-        # get dns servers
-        dns_servers: Tuple[
-          List[DnsServerDto], List[DnsServerDto]
-        ] = await db.get_dns_servers_for_resolve()  # first default, second doh
         # cname
         domain_cname: List[DomainsPostElementReq] = await self.__dns_cname_tasker(
           domain=domain, default_dns_servers=dns_servers[0], doh_dns_servers=dns_servers[1]
@@ -244,8 +259,8 @@ class DomainsResolver:
   async def __dns_main_tasker(
     self: Self,
     domain: DomainResult,
-    default_dns_servers: List[DnsServerDto],
-    doh_dns_servers: List[DnsServerDto],
+    default_dns_servers: Sequence[DnsServerDto],
+    doh_dns_servers: Sequence[DnsServerDto],
     discovered_cnames: list[DomainsPostElementReq] | None = None,
   ) -> None:
     logger.debug(f'START resolve domain {domain=} ...')
@@ -335,7 +350,10 @@ class DomainsResolver:
       logger.warning(f'[{err.__class__.__name__}]: CNAME discovery could not be queued')
 
   async def __dns_cname_tasker(
-    self: Self, domain: DomainResult, default_dns_servers: List[DnsServerDto], doh_dns_servers: List[DnsServerDto]
+    self: Self,
+    domain: DomainResult,
+    default_dns_servers: Sequence[DnsServerDto],
+    doh_dns_servers: Sequence[DnsServerDto],
   ) -> List[DomainsPostElementReq]:
     logger.debug(f'CNAME resolve for domains ...')
     logger.debug(f'CNAME for {domain=}')
@@ -717,11 +735,14 @@ class DomainsResolver:
       log_every: int = max(1, ceil(len_domains / resolve_domains_log_every))
       logger.info(f'Domains for resolve mode={job_mode}: {len_domains}, log_every: {log_every}')
       if len_domains > 0:
+        dns_servers = await self.__dns_snapshot()
         #
         logger.debug(f'Start task {job_mode} ...')
         self.__stop_domains_resolve_event.clear()
         create_task(
-          coro=self.__task_process_domains_resolve_from_queue(count_all=len_domains, log_every=log_every),
+          coro=self.__task_process_domains_resolve_from_queue(
+            count_all=len_domains, log_every=log_every, dns_servers=dns_servers
+          ),
           name=f'__task_process_domains_resolve_from_queue_{job_mode}',
         )
         [await self.__put_domain(domain) for domain in domains]
@@ -732,6 +753,9 @@ class DomainsResolver:
       else:
         logger.info(f'Domains resolve mode={job_mode} - Not found domains for resolve. DONE')
       normal = True
+    except DnsConfigurationReadError:
+      logger.error('Domains resolve could not read DNS configuration')
+      raise
     except Exception as err:
       logger.error(f'Try Domains resolve mode={job_mode} failed [{err.__class__.__name__}] : {err}', exc_info=True)
     finally:
@@ -800,7 +824,7 @@ class DomainsResolver:
       domain.observation = run.observe()
       notify_observation(domain.observation, 'processing_started', perf_counter())
       #
-      default_dns, doh_dns = await db.get_dns_servers_for_resolve()
+      default_dns, doh_dns = await self.__dns_snapshot()
       if not default_dns and not doh_dns:
         raise RuntimeError('DNS servers for resolve not found')
       #
@@ -817,6 +841,9 @@ class DomainsResolver:
     except CancelledError:
       if domain is not None and domain.processing_outcome is None:
         domain.processing_outcome = ProcessingOutcome.CANCELLED
+      raise
+    except DnsConfigurationReadError:
+      logger.error('Stored domain resolve could not read DNS configuration')
       raise
     except Exception as err:
       normal = domain is not None

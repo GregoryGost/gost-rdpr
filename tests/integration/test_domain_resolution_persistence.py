@@ -9,19 +9,21 @@ import os
 import shutil
 import sqlite3
 import sys
-from contextlib import closing
+import threading
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from time import perf_counter
 from types import SimpleNamespace
 
+import aiosqlite
 import dns.rdatatype
 import httpx
 import pytest
 from prometheus_client import REGISTRY
 from prometheus_client.parser import text_string_to_metric_families
-from sqlalchemy import insert, select, text
+from sqlalchemy import event, insert, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -2275,6 +2277,658 @@ async def test_dns_row_identity_survives_default_and_configured_union_mapping(ap
   classic, doh = await store.get_dns_servers_for_resolve()
   assert [(row.id, row.server) for row in classic] == [(42, '192.0.2.42')]
   assert [(row.id, row.server) for row in doh] == [(43, 'https://example.test/dns-query')]
+
+
+CONNECTION_PRAGMAS = {
+  'foreign_keys': 1,
+  'journal_mode': 'wal',
+  'temp_store': 2,
+  'mmap_size': 1048576,
+  'cache_size': -317,
+  'wal_autocheckpoint': 7,
+  'synchronous': 2,
+  'busy_timeout': 37,
+}
+
+
+@pytest.fixture
+async def configured_store(app, monkeypatch):
+  for name, value in CONNECTION_PRAGMAS.items():
+    if name != 'foreign_keys':
+      configured = {'temp_store': 'MEMORY', 'synchronous': 'FULL'}.get(name, value)
+      monkeypatch.setattr(app.settings, f'db_tune_{name}', configured)
+  database = app.database.DataBase()
+  database._DataBase__state = True
+  try:
+    async with database._DataBase__write_engine.begin() as connection:
+      await connection.run_sync(app.database.DomainsDbo.metadata.create_all)
+    yield database
+  finally:
+    await database.close(timeout=2)
+    await database._DataBase__read_engine.dispose()
+    await database._DataBase__write_engine.dispose()
+
+
+@contextmanager
+def physical_connection_observations(engine):
+  """Observe driver SQL and effective values on every actual pool checkout."""
+  evidence = SimpleNamespace(connections=[], statements=[], checkouts=[], closes=[])
+
+  def connected(connection, record):
+    evidence.connections.append(connection)
+    statements = []
+    evidence.statements.append(statements)
+    connection.run_async(lambda driver: driver.set_trace_callback(statements.append))
+
+  def checkout(connection, record, proxy):
+    cursor = connection.cursor()
+    try:
+      values = {}
+      for name in CONNECTION_PRAGMAS:
+        cursor.execute(f'PRAGMA {name}')
+        values[name] = cursor.fetchone()[0]
+      evidence.checkouts.append((connection, values))
+    finally:
+      cursor.close()
+
+  def closed(connection, record):
+    evidence.closes.append(connection)
+
+  listeners = [('connect', connected), ('checkout', checkout), ('close', closed)]
+  for name, callback in listeners:
+    event.listen(engine.sync_engine, name, callback, **({'insert': True} if name == 'connect' else {}))
+  try:
+    yield evidence
+  finally:
+    for name, callback in listeners:
+      event.remove(engine.sync_engine, name, callback)
+
+
+def assert_effective_connection_settings(evidence):
+  assert evidence.checkouts
+  for _connection, actual in evidence.checkouts:
+    # SQLite may cap mmap_size to a smaller platform-specific allocation.
+    assert 0 <= actual['mmap_size'] <= CONNECTION_PRAGMAS['mmap_size']
+    assert {name: value for name, value in actual.items() if name != 'mmap_size'} == {
+      name: value for name, value in CONNECTION_PRAGMAS.items() if name != 'mmap_size'
+    }
+
+
+async def test_real_read_connections_are_configured_once_and_after_invalidation_and_recycle(
+  app, configured_store, monkeypatch
+):
+  store = configured_store
+  engine = store._DataBase__read_engine
+  with physical_connection_observations(engine) as evidence:
+    async with engine.connect() as first, engine.connect() as second:
+      await first.execute(text('SELECT 11'))
+      await second.execute(text('SELECT 22'))
+      assert len(evidence.connections) == 2
+      assert evidence.connections[0] is not evidence.connections[1]
+      await first.invalidate()
+      async with engine.connect() as replacement:
+        assert (await replacement.execute(text('SELECT 33'))).scalar_one() == 33
+      assert len(evidence.connections) == 3
+    before = [list(statements) for statements in evidence.statements]
+    assert await store.get_all_ips_for_domain(1) == []
+    assert await store.get_all_ips_for_domain(2) == []
+    assert len(evidence.connections) == 3
+    for previous, current in zip(before, evidence.statements, strict=True):
+      assert [sql for sql in previous if sql.upper().startswith('PRAGMA') and '=' in sql] == [
+        sql for sql in current if sql.upper().startswith('PRAGMA') and '=' in sql
+      ]
+    monkeypatch.setattr(engine.pool, '_recycle', 0)
+    for _ in range(2):
+      async with engine.connect() as connection:
+        assert (await connection.execute(text('SELECT 44'))).scalar_one() == 44
+    assert len(evidence.connections) == 5
+    assert_effective_connection_settings(evidence)
+    await engine.dispose()
+    assert len(evidence.closes) == 5
+
+
+async def test_reopened_writer_connections_keep_settings_across_batches_and_lock_retry(
+  app, configured_store, monkeypatch
+):
+  store = configured_store
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+  monkeypatch.setattr(app.settings, 'db_save_batch_timeout', 0.01)
+  failed = False
+
+  async def fault(stage, evidence):
+    nonlocal failed
+    if stage == 'after_insert' and not failed:
+      failed = True
+      raise lock_error()
+
+  async def retry(delay):
+    assert delay == 0.1
+
+  monkeypatch.setattr(app.database, 'sleep', retry)
+  sessions = instrument_sessions(store, monkeypatch, fault=fault)
+  names = [f'reopened-{index}.example.test' for index in range(3)]
+  with physical_connection_observations(store._DataBase__write_engine) as evidence:
+    await enqueue_names(app, store, names)
+    await store.start_writer()
+    await asyncio.wait_for(store.db_save_queue.join(), timeout=3)
+    assert await stored_names(app, store) == names
+    assert (sessions.begins, sessions.commits, sessions.rollbacks) == (4, 3, 1)
+    assert len(evidence.connections) == len(evidence.closes) == 4
+    assert_effective_connection_settings(evidence)
+    for statements in evidence.statements:
+      assert sum(sql.upper().replace(' ', '').startswith('PRAGMAFOREIGN_KEYS=') for sql in statements) == 1
+  assert store.pending_count == store.unknown_count == 0
+  assert store.writer_state == 'RUNNING'
+
+
+@pytest.mark.parametrize('code', [sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED], ids=['busy', 'locked'])
+@pytest.mark.parametrize('recover', [True, False], ids=['third-attempt-commits', 'three-attempts-exhausted'])
+async def test_writer_configuration_locks_release_connections_and_preserve_bounded_retries(
+  app, store, monkeypatch, code, recover
+):
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+  engine = store._DataBase__write_engine
+  attempts, application_sql, delays = [], [], []
+  original_execute = aiosqlite.Cursor.execute
+
+  def connected(connection, record):
+    attempt = SimpleNamespace(driver=connection.driver_connection, statements=[], trace=[], failed=False)
+    attempts.append(attempt)
+    connection.run_async(lambda driver: driver.set_trace_callback(attempt.trace.append))
+
+  async def execute(cursor, statement, *args, **kwargs):
+    attempt = next((item for item in attempts if item.driver is cursor._conn), None)
+    if attempt is not None:
+      attempt.statements.append(statement)
+      if statement.upper().replace(' ', '').startswith('PRAGMAJOURNAL_MODE=') and (not recover or len(attempts) <= 2):
+        # Fail inside the real configurator at the DBAPI boundary, before BEGIN or INSERT.
+        attempt.failed = True
+        error = sqlite3.OperationalError('synthetic connection configuration lock')
+        error.sqlite_errorcode = code
+        raise error
+    return await original_execute(cursor, statement, *args, **kwargs)
+
+  def observed_sql(connection, cursor, statement, parameters, context, executemany):
+    application_sql.append(statement)
+
+  async def retry(delay):
+    delays.append(delay)
+    assert application_sql == []
+    assert await stored_names(app, store) == []
+    for attempt in attempts:
+      with pytest.raises(ValueError, match='no active connection'):
+        await attempt.driver.execute('SELECT 1')
+
+  monkeypatch.setattr(aiosqlite.Cursor, 'execute', execute)
+  monkeypatch.setattr(app.database, 'sleep', retry)
+  sessions = instrument_sessions(store, monkeypatch)
+  event.listen(engine.sync_engine, 'connect', connected, insert=True)
+  event.listen(engine.sync_engine, 'before_cursor_execute', observed_sql)
+  try:
+    await enqueue_names(app, store, ['configuration-retry.example.test'])
+    await store.start_writer()
+    if recover:
+      await asyncio.wait_for(store.db_save_queue.join(), timeout=3)
+    else:
+      await asyncio.wait_for(asyncio.shield(store.writer_task), timeout=3)
+    assert len(attempts) == 3
+    assert delays == [0.1, 0.2]
+    assert [attempt.failed for attempt in attempts] == ([True, True, False] if recover else [True] * 3)
+    for attempt in attempts:
+      assert any(sql.upper().replace(' ', '').startswith('PRAGMAFOREIGN_KEYS=') for sql in attempt.trace)
+      if attempt.failed:
+        assert all(sql.upper().startswith('PRAGMA') for sql in attempt.trace)
+      with pytest.raises(ValueError, match='no active connection'):
+        await attempt.driver.execute('SELECT 1')
+    committed = int(recover)
+    statements = [sql.upper() for attempt in attempts for sql in attempt.trace]
+    assert statements.count('BEGIN IMMEDIATE') == statements.count('COMMIT') == committed
+    assert sum(sql.startswith('INSERT ') for sql in statements) == committed
+    assert (sessions.begins, sessions.commits, sessions.rollbacks, sessions.closes) == (
+      committed,
+      committed,
+      3 - committed,
+      3,
+    )
+    assert await stored_names(app, store) == (['configuration-retry.example.test'] if recover else [])
+    assert store.unknown_count == 0
+    assert store.pending_count == store.db_save_queue._unfinished_tasks == (0 if recover else 1)
+    assert store.writer_state == ('RUNNING' if recover else 'FAILED')
+    if not recover:
+      assert store.writer_failure.outcome_unknown is False
+      with pytest.raises(app.database.WriterFailedError):
+        await store.close(timeout=2)
+  finally:
+    event.remove(engine.sync_engine, 'connect', connected)
+    event.remove(engine.sync_engine, 'before_cursor_execute', observed_sql)
+
+
+async def test_repository_read_session_stays_open_until_query_and_closes_once(app, store, monkeypatch):
+  sessions = []
+
+  class OwnedReadSession(AsyncSession):
+    close_count = 0
+
+    async def execute(self, statement, *args, **kwargs):
+      assert self.close_count == 0, 'Repository query received an already closed session'
+      return await super().execute(statement, *args, **kwargs)
+
+    async def close(self):
+      self.close_count += 1
+      await super().close()
+
+  factory = async_sessionmaker(bind=store._DataBase__read_engine, class_=OwnedReadSession)
+
+  def create_session():
+    session = factory()
+    sessions.append(session)
+    return session
+
+  monkeypatch.setattr(store, '_DataBase__read_session_factory', create_session)
+  assert await store.get_all_ips_for_domain(1) == []
+  assert len(sessions) == 1
+  assert sessions[0].close_count == 1
+  assert store._DataBase__read_engine.pool.checkedout() == 0
+
+
+@pytest.mark.parametrize(
+  ('setting', 'value'),
+  [
+    ('journal_mode', 'OFF'),
+    ('journal_mode', 'unrecognized-private-value'),
+    ('journal_mode', 'WAL; SELECT 1'),
+    ('temp_store', 'unrecognized-private-value'),
+    ('synchronous', 'unrecognized-private-value'),
+    ('busy_timeout', -1),
+    ('wal_autocheckpoint', -1),
+    ('cache_size', 'unrecognized-private-value'),
+  ],
+)
+async def test_invalid_connection_settings_fail_before_database_creation(app, monkeypatch, setting, value):
+  monkeypatch.setattr(app.settings, f'db_tune_{setting}', value)
+  path = Path(app.settings.db_path)
+  assert not path.exists()
+
+  async def initialize():
+    database = app.database.DataBase()
+    try:
+      await database.setup()
+    finally:
+      await database._DataBase__read_engine.dispose()
+      await database._DataBase__write_engine.dispose()
+
+  with pytest.raises(app.database.DatabaseConfigurationError) as failure:
+    await initialize()
+  assert 'private-value' not in str(failure.value)
+  assert str(path) not in str(failure.value)
+  assert not path.exists()
+
+
+@pytest.mark.parametrize('mode', ['DELETE', 'TRUNCATE', 'PERSIST', 'MEMORY', 'WAL'])
+async def test_supported_journal_modes_are_effective_on_each_owned_engine(app, monkeypatch, mode):
+  monkeypatch.setattr(app.settings, 'db_tune_journal_mode', mode.lower())
+  database = app.database.DataBase()
+  try:
+    # Allocate a real file before testing multiple independent physical connections.
+    Path(app.settings.db_path).touch()
+    for engine in (database._DataBase__read_engine, database._DataBase__write_engine):
+      for _ in range(2):
+        async with engine.connect() as connection:
+          assert (await connection.execute(text('PRAGMA journal_mode'))).scalar_one() == mode.lower()
+          assert (await connection.execute(text('PRAGMA foreign_keys'))).scalar_one() == 1
+  finally:
+    await database._DataBase__read_engine.dispose()
+    await database._DataBase__write_engine.dispose()
+
+
+async def test_negative_mmap_request_uses_fresh_sqlite_default(app, monkeypatch):
+  with closing(sqlite3.connect(app.settings.db_path)) as connection:
+    expected = connection.execute('PRAGMA mmap_size').fetchone()[0]
+  monkeypatch.setattr(app.settings, 'db_tune_mmap_size', -1)
+  database = app.database.DataBase()
+  try:
+    for engine in (database._DataBase__read_engine, database._DataBase__write_engine):
+      async with engine.connect() as connection:
+        assert (await connection.execute(text('PRAGMA mmap_size'))).scalar_one() == expected
+  finally:
+    await database._DataBase__read_engine.dispose()
+    await database._DataBase__write_engine.dispose()
+
+
+async def test_real_sqlite_mapping_cap_is_accepted_by_both_owned_engines(app, monkeypatch):
+  requested = 2**63 - 1
+  with closing(sqlite3.connect(app.settings.db_path)) as connection:
+    # SQLite's mmap_size readback reports its build/runtime limit, independently of engine wiring.
+    connection.execute(f'PRAGMA mmap_size={requested}')
+    effective = connection.execute('PRAGMA mmap_size').fetchone()[0]
+    assert 0 <= effective < requested, 'This SQLite build must exercise an actual mapping cap'
+    assert connection.execute('SELECT 123').fetchone() == (123,)
+  monkeypatch.setattr(app.settings, 'db_tune_mmap_size', requested)
+  database = app.database.DataBase()
+  try:
+    for engine in (database._DataBase__read_engine, database._DataBase__write_engine):
+      for _ in range(2):
+        async with engine.connect() as connection:
+          assert (await connection.execute(text('PRAGMA mmap_size'))).scalar_one() == effective
+          assert (await connection.execute(text('SELECT 456'))).scalar_one() == 456
+  finally:
+    await database._DataBase__read_engine.dispose()
+    await database._DataBase__write_engine.dispose()
+
+
+@pytest.mark.parametrize('engine_name', ['read', 'write'])
+async def test_effective_pragma_mismatch_rejects_connection_before_application_sql(app, store, engine_name):
+  engine = getattr(store, f'_DataBase__{engine_name}_engine')
+  await engine.dispose()
+  drivers, application_sql = [], []
+
+  def ignored_setting(action, name, value, database, trigger):
+    if action == sqlite3.SQLITE_PRAGMA and name.lower() == 'foreign_keys' and value is not None:
+      return sqlite3.SQLITE_IGNORE
+    return sqlite3.SQLITE_OK
+
+  def refuse_configuration(connection, record):
+    drivers.append(connection.driver_connection)
+    connection.run_async(lambda driver: driver.set_authorizer(ignored_setting))
+
+  def observed_sql(connection, cursor, statement, parameters, context, executemany):
+    application_sql.append(statement)
+
+  event.listen(engine.sync_engine, 'connect', refuse_configuration, insert=True)
+  event.listen(engine.sync_engine, 'before_cursor_execute', observed_sql)
+  try:
+    with pytest.raises(app.database.DatabaseConfigurationError):
+      async with engine.connect() as connection:
+        await connection.execute(text('SELECT 987654'))
+    assert application_sql == []
+    assert len(drivers) == 1
+    with pytest.raises(ValueError, match='no active connection'):
+      await drivers[0].execute('SELECT 1')
+    if engine_name == 'read':
+      assert engine.pool.checkedout() == 0
+  finally:
+    event.remove(engine.sync_engine, 'connect', refuse_configuration)
+    event.remove(engine.sync_engine, 'before_cursor_execute', observed_sql)
+
+
+async def test_startup_fk_override_is_closed_before_runtime_connections(app, startup_store):
+  store = startup_store
+  with physical_connection_observations(store._DataBase__write_engine) as writes:
+    await store.setup()
+    assert len(writes.connections) == len(writes.closes) == 1
+    statements = [sql.upper().replace(' ', '') for sql in writes.statements[0]]
+    enabled = next(
+      index for index, sql in enumerate(statements) if sql in {'PRAGMAFOREIGN_KEYS=ON', 'PRAGMAFOREIGN_KEYS=1'}
+    )
+    assert enabled < statements.index('PRAGMAFOREIGN_KEYS=OFF')
+    assert statements.index('PRAGMAFOREIGN_KEYS=OFF') < statements.index('BEGINIMMEDIATE')
+    await enqueue_names(app, store, ['after-startup.example.test'])
+    await store.close(timeout=2)
+    assert len(writes.connections) == len(writes.closes) == 2
+    assert all(values['foreign_keys'] == 1 for _, values in writes.checkouts)
+    assert not any('FOREIGN_KEYS=OFF' in sql.upper() for sql in writes.statements[1])
+  assert await stored_names(app, store) == ['after-startup.example.test', 'default']
+
+
+@pytest.mark.parametrize('mode', ['new', 'stale'])
+async def test_dns_job_reads_once_and_activates_committed_changes_only_for_next_job(
+  app, store, resolver, monkeypatch, dns_message, mode
+):
+  jobs = importlib.import_module('jobs.job_registry')
+  monkeypatch.setattr(resolver, 'domains_resolve_queue', asyncio.Queue(maxsize=1))
+  monkeypatch.setattr(resolver, '_DomainsResolver__stop_domains_resolve_event', threading.Event())
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(insert(app.database.DnsServersDbo).values(id=42, server='192.0.2.53'))
+    await connection.execute(
+      insert(app.database.DomainsDbo),
+      [
+        {
+          'id': index,
+          'name': f'snapshot-{index}.example.test',
+          'resolved': mode == 'stale',
+          'last_resolved_at': STALE_CHECKPOINT if mode == 'stale' else None,
+        }
+        for index in (1, 2)
+      ],
+    )
+  entered, release = asyncio.Event(), asyncio.Event()
+  requests, selections = [], []
+
+  async def classic(boundary, qname, rdtype, **kwargs):
+    requests.append((boundary.nameservers[0], qname, rdtype))
+    if len(requests) == 1:
+      entered.set()
+      await release.wait()
+    return SimpleNamespace(response=dns_message('nodata', query=dns.message.make_query(qname, rdtype)))
+
+  def observe_select(connection, cursor, statement, parameters, context, executemany):
+    if 'UNION ALL' in statement and 'rdpr_dns_servers' in statement:
+      selections.append(statement)
+
+  monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
+  event.listen(store._DataBase__read_engine.sync_engine, 'before_cursor_execute', observe_select)
+  mode_value = getattr(jobs.Jobs, f'DOMAINS_RESOLVE_{mode.upper()}')
+  task = asyncio.create_task(resolver.domains_resolve(mode_value))
+  try:
+    await asyncio.wait_for(entered.wait(), timeout=3)
+    assert store._DataBase__read_engine.pool.checkedout() == 0
+    assert len(selections) == 1
+    # Commit the new endpoint while the first job owns its old configuration.
+    async with store._DataBase__write_engine.begin() as connection:
+      await connection.execute(text("UPDATE rdpr_dns_servers SET server='192.0.2.54' WHERE id=42"))
+  finally:
+    release.set()
+    await asyncio.wait_for(task, timeout=3)
+  try:
+    expected_names = {f'snapshot-{index}.example.test' for index in (1, 2)}
+    assert set(requests) == {
+      ('192.0.2.53', name, record_type)
+      for name in expected_names
+      for record_type in (dns.rdatatype.A, dns.rdatatype.CNAME)
+    }
+    assert len(requests) == 4
+    assert len(selections) == 1
+    assert store.pending_count == 2
+    requests.clear()
+    await asyncio.wait_for(resolver.domains_resolve(mode_value), timeout=3)
+    assert set(requests) == {
+      ('192.0.2.54', name, record_type)
+      for name in expected_names
+      for record_type in (dns.rdatatype.A, dns.rdatatype.CNAME)
+    }
+    assert len(requests) == 4
+    assert len(selections) == 2
+    assert store.pending_count == 4
+    await flush_queue(store)
+    async with store._DataBase__read_engine.connect() as connection:
+      rows = (await connection.execute(text('SELECT resolved, last_resolved_at FROM rdpr_domains ORDER BY id'))).all()
+    assert len(rows) == 2
+    assert all(resolved == 1 and checkpoint is not None for resolved, checkpoint in rows)
+  finally:
+    event.remove(store._DataBase__read_engine.sync_engine, 'before_cursor_execute', observe_select)
+
+
+async def test_dns_configuration_ignores_enqueue_and_rollback_until_writer_commit(app, store):
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(insert(app.database.DnsServersDbo).values(id=0, server='192.0.2.1'))
+  request = importlib.import_module('models.http.dns_servers_req').DnsPostElementReq
+  await store.put_add_dns_servers_to_queue([request(server='192.0.2.42')])
+
+  def values(snapshot):
+    return tuple(tuple((server.id, server.server) for server in group) for group in snapshot)
+
+  before = await store.get_dns_servers_for_resolve()
+  assert values(before) == (((0, '192.0.2.1'),), ())
+  async with store._DataBase__write_engine.connect() as connection:
+    await connection.execute(text('BEGIN IMMEDIATE'))
+    await connection.execute(text("UPDATE rdpr_dns_servers SET server='192.0.2.99' WHERE id=0"))
+    assert values(await store.get_dns_servers_for_resolve()) == (((0, '192.0.2.1'),), ())
+    await connection.rollback()
+  assert values(await store.get_dns_servers_for_resolve()) == (((0, '192.0.2.1'),), ())
+  await flush_queue(store)
+  after = await store.get_dns_servers_for_resolve()
+  assert values(after) == (((1, '192.0.2.42'),), ())
+  assert values(before) == (((0, '192.0.2.1'),), ())
+  assert store.pending_count == 0
+
+
+@pytest.mark.parametrize('mode', ['new', 'stale'])
+async def test_dns_read_failure_is_typed_and_prevents_job_admission_and_persistence(
+  app, store, resolver, monkeypatch, mode, caplog
+):
+  jobs = importlib.import_module('jobs.job_registry')
+  monkeypatch.setattr(resolver, 'domains_resolve_queue', asyncio.Queue(maxsize=1))
+  monkeypatch.setattr(resolver, '_DomainsResolver__stop_domains_resolve_event', threading.Event())
+  await seed(app, store, resolved=mode == 'stale', checkpoint=STALE_CHECKPOINT if mode == 'stale' else None)
+  before = await snapshot(app, store)
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(text('DROP TABLE rdpr_dns_servers'))
+  with pytest.raises(app.database.DnsConfigurationReadError) as failure:
+    await store.get_dns_servers_for_resolve()
+  assert 'rdpr_dns_servers' not in str(failure.value)
+  assert str(app.settings.db_path) not in str(failure.value)
+  with pytest.raises(app.database.DnsConfigurationReadError):
+    await resolver.resolve_once('www.example.test')
+  with pytest.raises(app.database.DnsConfigurationReadError):
+    await asyncio.wait_for(resolver.domains_resolve(getattr(jobs.Jobs, f'DOMAINS_RESOLVE_{mode.upper()}')), timeout=3)
+  with pytest.raises(app.database.DnsConfigurationReadError):
+    await resolver.resolve_stored_domain(1)
+  assert resolver.domains_resolve_queue.qsize() == resolver.domains_resolve_queue._unfinished_tasks == 0
+  assert store.pending_count == store.unknown_count == 0
+  assert await snapshot(app, store) == before
+  assert store._DataBase__read_engine.pool.checkedout() == 0
+  assert 'no such table' not in caplog.text
+
+
+@pytest.mark.parametrize('mode', ['new', 'stale'])
+@pytest.mark.parametrize('configuration', ['empty', 'unknown-only'])
+async def test_successful_dns_selection_without_endpoints_rejects_nonempty_job_before_admission(
+  app, store, resolver, monkeypatch, mode, configuration
+):
+  jobs = importlib.import_module('jobs.job_registry')
+  network_calls, admissions, selections = [], [], []
+  queue = asyncio.Queue(maxsize=1)
+  original_put = queue.put
+
+  async def put(item):
+    admissions.append(item)
+    await original_put(item)
+
+  async def reject_network(*args, **kwargs):
+    network_calls.append((args, kwargs))
+    raise AssertionError('DNS configuration failure must precede network access')
+
+  def selected(connection, cursor, statement, parameters, context, executemany):
+    if 'UNION ALL' in statement and 'rdpr_dns_servers' in statement:
+      selections.append(statement)
+
+  monkeypatch.setattr(queue, 'put', put)
+  monkeypatch.setattr(resolver, 'domains_resolve_queue', queue)
+  monkeypatch.setattr(resolver, '_DomainsResolver__stop_domains_resolve_event', threading.Event())
+  monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', reject_network)
+  monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', reject_network)
+  await seed(app, store, resolved=mode == 'stale', checkpoint=STALE_CHECKPOINT if mode == 'stale' else None)
+  if configuration == 'unknown-only':
+    async with store._DataBase__write_engine.begin() as connection:
+      # A configured UNKNOWN row still suppresses the otherwise usable default row.
+      await connection.execute(
+        insert(app.database.DnsServersDbo),
+        [{'id': 0, 'server': '192.0.2.1', 'doh_server': None}, {'id': 42, 'server': None, 'doh_server': None}],
+      )
+  before = await snapshot(app, store)
+  async with store._DataBase__read_session_factory() as session:
+    rows = await app.database.DnsServersDbo.get_all_for_resolve(session)
+    assert [tuple(row) for row in rows] == ([(None, None, 0, 42)] if configuration == 'unknown-only' else [])
+  with pytest.raises(app.database.DnsConfigurationReadError) as repository_failure:
+    await store.get_dns_servers_for_resolve()
+  assert str(app.settings.db_path) not in str(repository_failure.value)
+  assert 'rdpr_dns_servers' not in str(repository_failure.value)
+  assert store._DataBase__read_engine.pool.checkedout() == 0
+  event.listen(store._DataBase__read_engine.sync_engine, 'after_cursor_execute', selected)
+  try:
+    with pytest.raises(app.database.DnsConfigurationReadError) as failure:
+      await asyncio.wait_for(resolver.domains_resolve(getattr(jobs.Jobs, f'DOMAINS_RESOLVE_{mode.upper()}')), timeout=3)
+    assert len(selections) == 1
+    assert str(app.settings.db_path) not in str(failure.value)
+    assert 'rdpr_dns_servers' not in str(failure.value)
+    assert network_calls == admissions == []
+    assert queue.qsize() == queue._unfinished_tasks == 0
+    assert store.db_save_queue.qsize() == store.db_save_queue._unfinished_tasks == 0
+    assert store.pending_count == store.unknown_count == 0
+    assert await snapshot(app, store) == before
+    assert store._DataBase__read_engine.pool.checkedout() == 0
+  finally:
+    event.remove(store._DataBase__read_engine.sync_engine, 'after_cursor_execute', selected)
+
+
+@pytest.mark.e2e
+async def test_public_dns_change_during_job_activates_after_commit_for_next_operation(e2e_service):
+  service = e2e_service
+  service.providers.addresses_by_domain.update(
+    {
+      ('classic', 'second.example.test.'): ('11.0.0.1',),
+      ('doh', 'second.example.test.'): ('12.0.0.1',),
+    }
+  )
+  await configure_public_domain(service, resolved=False)
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    response = await client.post('/domains', json=[{'domain': 'second.example.test'}])
+    assert response.status_code == 200, response.text
+    async with asyncio.timeout(5):
+      while True:
+        response = await client.get('/domains')
+        assert response.status_code == 200, response.text
+        if {'www.example.test', 'second.example.test'} <= {row['name'] for row in response.json()['payload']}:
+          break
+        await asyncio.sleep(0.02)
+    response = await client.get('/dns', params={'default': 'false'})
+    configured = response.json()['payload']
+    classic_id = next(row['id'] for row in configured if row['server'] == service.dns_host)
+    doh_id = next(row['id'] for row in configured if row['doh_server'] == service.doh_url)
+    service.providers.requests.clear()
+    service.providers.hold_dns = True
+    try:
+      response = await client.post('/commands/domains/resolve/new')
+      assert response.status_code == 200, response.text
+      await asyncio.wait_for(service.providers.dns_entered.wait(), timeout=3)
+      response = await client.delete(f'/dns/{classic_id}')
+      assert response.status_code == 200, response.text
+      async with asyncio.timeout(5):
+        while True:
+          response = await client.get('/dns', params={'default': 'false'})
+          if {row['id'] for row in response.json()['payload']} == {doh_id}:
+            break
+          await asyncio.sleep(0.02)
+    finally:
+      service.providers.hold_dns = False
+      service.providers.dns_release.set()
+    async with asyncio.timeout(5):
+      while True:
+        response = await client.get('/domains')
+        rows = [row for row in response.json()['payload'] if row['name'] != 'default']
+        if len(rows) == 2 and all(row['resolved'] for row in rows):
+          break
+        await asyncio.sleep(0.02)
+    assert {row for row in service.providers.requests if row[0] in {'classic', 'doh'}} == {
+      (transport, name + '.', record_type)
+      for transport in ('classic', 'doh')
+      for name in ('www.example.test', 'second.example.test')
+      for record_type in (dns.rdatatype.A, dns.rdatatype.CNAME)
+    }
+    service.providers.requests.clear()
+    response = await client.post('/domains/resolve/check', json={'domain': 'next.example.test'})
+    assert response.status_code == 200, response.text
+    assert [(row['server_type'], row['server'], row['ips_v4']) for row in response.json()['results']] == [
+      ('doh', service.doh_url, ['8.8.4.4'])
+    ]
+    assert {transport for transport, _, _ in service.providers.requests} == {'doh'}
+    for row in rows:
+      response = await client.get(f'/domains/{row["id"]}')
+      assert response.status_code == 200, response.text
+      assert set(response.json()['ips_v4']) == (
+        {'8.8.8.8', '8.8.4.4'} if row['name'] == 'www.example.test' else {'11.0.0.1', '12.0.0.1'}
+      )
+  await service.stop()
 
 
 @pytest.mark.parametrize('error_type', [RuntimeError, asyncio.CancelledError])

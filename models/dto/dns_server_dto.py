@@ -8,7 +8,7 @@ class DnsServerType(IntEnum):
   DOH = 2
 
 
-@dataclass
+@dataclass(frozen=True)
 class DnsServerDto:
   server: str
   id: int | None = None

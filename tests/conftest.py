@@ -525,14 +525,20 @@ async def e2e_service(tmp_path, dns_message, request):
     errors=[],
     classic_addresses=('8.8.8.8',),
     doh_addresses=('8.8.4.4',),
+    addresses_by_domain={},
     delay=0.0,
     unavailable=False,
+    hold_dns=False,
+    dns_entered=asyncio.Event(),
+    dns_release=asyncio.Event(),
   )
 
   def response_wire(query, transport):
     providers.requests.append((transport, query.question[0].name.to_text(), query.question[0].rdtype))
     kind = getattr(providers, transport) if query.question[0].rdtype == dns.rdatatype.A else 'nodata'
-    addresses = getattr(providers, f'{transport}_addresses')
+    addresses = providers.addresses_by_domain.get(
+      (transport, query.question[0].name.to_text()), getattr(providers, f'{transport}_addresses')
+    )
     return dns_message(kind, query=query, addresses=addresses).to_wire()
 
   class DnsProtocol(asyncio.DatagramProtocol):
@@ -576,6 +582,9 @@ async def e2e_service(tmp_path, dns_message, request):
           encoded = params['dns'][0]
           query = dns.message.from_wire(urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)))
           body = response_wire(query, 'doh')
+          if providers.hold_dns:
+            providers.dns_entered.set()
+            await providers.dns_release.wait()
           media = 'application/dns-message'
         elif method == 'GET' and url.path == '/data/network-info/data.json':
           providers.requests.append(('ripe', params['resource'][0], None))
@@ -649,6 +658,7 @@ async def e2e_service(tmp_path, dns_message, request):
       await service.start()
     yield service
   finally:
+    providers.dns_release.set()
     try:
       if service is not None:
         await service.stop()

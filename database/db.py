@@ -25,7 +25,7 @@ from types import ModuleType
 from typing import Any, Dict, List, Optional, Self, Sequence, Tuple, cast
 
 from aiosqlite import __version__ as aiosqlite_version
-from sqlalchemy import Result, Row, delete, func, insert, select, text, update
+from sqlalchemy import Result, Row, delete, event, func, insert, select, text, update
 from sqlalchemy import __version__ as sqlalchemy_version
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool
@@ -115,6 +115,10 @@ class DomainIpReadError(RuntimeError):
   """The current IP snapshot for a domain could not be read safely."""
 
 
+class DnsConfigurationReadError(RuntimeError):
+  """The committed DNS configuration could not be read safely."""
+
+
 class DatabaseWriteError(RuntimeError):
   """A sanitized failure of database initialization or queued persistence."""
 
@@ -134,6 +138,10 @@ class DatabaseWriteError(RuntimeError):
     self.outcome_unknown = outcome_unknown
     self.pending_count = pending_count
     self.unknown_count = unknown_count
+
+
+class DatabaseConfigurationError(DatabaseWriteError):
+  """SQLite connection settings are invalid or could not be established."""
 
 
 class BatchWriteError(DatabaseWriteError):
@@ -174,6 +182,7 @@ class DataBase:
   __migrations_path: Path = Path('migrations')
 
   def __init__(self: Self) -> None:
+    self.__connection_pragmas = self.__validated_connection_pragmas()
     self.__state = False
     self.__initialization_failed = False
     self.db_save_queue: Queue[QueueElementDto] = Queue(maxsize=settings.queue_max_size)
@@ -207,6 +216,8 @@ class DataBase:
     self.__write_engine: AsyncEngine = create_async_engine(
       url=settings.db_connection, connect_args={'timeout': settings.db_timeout}, poolclass=NullPool
     )
+    event.listen(self.__read_engine.sync_engine, 'connect', self.__configure_connection)
+    event.listen(self.__write_engine.sync_engine, 'connect', self.__configure_connection)
     self.__read_engine.dialect.identifier_preparer.initial_quote = ''
     self.__read_engine.dialect.identifier_preparer.final_quote = ''
     self.__write_engine.dialect.identifier_preparer.initial_quote = ''
@@ -255,17 +266,78 @@ class DataBase:
 
   #
 
-  async def __session_tune(self: Self, session: AsyncSession):
-    # Config PRAGMA
-    await session.execute(text(f'PRAGMA foreign_keys=ON'))  # foreign keys support
-    await session.execute(text(f'PRAGMA journal_mode={settings.db_tune_journal_mode}'))
-    await session.execute(text(f'PRAGMA temp_store={settings.db_tune_temp_store}'))
-    await session.execute(text(f'PRAGMA mmap_size={settings.db_tune_mmap_size}'))
-    await session.execute(text(f'PRAGMA cache_size={settings.db_tune_cache_size}'))
-    await session.execute(text(f'PRAGMA wal_autocheckpoint={settings.db_tune_wal_autocheckpoint}'))
-    await session.execute(text(f'PRAGMA synchronous={settings.db_tune_synchronous}'))
-    await session.execute(text(f'PRAGMA busy_timeout={settings.db_tune_busy_timeout}'))
-    return session
+  @staticmethod
+  def __validated_connection_pragmas() -> tuple[tuple[str, int | str], ...]:
+    """Normalize fixed SQLite settings before any connection or startup SQL."""
+    if not all(
+      isinstance(value, str)
+      for value in (settings.db_tune_journal_mode, settings.db_tune_temp_store, settings.db_tune_synchronous)
+    ):
+      raise DatabaseConfigurationError('Invalid SQLite connection mode')
+    journal_mode = settings.db_tune_journal_mode.strip().upper()
+    if journal_mode not in {'DELETE', 'TRUNCATE', 'PERSIST', 'MEMORY', 'WAL'}:
+      raise DatabaseConfigurationError('Unsupported SQLite journal mode')
+    temp_modes = {'DEFAULT': 0, 'FILE': 1, 'MEMORY': 2, '0': 0, '1': 1, '2': 2}
+    sync_modes = {'OFF': 0, 'NORMAL': 1, 'FULL': 2, 'EXTRA': 3, '0': 0, '1': 1, '2': 2, '3': 3}
+    temp_store = temp_modes.get(settings.db_tune_temp_store.strip().upper())
+    synchronous = sync_modes.get(settings.db_tune_synchronous.strip().upper())
+    if temp_store is None or synchronous is None:
+      raise DatabaseConfigurationError('Unsupported SQLite connection mode')
+    integers = (
+      ('busy_timeout', settings.db_tune_busy_timeout, 0, 2**31 - 1),
+      ('mmap_size', settings.db_tune_mmap_size, -(2**63), 2**63 - 1),
+      ('cache_size', settings.db_tune_cache_size, -(2**31), 2**31 - 1),
+      ('wal_autocheckpoint', settings.db_tune_wal_autocheckpoint, 0, 2**31 - 1),
+    )
+    for _, value, minimum, maximum in integers:
+      if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise DatabaseConfigurationError('Invalid SQLite connection setting')
+    # Timeout precedes lock-sensitive journal setup; all values below are validated.
+    return (
+      ('busy_timeout', settings.db_tune_busy_timeout),
+      ('foreign_keys', 1),
+      ('journal_mode', journal_mode.lower()),
+      ('temp_store', temp_store),
+      ('mmap_size', max(-1, settings.db_tune_mmap_size)),
+      ('cache_size', settings.db_tune_cache_size),
+      ('wal_autocheckpoint', settings.db_tune_wal_autocheckpoint),
+      ('synchronous', synchronous),
+    )
+
+  def __configure_connection(self, dbapi_connection: Any, connection_record: Any) -> None:
+    """Configure and verify each fresh physical connection outside transactions."""
+    try:
+      cursor = dbapi_connection.cursor()
+      try:
+        for name, expected in self.__connection_pragmas:
+          effective_expected = expected
+          if name == 'mmap_size' and isinstance(expected, int) and expected < 0:
+            # A negative request restores the fresh connection's platform default.
+            cursor.execute('PRAGMA mmap_size')
+            initial = cursor.fetchone()
+            if initial is None or not isinstance(initial[0], int) or initial[0] < 0:
+              raise DatabaseConfigurationError('SQLite mapping default is unavailable')
+            effective_expected = initial[0]
+          cursor.execute(f'PRAGMA {name}={expected}')
+          cursor.execute(f'PRAGMA {name}')
+          row = cursor.fetchone()
+          if row is None:
+            raise DatabaseConfigurationError('SQLite connection setting is unavailable')
+          actual = row[0]
+          if (
+            name == 'mmap_size'
+            and isinstance(actual, int)
+            and isinstance(effective_expected, int)
+            and 0 <= actual < effective_expected
+          ):
+            # SQLite may cap mappings, including disabling them in its build.
+            logger.debug(f'SQLite mmap_size capped to {actual} bytes')
+          elif actual != effective_expected:
+            raise DatabaseConfigurationError('SQLite connection setting could not be established')
+      finally:
+        cursor.close()
+    except Exception as err:
+      raise DatabaseConfigurationError('Cannot configure SQLite connection') from err
 
   async def __create_tables(self: Self) -> None:
     """Initialize schema, migrations, imported data and defaults atomically."""
@@ -486,22 +558,14 @@ class DataBase:
     return True
 
   async def __read_connect(self: Self) -> AsyncSession:
-    if self.__state == False:
+    if not self.__state:
       raise Exception('Database not ready to work')
-    async with self.__db_read_session() as session:
-      try:
-        return await self.__session_tune(session)
-      except Exception as err:
-        await session.rollback()
-        logger.error(f'Try DB connect failed : {settings.db_path} : {err}')
-        raise err
-      finally:
-        await session.close()
+    return self.__db_read_session()
 
   async def __write_connect(self: Self) -> AsyncSession:
     if not self.__state:
       raise DatabaseWriteError('Database is not ready for writes')
-    # The batch owns this session, including tuning failures and cancellation.
+    # The batch owns this session, including connection failures and cancellation.
     return self.__db_write_session()
 
   async def setup(self: Self) -> None:
@@ -944,33 +1008,24 @@ class DataBase:
       logger.error(f'Unexpected error - Try send deleted DNS servers to Queue : {err}', exc_info=True)
 
   async def get_dns_servers_for_resolve(self: Self) -> Tuple[List[DnsServerDto], List[DnsServerDto]]:
-    logger.debug(f'Try get DNS servers for resolve ...')
-    dns_servers: Tuple[List[DnsServerDto], List[DnsServerDto]] = ([], [])
+    """Read custom-or-default DNS from one committed query, closing before return."""
     try:
-      db_session: AsyncSession = await self.__read_connect()
-      # get dns servers for resolve
-      dns_servers_for_resolve: Sequence[
-        Row[str | None, str | None, DnsServerType, int]
-      ] = await DnsServersDbo.get_all_for_resolve(db_session=db_session)
-      dns_servers_default: List[DnsServerDto] = [
-        DnsServerDto(server=cast(str, dns_server[0]), id=dns_server[3])
-        for dns_server in dns_servers_for_resolve
-        if dns_server[2] == DnsServerType.DEFAULT
-      ]
-      dns_servers_doh: List[DnsServerDto] = [
-        DnsServerDto(server=cast(str, dns_server[1]), id=dns_server[3])
-        for dns_server in dns_servers_for_resolve
-        if dns_server[2] == DnsServerType.DOH
-      ]
-      logger.debug(f'DNS servers for resolve: {dns_servers_default=}, {dns_servers_doh=}')
-      dns_servers = (dns_servers_default, dns_servers_doh)
-      return dns_servers
+      async with await self.__read_connect() as db_session:
+        try:
+          rows = await DnsServersDbo.get_all_for_resolve(db_session=db_session)
+          servers = (
+            [DnsServerDto(server=cast(str, row[0]), id=row[3]) for row in rows if row[2] == DnsServerType.DEFAULT],
+            [DnsServerDto(server=cast(str, row[1]), id=row[3]) for row in rows if row[2] == DnsServerType.DOH],
+          )
+          if not any(servers):
+            raise DnsConfigurationReadError('Cannot read DNS configuration')
+          return servers
+        except Exception:
+          await db_session.rollback()
+          raise
     except Exception as err:
-      logger.error(f'Try get Domains for resolve failed : {err}', exc_info=True)
-      await db_session.rollback()
-      return dns_servers
-    finally:
-      await db_session.close()
+      logger.error('DNS configuration read failed')
+      raise DnsConfigurationReadError('Cannot read DNS configuration') from err
 
   # Domains Lists
 
@@ -2418,7 +2473,8 @@ class DataBase:
       #
       #
       db_session = await self.__write_connect()
-      await self.__session_tune(db_session)
+      # Connection setup precedes the timed explicit write transaction.
+      await db_session.connection()
       # Recording with immediate write lock
       transaction_started = perf_counter()
       await db_session.execute(text('BEGIN IMMEDIATE'))
@@ -2548,6 +2604,8 @@ class DataBase:
     if failure is not None:
       # SQLite extended result codes retain the primary code in the low byte.
       original = getattr(failure, 'orig', failure)
+      while isinstance(original, DatabaseConfigurationError) and original.__cause__ is not None:
+        original = original.__cause__
       sqlite_code = getattr(original, 'sqlite_errorcode', None)
       retryable = (
         not commit_started

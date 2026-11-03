@@ -484,6 +484,9 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
 - Lifespan owner: `AppServer.__lifespan` resets job state, sets up the database, and closes HTTP clients on shutdown.
 - Background task policy: current commands use `BackgroundTasks` and process-local `JobRegistry` reservations.
   They provide no durable job execution guarantee. Do not introduce a worker framework implicitly.
+- DNS configuration: each nonempty new/stale resolution job reads one immutable task-local snapshot before queue work.
+  Changes committed after that read apply to the next job; single-domain operations read fresh committed settings.
+  Keep explicit DNS selection and default row `0` semantics. Failed configuration reads must not start queue work.
 - Public API docs: runtime `/docs` and `/docs/openapi.json`; checked-in export `docs/OPENAPI.json`.
   Contract changes must reconcile models, route metadata, tests, and the export when applicable.
 - Active FastAPI rule/skill: `python_fastapi.md` + `python-fastapi-expert`.
@@ -528,8 +531,12 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
 - Active database toolkit skill: `python-sqlalchemy-core`.
 - Active database-specific skill: `python-sqlalchemy-sqlite`.
 - Dependency versions source: `pyproject.toml` and `poetry.lock`.
-- PRAGMA policy source: `config/config.py` and `DataBase.__session_tune`.
-  Verify actual per-connection behavior when changing engine/session code.
+- PRAGMA policy source: `config/config.py` and `DataBase.__configure_connection`.
+  Both engines register instance connect listeners before first use; validate and verify settings for each physical
+  connection, including pooled replacements and every NullPool writer connection. Reads do not repeat tuning.
+  Supported journal modes are WAL, DELETE, TRUNCATE, PERSIST and MEMORY; OFF is rejected to preserve rollback support.
+  Keep the dedicated startup connection's temporary FK OFF phase before BEGIN IMMEDIATE and physical closure afterward.
+  Verify actual per-connection behavior when changing engine/session code, including SQLite normalization/platform caps.
 
 ## Persistence / Runtime Write Policy
 
