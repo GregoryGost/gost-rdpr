@@ -12,8 +12,8 @@ from asyncio import (
 from base64 import urlsafe_b64encode
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field, replace
 from ipaddress import IPv4Address, IPv4Network, ip_address, ip_network
-from itertools import product
 from math import ceil
 from threading import Event
 from time import perf_counter
@@ -65,6 +65,25 @@ from models.http.domains_resp import DomainElementResp
 from utils.utils import get_ip_network_address, get_ip_version
 
 type _DnsServersSnapshot = tuple[tuple[DnsServerDto, ...], tuple[DnsServerDto, ...]]
+
+
+@dataclass(frozen=True)
+class _DefaultDnsContext:
+  """Own endpoint resolvers and fixed timeout settings for one operation or job."""
+
+  timeout: float
+  lifetime: float
+  resolvers: dict[str, Resolver] = field(default_factory=dict)
+
+  def resolver_for(self, server: str) -> Resolver:
+    resolver = self.resolvers.get(server)
+    if resolver is None:
+      resolver = Resolver(configure=False)
+      resolver.nameservers = [server]
+      resolver.timeout = self.timeout
+      resolver.lifetime = self.lifetime
+      self.resolvers[server] = resolver
+    return resolver
 
 
 class _DnsResponseError(ValueError):
@@ -174,7 +193,9 @@ def classify_dns_response(
     if response.rcode() == NOERROR and not covering_soa and any(rrset.rdtype == NS for rrset in response.authority):
       raise _DnsResponseError('referral')
     if response.rcode() == NOERROR and not covering_soa:
-      raise _DnsResponseError('unconfirmed_absence')
+      return DnsQueryOutcome(
+        server, server_type, lookup_type, DnsQueryStatus.FAILURE, cnames=cnames, reason='unconfirmed_absence'
+      )
     return DnsQueryOutcome(server, server_type, lookup_type, DnsQueryStatus.ABSENT, cnames=cnames)
   except _DnsResponseError as err:
     reason = str(err)
@@ -189,7 +210,6 @@ class DomainsResolver:
   __queue_get_timeout: float = settings.queue_get_timeout
   __task_exception_error_timeout: float = 10.0
 
-  __lookup_types: tuple[Literal[RdataType.A]] = (A,)  # (A, AAAA)
   __semaphore: Semaphore = Semaphore(settings.domains_resolve_semaphore_limit)
 
   __http_client: AsyncClient = HttpClient.get_client(
@@ -231,6 +251,7 @@ class DomainsResolver:
       dns_servers = await self.__dns_snapshot()
     if dns_servers is None:
       return
+    dns_context = _DefaultDnsContext(settings.dns_timeout, settings.dns_lifetime)
     logger.info('STARTING A FLOW - Resolve domains')
     processed: int = 0
     while not self.__stop_domains_resolve_event.is_set() and processed < count_all:
@@ -245,19 +266,11 @@ class DomainsResolver:
           domain.admitted_at = None
         notify_observation(domain.observation, 'processing_started', perf_counter())
         logger.debug(f'START resolving domain element {domain=}')
-        # cname
-        domain_cname: List[DomainsPostElementReq] = await self.__dns_cname_tasker(
-          domain=domain, default_dns_servers=dns_servers[0], doh_dns_servers=dns_servers[1]
-        )
-        if len(domain_cname) > 0:
-          logger.debug(f'{domain_cname=}')
-          await self.__persist_cnames(domain_cname)
-        # resolve
         await self.__dns_main_tasker(
           domain=domain,
           default_dns_servers=dns_servers[0],
           doh_dns_servers=dns_servers[1],
-          discovered_cnames=domain_cname,
+          dns_context=dns_context,
         )
         logger.debug(f'END resolving domain element {domain=}')
       except CancelledError:
@@ -282,6 +295,7 @@ class DomainsResolver:
     default_dns_servers: Sequence[DnsServerDto],
     doh_dns_servers: Sequence[DnsServerDto],
     discovered_cnames: list[DomainsPostElementReq] | None = None,
+    dns_context: _DefaultDnsContext | None = None,
   ) -> None:
     logger.debug(f'START resolve domain {domain=} ...')
     domain.resolution_complete = False
@@ -290,30 +304,18 @@ class DomainsResolver:
     domain.insert.ips_insert.clear()
     domain.insert.ips_delete.clear()
     try:
-      tasks: List[CoroutineType] = []
-      # Default DNS
-      if len(default_dns_servers) > 0:
-        for domain_result, dns_server, lookup_type in product((domain,), default_dns_servers, self.__lookup_types):
-          task: CoroutineType = self.__default_resolver(
-            domain=domain_result, dns_server=dns_server, lookup_type=lookup_type
-          )
-          tasks.append(task)
-      # DoH DNS
-      if len(doh_dns_servers) > 0:
-        for domain_result, dns_server, lookup_type in product((domain,), doh_dns_servers, self.__lookup_types):
-          task: CoroutineType = self.__doh_resolver(
-            domain=domain_result, dns_server=dns_server, lookup_type=lookup_type
-          )
-          tasks.append(task)
+      if dns_context is None:
+        dns_context = _DefaultDnsContext(settings.dns_timeout, settings.dns_lifetime)
+      tasks = [self.__resolve_server(domain, server, 'classic', dns_context) for server in default_dns_servers] + [
+        self.__resolve_server(domain, server, 'doh') for server in doh_dns_servers
+      ]
       # Run parallel tasks
       outcomes: list[DnsQueryOutcome] = list(await gather(*tasks))
       try:
         known_cnames = {_absolute_name(from_text(cname.domain)) for cname in discovered_cnames or []}
         additional_cnames = [
           DomainsPostElementReq(domain=cname, list_id=domain.list_id)
-          for cname in dict.fromkeys(
-            cname for outcome in outcomes if outcome.status != DnsQueryStatus.FAILURE for cname in outcome.cnames
-          )
+          for cname in dict.fromkeys(cname for outcome in outcomes for cname in outcome.cnames)
           if _absolute_name(from_text(cname)) not in known_cnames
         ]
         if additional_cnames:
@@ -369,37 +371,28 @@ class DomainsResolver:
     except Exception as err:
       logger.warning(f'[{err.__class__.__name__}]: CNAME discovery could not be queued')
 
-  async def __dns_cname_tasker(
+  async def __resolve_server(
     self: Self,
     domain: DomainResult,
-    default_dns_servers: Sequence[DnsServerDto],
-    doh_dns_servers: Sequence[DnsServerDto],
-  ) -> List[DomainsPostElementReq]:
-    logger.debug(f'CNAME resolve for domains ...')
-    logger.debug(f'CNAME for {domain=}')
-    cname_domains: List[DomainsPostElementReq] = []
-    try:
-      tasks: List[CoroutineType] = []
-      # Default DNS
-      if len(default_dns_servers) > 0:
-        for domain_result, dns_server in product((domain,), default_dns_servers):
-          task: CoroutineType = self.__cname_default_resolver(
-            domain=domain_result, dns_server=dns_server, cname_domains=cname_domains
-          )
-          tasks.append(task)
-      # DoH DNS
-      if len(doh_dns_servers) > 0:
-        for domain_result, dns_server in product((domain,), doh_dns_servers):
-          task: CoroutineType = self.__cname_doh_resolver(
-            domain=domain_result, dns_server=dns_server, cname_domains=cname_domains
-          )
-          tasks.append(task)
-      # Run parallel tasks
-      await gather(*tasks)
-      return cname_domains
-    except Exception as err:
-      logger.error(f'[{err.__class__.__name__}]: __dns_cname_tasker - {err}', exc_info=True)
-      return cname_domains
+    dns_server: DnsServerDto,
+    transport: Literal['classic', 'doh'],
+    dns_context: _DefaultDnsContext | None = None,
+  ) -> DnsQueryOutcome:
+    if transport == 'classic':
+      if dns_context is None:
+        dns_context = _DefaultDnsContext(settings.dns_timeout, settings.dns_lifetime)
+      outcome = await self.__default_resolver(domain, dns_server, A, dns_context)
+    else:
+      outcome = await self.__doh_resolver(domain, dns_server, A)
+    if outcome.status != DnsQueryStatus.FAILURE or outcome.cnames:
+      return outcome
+    # Alias evidence cannot authorize IPv4 deletion or a refresh checkpoint.
+    cnames: list[DomainsPostElementReq] = []
+    if transport == 'classic':
+      await self.__cname_default_resolver(domain, dns_server, cnames, dns_context)
+    else:
+      await self.__cname_doh_resolver(domain, dns_server, cnames)
+    return replace(outcome, cnames=tuple(dict.fromkeys(cname.domain for cname in cnames)))
 
   # Resolvers
 
@@ -417,14 +410,19 @@ class DomainsResolver:
     message = from_wire(response.content, one_rr_per_rrset=True)
     return _validated_dns_response(message, domain_name, lookup_type, query.id)
 
-  async def __query_default(self: Self, domain_name: str, dns_server: DnsServerDto, lookup_type: RdataType) -> Message:
-    resolver = Resolver(configure=False)
-    resolver.nameservers = [dns_server.server]
-    resolver.timeout = settings.dns_timeout
-    resolver.lifetime = settings.dns_lifetime
+  async def __query_default(
+    self: Self,
+    domain_name: str,
+    dns_server: DnsServerDto,
+    lookup_type: RdataType,
+    dns_context: _DefaultDnsContext | None = None,
+  ) -> Message:
+    if dns_context is None:
+      dns_context = _DefaultDnsContext(settings.dns_timeout, settings.dns_lifetime)
+    resolver = dns_context.resolver_for(dns_server.server)
     try:
       answer: Answer = await resolver.resolve(
-        qname=domain_name, rdtype=lookup_type, search=False, lifetime=settings.dns_lifetime
+        qname=domain_name, rdtype=lookup_type, search=False, lifetime=dns_context.lifetime
       )
       response = answer.response
     except NoAnswer as err:
@@ -502,12 +500,16 @@ class DomainsResolver:
       return DnsQueryOutcome(dns_server.server, 'doh', lookup_type, DnsQueryStatus.FAILURE, reason='timeout')
 
   async def __default_resolver(
-    self: Self, domain: DomainResult, dns_server: DnsServerDto, lookup_type: RdataType
+    self: Self,
+    domain: DomainResult,
+    dns_server: DnsServerDto,
+    lookup_type: RdataType,
+    dns_context: _DefaultDnsContext | None = None,
   ) -> DnsQueryOutcome:
     try:
       async with self.__dns_observation(dns_server, 'classic', lookup_type.name) as measurement:
         try:
-          response = await self.__query_default(domain.name, dns_server, lookup_type)
+          response = await self.__query_default(domain.name, dns_server, lookup_type, dns_context)
           outcome = classify_dns_response(response, domain.name, dns_server.server, 'classic', lookup_type)
           measurement.update(outcome=outcome.status.value.lower(), reason=outcome.reason or 'none')
           return outcome
@@ -537,12 +539,16 @@ class DomainsResolver:
       logger.debug('CNAME discovery operation timed out')
 
   async def __cname_default_resolver(
-    self: Self, domain: DomainResult, dns_server: DnsServerDto, cname_domains: List[DomainsPostElementReq]
+    self: Self,
+    domain: DomainResult,
+    dns_server: DnsServerDto,
+    cname_domains: List[DomainsPostElementReq],
+    dns_context: _DefaultDnsContext | None = None,
   ) -> None:
     try:
       async with self.__dns_observation(dns_server, 'classic', 'CNAME') as measurement:
         try:
-          response = await self.__query_default(domain.name, dns_server, CNAME)
+          response = await self.__query_default(domain.name, dns_server, CNAME, dns_context)
           _, cnames, _ = _reachable_cnames(response)
           measurement.update(outcome='aliases' if cnames else 'no_alias')
           cname_domains.extend(DomainsPostElementReq(domain=cname, list_id=domain.list_id) for cname in cnames)
@@ -553,75 +559,32 @@ class DomainsResolver:
       logger.debug('CNAME discovery operation timed out')
 
   async def __resolve_once_default_server(
-    self: Self, domain_name: str, dns_server: DnsServerDto
+    self: Self,
+    domain_name: str,
+    dns_server: DnsServerDto,
+    dns_context: _DefaultDnsContext | None = None,
   ) -> DnsServerResolveResultDto:
     domain: DomainResult = DomainResult(id=0, name=domain_name)
-    cname_domains: List[DomainsPostElementReq] = []
-    tasks: list[CoroutineType] = [
-      self.__default_resolver(domain=domain, dns_server=dns_server, lookup_type=lookup_type)
-      for lookup_type in self.__lookup_types
-    ]
-    tasks.append(self.__cname_default_resolver(domain=domain, dns_server=dns_server, cname_domains=cname_domains))
-    outcomes = await gather(*tasks)
+    outcome = await self.__resolve_server(domain, dns_server, 'classic', dns_context)
     return DnsServerResolveResultDto(
       server=dns_server.server,
       server_type='classic',
-      ips_v4=sorted(
-        {
-          address
-          for outcome in outcomes
-          if isinstance(outcome, DnsQueryOutcome) and outcome.status == DnsQueryStatus.ADDRESSES
-          for address in outcome.addresses
-        }
-      ),
+      ips_v4=list(outcome.addresses),
       ips_v6=domain.result.AAAA,
-      cnames=list(
-        dict.fromkeys(
-          [cname.domain for cname in cname_domains]
-          + [
-            cname
-            for outcome in outcomes
-            if isinstance(outcome, DnsQueryOutcome) and outcome.status != DnsQueryStatus.FAILURE
-            for cname in outcome.cnames
-          ]
-        )
-      ),
+      cnames=list(outcome.cnames),
     )
 
   async def __resolve_once_doh_server(
     self: Self, domain_name: str, doh_server: DnsServerDto
   ) -> DnsServerResolveResultDto:
     domain: DomainResult = DomainResult(id=0, name=domain_name)
-    cname_domains: List[DomainsPostElementReq] = []
-    tasks: list[CoroutineType] = [
-      self.__doh_resolver(domain=domain, dns_server=doh_server, lookup_type=lookup_type)
-      for lookup_type in self.__lookup_types
-    ]
-    tasks.append(self.__cname_doh_resolver(domain=domain, dns_server=doh_server, cname_domains=cname_domains))
-    outcomes = await gather(*tasks)
+    outcome = await self.__resolve_server(domain, doh_server, 'doh')
     return DnsServerResolveResultDto(
       server=doh_server.server,
       server_type='doh',
-      ips_v4=sorted(
-        {
-          address
-          for outcome in outcomes
-          if isinstance(outcome, DnsQueryOutcome) and outcome.status == DnsQueryStatus.ADDRESSES
-          for address in outcome.addresses
-        }
-      ),
+      ips_v4=list(outcome.addresses),
       ips_v6=domain.result.AAAA,
-      cnames=list(
-        dict.fromkeys(
-          [cname.domain for cname in cname_domains]
-          + [
-            cname
-            for outcome in outcomes
-            if isinstance(outcome, DnsQueryOutcome) and outcome.status != DnsQueryStatus.FAILURE
-            for cname in outcome.cnames
-          ]
-        )
-      ),
+      cnames=list(outcome.cnames),
     )
 
   # IPS
@@ -860,9 +823,10 @@ class DomainsResolver:
           raise RuntimeError(f'DNS server ID={selected_dns_server.id} does not contain a server address')
     #
     tasks: list[CoroutineType] = []
+    dns_context = _DefaultDnsContext(settings.dns_timeout, settings.dns_lifetime)
     #
     for dns_server in default_dns_servers:
-      tasks.append(self.__resolve_once_default_server(domain_name=name, dns_server=dns_server))
+      tasks.append(self.__resolve_once_default_server(domain_name=name, dns_server=dns_server, dns_context=dns_context))
     for dns_server in doh_dns_servers:
       tasks.append(self.__resolve_once_doh_server(domain_name=name, doh_server=dns_server))
     if not tasks:
@@ -892,15 +856,7 @@ class DomainsResolver:
       if not default_dns and not doh_dns:
         raise RuntimeError('DNS servers for resolve not found')
       #
-      cname_domains: List[DomainsPostElementReq] = await self.__dns_cname_tasker(
-        domain=domain, default_dns_servers=default_dns, doh_dns_servers=doh_dns
-      )
-      if cname_domains:
-        await self.__persist_cnames(cname_domains)
-      #
-      await self.__dns_main_tasker(
-        domain=domain, default_dns_servers=default_dns, doh_dns_servers=doh_dns, discovered_cnames=cname_domains
-      )
+      await self.__dns_main_tasker(domain=domain, default_dns_servers=default_dns, doh_dns_servers=doh_dns)
       normal = True
     except CancelledError:
       if domain is not None and domain.processing_outcome is None:

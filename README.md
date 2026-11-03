@@ -228,6 +228,25 @@ continues to use those selected servers. When no custom servers remain, selectio
 A DNS configuration read failure aborts a job before domains are enqueued, preserving previously stored IP records.
 No previous job's snapshot is reused after a failed read.
 
+Each configured endpoint is queried for A records first. Reachable CNAME chains in that response are returned by
+single-domain checks and queued for storage by resolving jobs, with the source domain's list ID. A successful address
+response or confirmed absence needs no separate CNAME query. A failed A query without usable alias evidence permits
+one best-effort CNAME query to the same endpoint. A valid CNAME chain without addresses or confirmed absence remains
+failed IPv4 evidence: storing its aliases never permits deleting previous IP records or advancing the refresh time.
+Cancellation propagates without starting an alias query.
+
+Ordinary DNS resolvers belong to one job or single-domain operation. Each endpoint reuses its own resolver with fixed
+nameserver, timeout and lifetime settings, including any CNAME query after A failure. A later job creates new resolvers
+from its own configuration snapshot. Endpoints remain independent so their addresses can be unioned before storage.
+
+DNS response caching remains disabled. Reusing a resolver does not enable its response cache. The local measurement
+providers return TTLs of 60 seconds, while the default successful-domain update interval is 172800 seconds. A normal
+pass queries each selected name once per endpoint; the synthetic warm pass deliberately resets domain state and is
+not evidence of production cache reuse. Repeated manual checks or shorter update intervals may benefit from caching,
+but production TTLs and repeat frequencies have not been measured. Before enabling a cache, measure those values and
+define endpoint isolation, bounded capacity, positive and negative expiry, and validation before cache admission.
+Never reuse another server's answer or cache a failed DNS query as successful empty evidence.
+
 ## Resolution measurements
 
 `/metrics` exposes separate measurements for processing, queue admission and confirmed database commands.
@@ -324,6 +343,34 @@ The tested source/configuration snapshot identity is
 `2237ef45537716d78b14507e3080baaf92d860a8dcb00922b83fbaa2c6d8b609`, based on commit `1a96db7` plus the
 measurement changes. Each rerun writes `measurement-baseline.json` under its pytest temporary directory with the
 exact invocation, input hashes, versions, settings, provider schedule, outcomes, database effects and resource samples.
+
+### DNS query optimization measurement
+
+On 2026-11-04, the same four-domain workload was measured immediately before and after changing alias discovery and
+resolver reuse. Dependency versions, provider schedules, settings and resource sampling matched; disposable database
+paths and local provider ports differed. The successful runs reduced logical DNS operations from 16 to 8 per job.
+Cold/warm still refers to the RIPEstat cache; DNS response caching was disabled in both versions.
+
+| Provider / RIPE cache | DNS operations, before / after | Domains/s, before / after | Confirmed commands/s, before / after | DNS p95 estimate ms, before / after |
+| --------------------- | ------------------------------: | ------------------------: | ----------------------------------: | ---------------------------------: |
+| Fast / cold | 16 / 8 | 39.557 / 69.193 | 24.307 / 41.530 | 21.0 / 9.6 |
+| Fast / warm | 16 / 8 | 36.336 / 82.710 | 23.749 / 51.131 | 23.0 / 22.0 |
+| Slow, 20 ms / cold | 16 / 8 | 10.918 / 26.016 | 9.330 / 20.543 | 48.75 / 45.0 |
+| Slow, 20 ms / warm | 16 / 8 | 9.340 / 32.132 | 7.942 / 23.999 | 80.0 / 45.0 |
+
+Unavailable providers retained 16 logical operations, including conditional CNAME queries, zero confirmed result
+commands, and unchanged IP rows and refresh checkpoints. Successful-run child CPU deltas were 0.109375–0.171875 seconds
+before and 0.0625–0.125 seconds after. Peak resident memory was 119640064–119832576 bytes before and
+119246848–120217600 bytes after. These are single small local samples and histogram bucket estimates, with polling
+overhead; the query-count reduction is directly observed, while timing and resource differences need repeated runs
+before production extrapolation.
+
+The production client SHA256 changed from
+`77188060d312f6e2940a768440fc96220e474888267cdd7ca1d96d92f42e068d` to
+`c9d81de97dc96477779c3bf1175689b3321dbf6ff60400a525dbb28e930e6578` on base commit `50626d8`.
+The measurement JSON records complete source/test hashes and the controlled provider TTL of 60 seconds. Each successful
+pass had eight distinct endpoint/name/type keys and no repetition within the pass. Its immediate warm rerun repeated
+those keys, illustrating possible cache reuse under forced repetition rather than the normal 48-hour refresh cycle.
 
 ## MikroTik RouterOS
 

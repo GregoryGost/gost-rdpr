@@ -487,6 +487,11 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
 - DNS configuration: each nonempty new/stale resolution job reads one immutable task-local snapshot before queue work.
   Changes committed after that read apply to the next job; single-domain operations read fresh committed settings.
   Keep explicit DNS selection and default row `0` semantics. Failed configuration reads must not start queue work.
+  Each endpoint receives an A query first; validated reachable aliases from that response are reused. A failure without
+  usable alias evidence permits a separate best-effort CNAME query. It never changes the A result's storage authority.
+  Ordinary DNS resolvers and their fixed timeout/lifetime settings belong to one job or single-domain operation;
+  each endpoint's resolver is reused within that scope. DNS response caching remains disabled pending evidence of
+  useful TTLs and repeated queries.
 - Public API docs: runtime `/docs` and `/docs/openapi.json`; checked-in export `docs/OPENAPI.json`.
   Contract changes must reconcile models, route metadata, tests, and the export when applicable.
 - Active FastAPI rule/skill: `python_fastapi.md` + `python-fastapi-expert`.

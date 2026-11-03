@@ -217,6 +217,11 @@ def dns_message():
       add(message.answer, owner, 'CNAME', 'edge.example.test.')
     if kind == 'alias-positive':
       add(message.answer, 'edge.example.test.', 'A', *addresses)
+    if kind == 'alias-chain-positive':
+      add(message.answer, 'edge.example.test.', 'CNAME', 'terminal.example.test.')
+      add(message.answer, 'terminal.example.test.', 'A', *addresses)
+      add(message.answer, owner, 'CNAME', 'edge.example.test.')
+      add(message.answer, 'unreachable.example.test.', 'CNAME', 'untrusted.example.test.')
     if kind in {'nxdomain', 'alias-nxdomain', 'nxdomain-positive', 'nxdomain-ns'}:
       message.set_rcode(dns.rcode.NXDOMAIN)
     if kind in {'nodata', 'alias-nodata', 'unrelated-negative', 'foreign-soa', 'wrong-soa-class'}:
@@ -283,7 +288,7 @@ def network(app, resolver, dns_message, monkeypatch):
   def install(kinds, transport='classic', status=200, media='application/dns-message', mutate_wire=None):
     async def classic(boundary, qname, rdtype, **kwargs):
       requests.append((boundary.nameservers[0], rdtype))
-      kind = kinds[boundary.nameservers[0]]
+      kind = kinds.get((boundary.nameservers[0], rdtype), kinds.get(boundary.nameservers[0]))
       if isinstance(kind, Exception):
         raise kind
       query = dns.message.make_query(qname, rdtype)
@@ -301,7 +306,8 @@ def network(app, resolver, dns_message, monkeypatch):
       encoded = request.url.params['dns']
       query = dns.message.from_wire(urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)))
       requests.append((str(request.url.copy_with(query=None)), query.question[0].rdtype))
-      kind = kinds[str(request.url.copy_with(query=None))]
+      endpoint = str(request.url.copy_with(query=None))
+      kind = kinds.get((endpoint, query.question[0].rdtype), kinds.get(endpoint))
       if isinstance(kind, Exception):
         raise kind
       assert request.method == 'GET'
@@ -522,7 +528,9 @@ async def e2e_service(tmp_path, dns_message, request):
   providers = SimpleNamespace(
     classic='positive',
     doh='positive',
+    cname_kinds={},
     requests=[],
+    response_ttls=[],
     http_requests=[],
     http_statuses={},
     errors=[],
@@ -545,11 +553,17 @@ async def e2e_service(tmp_path, dns_message, request):
 
   def response_wire(query, transport):
     providers.requests.append((transport, query.question[0].name.to_text(), query.question[0].rdtype))
-    kind = getattr(providers, transport) if query.question[0].rdtype == dns.rdatatype.A else 'nodata'
+    kind = (
+      getattr(providers, transport)
+      if query.question[0].rdtype == dns.rdatatype.A
+      else providers.cname_kinds.get(transport, 'nodata')
+    )
     addresses = providers.addresses_by_domain.get(
       (transport, query.question[0].name.to_text()), getattr(providers, f'{transport}_addresses')
     )
-    return dns_message(kind, query=query, addresses=addresses).to_wire()
+    message = dns_message(kind, query=query, addresses=addresses)
+    providers.response_ttls.append(sorted({record.ttl for record in (*message.answer, *message.authority)}))
+    return message.to_wire()
 
   class DnsProtocol(asyncio.DatagramProtocol):
     def connection_made(self, transport):

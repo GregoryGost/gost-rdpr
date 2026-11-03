@@ -25,6 +25,202 @@ pytestmark = pytest.mark.unit
 ROS_RETRY_METHODS = frozenset({'GET', 'POST', 'PATCH', 'DELETE'})
 
 
+@pytest.mark.parametrize('transport', ['classic', 'doh'])
+@pytest.mark.parametrize('entrypoint', ['check', 'stored', 'new', 'stale'])
+@pytest.mark.parametrize('kind', ['positive', 'alias-chain-positive', 'nodata', 'cname-only', 'timeout', 'alias-cycle'])
+async def test_a_first_discovery_preserves_aliases_and_independent_ip_evidence(
+  app, resolver, repository, network, monkeypatch, transport, entrypoint, kind
+):
+  """Alias discovery cannot promote incomplete A evidence into deletion permission."""
+  endpoint = '192.0.2.53' if transport == 'classic' else 'https://dns.example.test/dns-query'
+  failure = dns.exception.Timeout() if transport == 'classic' else httpx.ReadTimeout('Synthetic A timeout')
+  requests = network(
+    {
+      endpoint: failure if kind == 'timeout' else kind,
+      (endpoint, dns.rdatatype.CNAME): 'alias-cycle' if kind == 'alias-cycle' else 'cname-only',
+    },
+    transport=transport,
+  )
+  server = app.Server(server=endpoint, id=42)
+  repository.get_dns_servers_for_resolve.return_value = ([server], []) if transport == 'classic' else ([], [server])
+  repository.get_domain_on_id = AsyncMock(
+    return_value=SimpleNamespace(id=1, name='www.example.test', domains_list_id=7)
+  )
+  repository.get_all_ips_for_domain.return_value = [app.Ip(id=10, ip_address='9.9.9.9', addr_type=4)]
+  domains = [app.dto.DomainResult(id=1, name='www.example.test', list_id=7)]
+  repository.get_new_domains_for_resolve = AsyncMock(return_value=domains)
+  repository.get_stale_domains_for_resolve = AsyncMock(return_value=domains)
+  monkeypatch.setattr(resolver, 'domains_resolve_queue', asyncio.Queue(maxsize=1))
+  monkeypatch.setattr(resolver, '_DomainsResolver__stop_domains_resolve_event', threading.Event())
+  aliases = (
+    ['edge.example.test', 'terminal.example.test']
+    if kind == 'alias-chain-positive'
+    else ['edge.example.test']
+    if kind in {'cname-only', 'timeout'}
+    else []
+  )
+  addresses = ['8.8.8.8'] if kind in {'positive', 'alias-chain-positive'} else []
+  if entrypoint == 'check':
+    result = await resolver.resolve_once('www.example.test')
+    assert result.results[0].cnames == aliases
+    assert result.results[0].ips_v4 == addresses
+    repository.put_add_domains_to_queue.assert_not_awaited()
+    repository.put_domain_after_resolve.assert_not_awaited()
+  else:
+    if entrypoint == 'stored':
+      await resolver.resolve_stored_domain(1)
+    else:
+      jobs = importlib.import_module('jobs.job_registry')
+      await asyncio.wait_for(
+        resolver.domains_resolve(getattr(jobs.Jobs, f'DOMAINS_RESOLVE_{entrypoint.upper()}')), timeout=2
+      )
+    discovered = [
+      (alias.domain, alias.list_id)
+      for call in repository.put_add_domains_to_queue.await_args_list
+      for alias in call.kwargs['domains']
+    ]
+    assert discovered == [(name, 7) for name in aliases]
+    if kind in {'positive', 'alias-chain-positive', 'nodata'}:
+      queued = repository.put_domain_after_resolve.await_args.kwargs['domain']
+      assert queued.resolution_complete is True
+      assert queued.result.A == addresses
+      assert queued.insert.ips_delete == [10]
+    else:
+      repository.put_domain_after_resolve.assert_not_awaited()
+      repository.get_all_ips_for_domain.assert_not_awaited()
+  assert [record_type for _, record_type in requests] == (
+    [dns.rdatatype.A, dns.rdatatype.CNAME] if kind in {'timeout', 'alias-cycle'} else [dns.rdatatype.A]
+  )
+
+
+async def test_job_reuses_one_classic_resolver_for_domains_and_fallback_but_reloads_next_job(
+  app, resolver, repository, dns_message, monkeypatch
+):
+  jobs = importlib.import_module('jobs.job_registry')
+  monkeypatch.setattr(resolver, 'domains_resolve_queue', asyncio.Queue(maxsize=1))
+  monkeypatch.setattr(resolver, '_DomainsResolver__stop_domains_resolve_event', threading.Event())
+  domains = [app.dto.DomainResult(id=index, name=f'domain-{index}.example.test') for index in (1, 2)]
+  repository.get_new_domains_for_resolve = AsyncMock(return_value=domains)
+  servers = [app.Server(server='192.0.2.53', id=42)]
+  repository.get_dns_servers_for_resolve.return_value = (servers, [])
+  instances, queries = [], []
+  original = dns.asyncresolver.Resolver
+
+  def create(*args, **kwargs):
+    instance = original(*args, **kwargs)
+    instances.append(instance)
+    return instance
+
+  async def classic(boundary, qname, rdtype, **kwargs):
+    queries.append((boundary, boundary.nameservers[0], boundary.timeout, boundary.lifetime, qname, rdtype))
+    servers[:] = [app.Server(server='192.0.2.54', id=42)]
+    monkeypatch.setattr(app.settings, 'dns_timeout', 0.7)
+    monkeypatch.setattr(app.settings, 'dns_lifetime', 0.9)
+    if rdtype == dns.rdatatype.A:
+      raise dns.exception.Timeout()
+    return SimpleNamespace(response=dns_message('cname-only', query=dns.message.make_query(qname, rdtype)))
+
+  monkeypatch.setattr(app.settings, 'dns_timeout', 0.2)
+  monkeypatch.setattr(app.settings, 'dns_lifetime', 0.4)
+  monkeypatch.setattr(app.resolver, 'Resolver', create)
+  monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
+  await asyncio.wait_for(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW), timeout=2)
+  assert len(instances) == 1
+  assert len(queries) == 4
+  assert all(row[:4] == (instances[0], '192.0.2.53', 0.2, 0.4) for row in queries)
+  queries.clear()
+  await asyncio.wait_for(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW), timeout=2)
+  assert len(instances) == 2
+  assert len(queries) == 4
+  assert all(row[:4] == (instances[1], '192.0.2.54', 0.7, 0.9) for row in queries)
+  repository.put_domain_after_resolve.assert_not_awaited()
+
+
+@pytest.mark.parametrize('transport', ['classic', 'doh'])
+async def test_a_failure_does_not_hide_same_endpoint_recovery(app, resolver, repository, network, transport):
+  endpoint = '192.0.2.53' if transport == 'classic' else 'https://dns.example.test/dns-query'
+  kinds = {endpoint: 'servfail', (endpoint, dns.rdatatype.CNAME): 'nodata'}
+  requests = network(kinds, transport=transport)
+  server = app.Server(server=endpoint)
+  repository.get_dns_servers_for_resolve.return_value = ([server], []) if transport == 'classic' else ([], [server])
+  first = await resolver.resolve_once('www.example.test')
+  assert first.results[0].ips_v4 == first.results[0].cnames == []
+  kinds[endpoint] = 'alias-positive'
+  second = await resolver.resolve_once('www.example.test')
+  assert second.results[0].ips_v4 == ['8.8.8.8']
+  assert second.results[0].cnames == ['edge.example.test']
+  assert [record_type for _, record_type in requests] == [dns.rdatatype.A, dns.rdatatype.CNAME, dns.rdatatype.A]
+
+
+@pytest.mark.parametrize('failed_transport', ['classic', 'doh'])
+async def test_alias_fallback_is_endpoint_specific_and_never_completes_partial_ip_evidence(
+  app, resolver, repository, network, failed_transport
+):
+  classic, doh = '192.0.2.53', 'https://dns.example.test/dns-query'
+  failed = classic if failed_transport == 'classic' else doh
+  requests = network(
+    {
+      classic: 'servfail' if failed_transport == 'classic' else 'alias-positive',
+      doh: 'servfail' if failed_transport == 'doh' else 'alias-positive',
+      (failed, dns.rdatatype.CNAME): 'cname-only',
+    }
+  )
+  repository.get_dns_servers_for_resolve.return_value = ([app.Server(server=classic)], [app.Server(server=doh)])
+  repository.get_domain_on_id = AsyncMock(
+    return_value=SimpleNamespace(id=1, name='www.example.test', domains_list_id=7)
+  )
+  repository.get_all_ips_for_domain.return_value = [app.Ip(id=10, ip_address='9.9.9.9', addr_type=4)]
+  await resolver.resolve_stored_domain(1)
+  queued = repository.put_domain_after_resolve.await_args.kwargs['domain']
+  assert queued.processing_outcome == app.dto.ProcessingOutcome.PARTIAL
+  assert queued.resolution_complete is False
+  assert queued.insert.ips_delete == []
+  assert [ip.ip_address for ip in queued.insert.ips_insert] == ['8.8.8.8']
+  aliases = [
+    (alias.domain, alias.list_id)
+    for call in repository.put_add_domains_to_queue.await_args_list
+    for alias in call.kwargs['domains']
+  ]
+  assert aliases == [('edge.example.test', 7)]
+  assert sorted(requests) == sorted([(classic, dns.rdatatype.A), (doh, dns.rdatatype.A), (failed, dns.rdatatype.CNAME)])
+
+
+@pytest.mark.parametrize('transport', ['classic', 'doh'])
+async def test_cancelled_a_discovery_propagates_without_starting_alias_fallback(
+  app, resolver, repository, monkeypatch, transport
+):
+  entered, exited = asyncio.Event(), asyncio.Event()
+  requests = []
+
+  async def blocked(*args, **kwargs):
+    requests.append(kwargs.get('rdtype', dns.rdatatype.A))
+    entered.set()
+    try:
+      await asyncio.Future()
+    finally:
+      exited.set()
+
+  server = app.Server(server='192.0.2.53' if transport == 'classic' else 'https://dns.example.test/dns-query')
+  repository.get_dns_servers_for_resolve.return_value = ([server], []) if transport == 'classic' else ([], [server])
+  if transport == 'classic':
+    monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', blocked)
+  else:
+    resolver._DomainsResolver__http_client = app.make_http(blocked)
+  task = asyncio.create_task(resolver.resolve_once('www.example.test'))
+  try:
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+    assert exited.is_set()
+    assert requests == [dns.rdatatype.A]
+    repository.put_add_domains_to_queue.assert_not_awaited()
+    repository.put_domain_after_resolve.assert_not_awaited()
+  finally:
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.fixture
 async def http_factory(app, monkeypatch):
   """Exercise the production retry chain while replacing only its wire boundary."""
@@ -1160,7 +1356,7 @@ async def test_stored_resolution_keeps_cname_discovery_best_effort(
   queued = repository.put_domain_after_resolve.await_args.kwargs['domain']
   assert queued.resolution_complete is True
   assert [ip.ip_address for ip in queued.insert.ips_insert] == ['8.8.8.8']
-  assert sorted(requests) == sorted([dns.rdatatype.A, dns.rdatatype.CNAME])
+  assert requests == [dns.rdatatype.A]
   if discover_alias:
     added = repository.put_add_domains_to_queue.await_args.kwargs['domains']
     assert [(domain.domain, domain.list_id) for domain in added] == [('edge.example.test', 7)]
@@ -1671,7 +1867,7 @@ async def test_single_checks_reload_dns_and_explicit_selection_bypasses_configur
   assert [(row.server, row.ips_v4) for row in third.results] == [('192.0.2.55', ['8.8.8.8'])]
   assert repository.get_dns_servers_for_resolve.await_count == 2
   assert {server for server, _ in requests} == {'192.0.2.53', '192.0.2.54', '192.0.2.55'}
-  assert metric_total('resolution_dns_duration_seconds_count', server_id='88', transport='classic') - before == 2
+  assert metric_total('resolution_dns_duration_seconds_count', server_id='88', transport='classic') - before == 1
   repository.put_domain_after_resolve.assert_not_awaited()
 
 
@@ -1710,9 +1906,7 @@ async def test_job_copies_dns_collections_before_network_work(
   monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
   await asyncio.wait_for(resolver.domains_resolve(getattr(jobs.Jobs, f'DOMAINS_RESOLVE_{mode.upper()}')), timeout=2)
   assert set(requests) == {
-    ('192.0.2.53', domain.name, record_type)
-    for domain in domains
-    for record_type in (dns.rdatatype.A, dns.rdatatype.CNAME)
+    ('192.0.2.53', domain.name, record_type) for domain in domains for record_type in (dns.rdatatype.A,)
   }
   repository.get_dns_servers_for_resolve.assert_awaited_once_with()
   assert repository.put_domain_after_resolve.await_count == 2

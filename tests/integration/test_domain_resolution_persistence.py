@@ -1499,6 +1499,52 @@ def public_flow_snapshot(service, domain_id):
 
 
 @pytest.mark.e2e
+@pytest.mark.parametrize('kind', ['alias-chain-positive', 'cname-only', 'servfail', 'alias-cycle'])
+async def test_public_a_alias_discovery_persists_only_reachable_aliases_without_granting_ip_deletion(e2e_service, kind):
+  service = e2e_service
+  domain_id = await configure_public_domain(service)
+  before = public_flow_snapshot(service, domain_id)
+  service.providers.classic = service.providers.doh = kind
+  service.providers.cname_kinds = dict.fromkeys(
+    ('classic', 'doh'), 'alias-cycle' if kind == 'alias-cycle' else 'cname-only'
+  )
+  aliases = (
+    ['edge.example.test', 'terminal.example.test']
+    if kind == 'alias-chain-positive'
+    else ['edge.example.test']
+    if kind in {'cname-only', 'servfail'}
+    else []
+  )
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    checked = await client.post('/domains/resolve/check', json={'domain': 'www.example.test'})
+    assert checked.status_code == 200
+    assert [row['cnames'] for row in checked.json()['results']] == [aliases, aliases]
+    assert public_flow_snapshot(service, domain_id) == before
+    listed = (await client.get('/domains')).json()['payload']
+    assert {row['name'] for row in listed} == {'default', 'www.example.test'}
+    service.providers.requests.clear()
+    assert (await client.post(f'/domains/{domain_id}/resolve')).status_code == 202
+    _, fields = await completed_metrics(client, mode='stored', selected=1)
+    assert fields['success' if kind == 'alias-chain-positive' else 'failure'] == 1
+    assert fields['confirmed'] == int(kind == 'alias-chain-positive')
+  await service.stop()
+  after = public_flow_snapshot(service, domain_id)
+  if kind == 'alias-chain-positive':
+    assert after[0][1] != before[0][1]
+    assert set(after[1]) == {'8.8.8.8', '8.8.4.4', '2001:4860:4860::8888'}
+    assert after[1]['2001:4860:4860::8888'] == before[1]['2001:4860:4860::8888']
+  else:
+    assert after == before
+  with closing(sqlite3.connect(service.db_path)) as connection:
+    names = connection.execute('SELECT name FROM rdpr_domains ORDER BY name').fetchall()
+  assert names == sorted((name,) for name in ['default', 'www.example.test', *aliases])
+  for transport in ('classic', 'doh'):
+    assert [record_type for source, _, record_type in service.providers.requests if source == transport] == (
+      [dns.rdatatype.A, dns.rdatatype.CNAME] if kind in {'servfail', 'alias-cycle'} else [dns.rdatatype.A]
+    )
+
+
+@pytest.mark.e2e
 @pytest.mark.parametrize(
   ('classic', 'doh', 'complete', 'addresses'),
   [
@@ -1570,10 +1616,11 @@ async def test_public_resolution_reconciles_only_complete_trustworthy_ipv4(
     assert {address: ips[address] for address in before_ips} == before_ips
     assert set(ips) == set(before_ips) | addresses
   assert {(row[0], row[2]) for row in service.providers.requests} == {
-    ('classic', dns.rdatatype.A),
-    ('classic', dns.rdatatype.CNAME),
-    ('doh', dns.rdatatype.A),
-    ('doh', dns.rdatatype.CNAME),
+    (transport, record_type)
+    for transport, kind in [('classic', classic), ('doh', doh)]
+    for record_type in (
+      (dns.rdatatype.A,) if kind in {'positive', 'nodata', 'nxdomain'} else (dns.rdatatype.A, dns.rdatatype.CNAME)
+    )
   }
 
   if not complete:
@@ -2722,21 +2769,17 @@ async def test_dns_job_reads_once_and_activates_committed_changes_only_for_next_
   try:
     expected_names = {f'snapshot-{index}.example.test' for index in (1, 2)}
     assert set(requests) == {
-      ('192.0.2.53', name, record_type)
-      for name in expected_names
-      for record_type in (dns.rdatatype.A, dns.rdatatype.CNAME)
+      ('192.0.2.53', name, record_type) for name in expected_names for record_type in (dns.rdatatype.A,)
     }
-    assert len(requests) == 4
+    assert len(requests) == 2
     assert len(selections) == 1
     assert store.pending_count == 2
     requests.clear()
     await asyncio.wait_for(resolver.domains_resolve(mode_value), timeout=3)
     assert set(requests) == {
-      ('192.0.2.54', name, record_type)
-      for name in expected_names
-      for record_type in (dns.rdatatype.A, dns.rdatatype.CNAME)
+      ('192.0.2.54', name, record_type) for name in expected_names for record_type in (dns.rdatatype.A,)
     }
-    assert len(requests) == 4
+    assert len(requests) == 2
     assert len(selections) == 2
     assert store.pending_count == 4
     await flush_queue(store)
@@ -2913,7 +2956,7 @@ async def test_public_dns_change_during_job_activates_after_commit_for_next_oper
       (transport, name + '.', record_type)
       for transport in ('classic', 'doh')
       for name in ('www.example.test', 'second.example.test')
-      for record_type in (dns.rdatatype.A, dns.rdatatype.CNAME)
+      for record_type in (dns.rdatatype.A,)
     }
     service.providers.requests.clear()
     response = await client.post('/domains/resolve/check', json={'domain': 'next.example.test'})
@@ -3088,7 +3131,9 @@ async def test_public_metrics_separate_processing_admission_and_real_persistence
     assert fields['processing_rate'] > 0
     assert (fields['saved_rate'] > 0) is bool(admitted)
     assert sample_total(samples, 'resolution_dns_duration_seconds_count', record_type='A') == 2
-    assert sample_total(samples, 'resolution_dns_duration_seconds_count', record_type='CNAME') == 2
+    assert sample_total(samples, 'resolution_dns_duration_seconds_count', record_type='CNAME') == sum(
+      kind == 'servfail' for kind in (classic, doh)
+    )
     assert sample_total(samples, 'httpx_exchanges_in_flight') == 0
     assert sample_total(samples, 'httpx_exchanges_started_total') == sample_total(
       samples, 'httpx_exchanges_terminal_total'
@@ -3278,7 +3323,7 @@ async def test_reproducible_local_measurement_baseline(e2e_service, tmp_path):
             for phase in ('attempt', 'transaction', 'commit')
           },
         }
-        assert distributions['resolution_dns_duration_seconds']['count'] == len(names) * 4
+        assert distributions['resolution_dns_duration_seconds']['count'] == len(names) * (4 if unavailable else 2)
         scenarios.append(
           {
             'schedule': schedule,
@@ -3290,6 +3335,10 @@ async def test_reproducible_local_measurement_baseline(e2e_service, tmp_path):
             'run': fields,
             'histogram_percentile_estimates': distributions,
             'actual_classic_calls': sum(row[0] == 'classic' for row in service.providers.requests[request_offset:]),
+            'actual_dns_calls': [row for row in service.providers.requests[request_offset:] if row[0] != 'ripe'],
+            'controlled_dns_ttls_seconds': sorted(
+              {ttl for response in service.providers.response_ttls for ttl in response}
+            ),
             'actual_http_calls': service.providers.http_requests[http_offset:],
             'ripe_network_calls': network_count,
             'actual_ip_rows': actual_rows,
@@ -3495,8 +3544,10 @@ async def test_public_http_retries_preserve_resolution_persistence_and_logical_m
     assert sample_total(samples, 'httpx_exchanges_started_total') == sample_total(
       samples, 'httpx_exchanges_terminal_total'
     )
-    assert sample_total(samples, 'httpx_exchanges_started_total', integration='domains_resolver') == 2
-  assert service.providers.http_requests.count(('GET', '/dns-query')) == (6 if exhausted else 3)
+    assert sample_total(samples, 'httpx_exchanges_started_total', integration='domains_resolver') == (
+      2 if exhausted else 1
+    )
+  assert service.providers.http_requests.count(('GET', '/dns-query')) == (6 if exhausted else 2)
   assert service.providers.http_statuses['/dns-query'] == []
   after = public_flow_snapshot(service, domain_id)
   if exhausted:
