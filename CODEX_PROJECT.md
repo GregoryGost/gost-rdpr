@@ -351,7 +351,8 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
   --cov-config=pyproject.toml --cov-report=term-missing --cov-report=html` as one command.
   Read source packages, branch tracking, and fail-under from `[tool.coverage.*]`; do not override its source list.
 - Coverage report: `.\.venv\Scripts\python.exe -m coverage report --show-missing` with the configured fail-under.
-- Coverage HTML: `.\.venv\Scripts\python.exe -m coverage html`; inspect the generated `htmlcov/` report.
+- Coverage HTML: `.\.venv\Scripts\python.exe -m coverage html`; inspect `.pytest_cache/coverage/htmlcov/`.
+  Coverage data and subprocess fragments use `.pytest_cache/coverage/.coverage*` from the declared configuration.
 - Parallel tests: `.\.venv\Scripts\python.exe -m pytest -m "not e2e and not e2e_load" -n auto --dist loadfile`
   only for a scope whose worker/resource isolation has been verified, after focused serial tests pass.
   Rerun parallel failures with `-n 0`; parallel execution does not replace the required serial acceptance baseline.
@@ -405,6 +406,7 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
 - Coverage tool: `coverage.py` through the declared `pytest-cov` plugin.
 - Coverage configuration source: `[tool.coverage.run]`, `[tool.coverage.report]`, and `[tool.coverage.html]`
   in `pyproject.toml`, including the configured `migrations` source package.
+- Generated coverage data, subprocess fragments and HTML stay under `.pytest_cache/coverage/`, not as root files.
 - Coverage branch tracking: yes.
 - Coverage fail-under: 85; target 90–95% for critical domain behavior.
 - Parallel test execution enabled: yes, explicitly selected isolated scopes only; serial execution remains the baseline.

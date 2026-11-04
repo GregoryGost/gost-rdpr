@@ -59,7 +59,7 @@ markers = [
   "unit: fast isolated unit tests",
   "integration: tests requiring database, network, filesystem, framework or infrastructure boundaries",
   "e2e: service E2E tests across public application boundaries",
-  "e2e_load: manually selected hybrid E2E load ladder",
+  "e2e_load: explicitly selected local load campaigns with API responsiveness and durable-result checks",
   "slow: slow tests",
 ]
 asyncio_mode = "auto"
@@ -68,6 +68,7 @@ asyncio_default_fixture_loop_scope = "function"
 
 [tool.coverage.run]
 branch = true
+data_file = ".pytest_cache/coverage/.coverage"
 source = [
   "cache",
   "client",
@@ -92,7 +93,7 @@ exclude_lines = [
 ]
 
 [tool.coverage.html]
-directory = "htmlcov"
+directory = ".pytest_cache/coverage/htmlcov"
 
 [tool.ruff]
 line-length = 120

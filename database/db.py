@@ -2400,6 +2400,7 @@ class DataBase:
         except QueueShutDown:
           await self.__flush_pending()
           break
+        deadline = monotonic() + settings.db_save_batch_timeout
         queue_element.dequeued_at = perf_counter()
         if queue_element.admitted_at is not None:
           observe_duration(
@@ -2407,8 +2408,6 @@ class DataBase:
           )
           queue_element.admitted_at = None
         self.__pending_batch.append(queue_element)
-        if len(self.__pending_batch) == 1:
-          deadline = monotonic() + settings.db_save_batch_timeout
     except CancelledError:
       self.__fail_writer(
         WriterFailedError(

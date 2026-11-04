@@ -69,7 +69,7 @@ Available environment variables
 | `DB_FILE_NAME` | str | `rdpr-db.sqlite` | Database file name |
 | `DB_TABLE_PREFIX` | str | `rdpr_` | Prefix for database table names |
 | `DB_SAVE_BATCH_SIZE` | int | `1000` | Maximum queued commands in one writer transaction; independent of domain scan membership and IP row count |
-| `DB_SAVE_BATCH_TIMEOUT` | float | `5.0` | Maximum time in seconds from the first event in a pending batch until that partial batch is flushed |
+| `DB_SAVE_BATCH_TIMEOUT` | float | `5.0` | Maximum idle time in seconds between commands received by the writer from its queue; each received command restarts the timer |
 | `DB_SHUTDOWN_TIMEOUT` | float | `20.0` | Time in seconds to wait for the database writer during shutdown. Expiry reports unresolved writes; it does not imply a successful drain |
 | `DB_TUNE_JOURNAL_MODE` | str | `WAL` | SQLite journal mode: `WAL`, `DELETE`, `TRUNCATE`, `PERSIST` or `MEMORY`. `OFF` is rejected because transactions require rollback support |
 | `DB_TUNE_WAL_AUTOCHECKPOINT` | int | `1000` | Initiate a checkpoint approximately every 1000 WAL pages (choose experimentally: if WAL grows too quickly, decrease it; if checkpoints interfere, increase it) |
@@ -197,8 +197,11 @@ runtime connections start with foreign-key enforcement enabled.
 ## Database writes and shutdown
 
 Runtime database changes pass through one bounded in-memory writer queue. Enqueue success means that a command was
-accepted into memory; it does not confirm commit or immediate visibility to reads. A full batch is flushed immediately,
-and a partial batch is flushed at its deadline or during graceful shutdown.
+accepted into memory; it does not confirm commit or immediate visibility to reads. A full batch is flushed immediately.
+A partial batch is flushed when the writer receives no further command for `DB_SAVE_BATCH_TIMEOUT`, or during graceful
+shutdown without waiting for that timeout. Each successful queue receive restarts the idle timer. Continuous arrivals
+can extend collection until `DB_SAVE_BATCH_SIZE` is reached. The timeout does not limit the oldest command's age
+or its wait for commit.
 
 Only SQLite busy/locked failures before commit are retried, after the failed transaction has been rolled back and
 released. The same batch stays ahead of later commands, with at most three attempts and delays of 0.1 and 0.2 seconds.
@@ -359,7 +362,137 @@ interrupted or zero-duration measurements are invalid and use `NaN`, rather than
 with no required writes can have a valid saved rate of zero. Late receipts from an older run cannot replace a newer
 run's snapshot for the same mode. All observations are process-local and do not provide crash durability.
 
-### Repeatable local baseline
+### Local load campaigns and API responsiveness
+
+Load testing extends the existing pytest suite and local DNS, DoH and RIPEstat protocol providers. All measurements
+run in the current workspace; a separate machine or infrastructure is not required. The application still runs its
+real entrypoint, composition, startup migrations and shutdown against a disposable SQLite database. Production
+databases, local secret files and uncontrolled external services are outside the test boundary.
+
+API responsiveness is a mandatory selection criterion for resolution defaults. A full STALE pass through known
+persistence must also finish within 30 minutes, with 15 minutes as the preferred target. For 187558 input domains,
+these correspond to approximately 104.2 and 208.4 domains/s. Pilot extrapolations screen candidates; only actual
+full-size repeated passes establish that the deadline is met. Compare higher bounded concurrency before full-size
+finalist validation, and preserve data correctness and API responsiveness throughout.
+
+Compare an idle baseline with
+continuous public domain/statistics requests and controlled write/job admission while background resolution is
+active. Freeze finite timeout and latency-regression limits before comparing candidates. Record measured API
+quantiles separately from estimates interpolated from Prometheus histogram buckets. A health response, early job
+acceptance or processing completion alone does not prove responsiveness or confirmed persistence.
+
+The initial local sizing on 2026-11-04 counted 156298 domain rows with `id > 0`, excluding the service row, in
+`db/rdpr-db.sqlite`. The immutable read used an empty WAL and verified the main-file SHA256 before and after:
+`f4d879fdc3c488ca4955f5c4de71d46530e75a57ecf00f5b7c09ba8031132555`.
+The corresponding half/full/20%-headroom ladder is 78149, 156298 and 187558 input domains. Learned aliases and probe
+records are accounted for separately. Preserve the count, observation date, seed, provider schedule, source hashes,
+dependency versions, actual settings and current hardware in the machine-readable results.
+
+Prepare disposable seed data only after real migration startup and with the application stopped. Application
+outcome checks use public HTTP/metrics and exact API reads after restart. Controlled repeated STALE experiments may
+explicitly override the refresh interval to make the workload eligible; report that as a workload override, preserve
+it identically across candidates, and keep the initial NEW baseline on genuine production defaults. Such an override
+does not justify changing the production freshness policy.
+
+Explicitly selected smoke profiles validate the machinery at a small size and do not establish full-load acceptance
+or justify new defaults. Full comparisons require the configured ladder, separate warmup, at least three measured
+repetitions per compared configuration, degraded-provider checks, restart validation and the independent regression
+checks. Process resource limits in a campaign protect the local test run; they are not deployment hardware promises.
+
+Run a small, explicitly non-acceptance smoke campaign on Windows:
+
+```powershell
+$measurementTemp = Join-Path ([System.IO.Path]::GetTempPath()) ('rdpr-load-smoke-' + [guid]::NewGuid().ToString('N'))
+$previousLoadConfig = $env:GOST_LOAD_CONFIG
+try {
+  $env:GOST_LOAD_CONFIG = @{
+    profile = 'smoke'
+    n = 32
+    factors = @(1)
+    repetitions = 1
+    warmup_size = 8
+    baseline_samples = 3
+    candidates = @(@{ name = 'defaults'; environment = @{} })
+  } | ConvertTo-Json -Depth 5 -Compress
+  .\.venv\Scripts\python.exe -B -m pytest -n 0 -m e2e_load -k resolution_load `
+    -p no:cacheprovider --basetemp $measurementTemp
+  if ($LASTEXITCODE -ne 0) { throw 'Load smoke checks failed' }
+} finally {
+  $env:GOST_LOAD_CONFIG = $previousLoadConfig
+}
+```
+
+The normal `-m e2e_load` selection uses the full profile unless `GOST_LOAD_CONFIG` explicitly selects smoke.
+For the full observed scale, use a fresh temporary directory and set `GOST_LOAD_CONFIG` to
+`{"profile":"full","n":156298,"headroom":0.2,"repetitions":3}` before running the same command without the
+`-k` filter. Restore the previous environment value afterward. Full profile validation requires the half/full/
+headroom ladder and at least three measured repetitions. Candidate environments are restricted to tuning settings;
+database paths, provider targets, durability and freshness settings cannot be changed through that candidate list.
+
+For a bounded diagnostic replay, `stages` selects from `baseline`, `warmup`, `healthy` and `degraded`;
+`candidate_names` and `repetition_numbers` select subsets of the configured matrix. The default runs every stage,
+candidate and repetition. For example, a single true-default pass at the observed headroom population uses
+`{"profile":"smoke","n":156298,"factors":[1.2],"repetitions":1,"stages":["baseline"]}`.
+The smoke label describes incomplete acceptance evidence, even when its individual pass uses the full population.
+Custom-small full-profile branch checks and filtered replays are likewise labeled non-acceptance in the artifact.
+Retain identical source hashes, schedules and frozen API limits when comparing or combining diagnostic results.
+
+The finite whole-pass safety timeout is configurable and defaults to 14400 seconds for diagnostic/baseline runs.
+It does not override the 1800-second acceptance limit for full-size STALE passes; a slower candidate is ineligible.
+API request/maximum guards remain 5 seconds, with a frozen p99 limit of
+`min(5, max(1, idle_p99 * latency_factor + latency_slack))` seconds per route. Record raw measured delays as well as
+these conservative local guardrails. Longer source passes do not permit longer API requests.
+
+Measure each HTTP exchange independently, including domain reads, lists, statistics and write/job admission.
+Canary creation, resolution and deletion remain functional persistence checks under the finite pass budget;
+their end-to-end waiting time is separate from HTTP latency and has no independent 60-second acceptance limit.
+Retain completed source-pass measurements and HTTP observations when a later validation or probe drain fails,
+while keeping the failed verdict explicit. Cancelled requests do not count as completed HTTP responses.
+
+`resolution-load-campaign.json` contains the incremental cases, frozen API guardrails, exact public-result checks,
+restart verification, calibrated provider capacity, generator overhead, actual child resource measurements and
+repetition summaries. `resolution-load-resilience.json` records bounded priority/failure/recovery/soak/shutdown
+scenarios. Retain the artifact directory when inspecting a failure; partial and failed cases must not be treated as
+successful comparisons. Ordinary unit/integration/E2E regressions and configured quality/coverage checks run separately.
+
+### Bounded parameter screening outcome
+
+The 2026-11-04 parameter search stopped after four experimental series, including the initial exploratory pilot.
+Production resolver/writer code and defaults were not changed. These are screening results, not full-load acceptance;
+the 187558-domain deadline and repeated full-size comparisons remain unverified.
+
+| Series | Workload and candidates | Observed outcome |
+| --- | --- | --- |
+| 1 | 1024 domains, 4/8 workers, earlier harness | Exploratory only; later oracle/measurement corrections supersede it. |
+| 2 | 1024 domains, defaults/16/wide 64 workers | Warm confirmed rates 60.01/84.04 per second; wide 64 failed list p99 at 1.2403s against 1s. |
+| 3 | 1024 domains, smooth 32/bounded 64 workers | Cold 75.49/75.41 and warm 87.77/85.49 confirmed per second; API guards passed. |
+| 4 | 8192 domains, the smooth 32-worker candidate | Canary lifecycle exceeded 60s while awaiting confirmed resolution; shutdown failed its 20s writer-drain budget. |
+
+The smooth candidate uses workers32, DNS concurrency64, RIPE concurrency16, HTTP/keepalive32, queue512, batch128
+and flush0.1s. In series 3 its measured list p99 was 0.416s cold and 0.413s warm; application CPU averaged about
+106% of one core, with peak RSS below 134MiB. Bounded 64-worker processing completed in 6.63s warm but persistence
+took 11.93s. Writer transaction/residence histogram estimates are seconds, while commit estimates are milliseconds;
+these observations identify persistence work for investigation, not the cost of an individual SQL statement.
+
+The final series stopped before a complete source pass. Its last progress sample at 100.77s had 2060 attempted,
+1447 confirmed and 581 pending source outcomes. No full-pass rate, successful drain or API-request timeout can be
+inferred from that sample: the triggering timeout was the canary's end-to-end lifecycle. Warm/degraded checks for
+8192 domains were not reached. Separate follow-up work must address persistence cost and public-operation progress,
+then repeat the unchanged guards before selecting defaults. Do not continue tuning beyond the four-series cap or
+weaken the workload, provider failures, freshness, persistence guarantees or API bounds to obtain a pass.
+
+Current corrected artifacts are retained locally under `.pytest_cache/`, in these generated run directories:
+
+- `concurrency-search-66cbed41fbc947e7b8f74d70f9fedea9` (series 2).
+- `concurrency-search-3fd1d8dcca1c4c9d9f19c175a9fb6cdc` (series 3).
+- `final-parameter-check-10ca1a2e35d14d98a1da243727710fcb` (series 4).
+
+Each contains `test_resolution_load_campaign_0/resolution-load-campaign.json` with the exact `configuration` for
+replay, source hashes, local dependency versions and machine metadata. Replay with a fresh disposable `--basetemp`;
+retain the original failed output. The model deliberately includes several IPv4 results and frequent eligible RIPE
+lookups. Stored-IP aggregates alone do not establish its equivalence to real DNS fanout or provider/cache behavior.
+
+### Historical small local baseline
 
 The explicitly selected `e2e_load` scenarios use the real application entrypoint and lifespan, disposable SQLite,
 and local DNS, DoH and RIPEstat protocol providers. They record fixed workloads and safe settings, cold/warm cache
@@ -370,7 +503,9 @@ On Windows, select a fresh temporary directory so the run owns all generated fil
 
 ```powershell
 $measurementTemp = Join-Path ([System.IO.Path]::GetTempPath()) ('rdpr-measurements-' + [guid]::NewGuid().ToString('N'))
-.\.venv\Scripts\python.exe -B -m pytest -n 0 -m e2e_load -p no:cacheprovider --basetemp $measurementTemp
+.\.venv\Scripts\python.exe -B -m pytest -n 0 -m e2e_load `
+  -k 'reproducible_local_measurement_baseline or slow_independent_ripe' `
+  -p no:cacheprovider --basetemp $measurementTemp
 ```
 
 Keep the exact source snapshot, dependency versions, workload, provider schedule, settings and generated results

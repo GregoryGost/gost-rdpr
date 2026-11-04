@@ -11,10 +11,12 @@ import shutil
 import socket
 import sys
 from base64 import urlsafe_b64decode
+from collections import Counter
 from contextlib import closing
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
@@ -386,6 +388,8 @@ class ServiceProcess:
   providers: SimpleNamespace
   dns_host: str
   doh_url: str
+  provider_url: str
+  load_mode: bool
 
   def __init__(self, root, directory, environment):
     self.root = root
@@ -488,6 +492,10 @@ class ServiceProcess:
         return len(status) >= 2 and status[0] in {b'HTTP/1.0', b'HTTP/1.1'} and status[1] == b'200'
 
   async def start(self):
+    if self.process is not None:
+      raise RuntimeError('Application is already running')
+    if getattr(self, 'load_mode', False) and self.environment.get('TEST_TASK_MEASUREMENTS'):
+      raise ValueError('Load runs must use public metrics without task interception')
     # The wrapper only converts test-owned stdin into SIGINT; main.py owns the app.
     bootstrap = (
       'import _thread, asyncio, json, os, runpy, sys, threading\n'
@@ -552,6 +560,19 @@ class ServiceProcess:
     return f'http://127.0.0.1:{self.environment["APP_PORT"]}'
 
   async def stop(self, *, allow_failure=False):
+    """Retain bounded process cleanup even when the calling test is cancelled."""
+    cleanup = asyncio.create_task(self._stop(allow_failure=allow_failure))
+    cancelled = False
+    while not cleanup.done():
+      try:
+        await asyncio.shield(cleanup)
+      except asyncio.CancelledError:
+        cancelled = True
+    cleanup.result()
+    if cancelled:
+      raise asyncio.CancelledError
+
+  async def _stop(self, *, allow_failure=False):
     process, self.process = self.process, None
     try:
       if process is None:
@@ -564,7 +585,8 @@ class ServiceProcess:
         except BrokenPipeError, ConnectionResetError:
           pass
         try:
-          await asyncio.wait_for(process.wait(), timeout=15)
+          shutdown_timeout = max(15, float(self.environment.get('DB_SHUTDOWN_TIMEOUT', 20)) + 10)
+          await asyncio.wait_for(process.wait(), timeout=shutdown_timeout)
         except TimeoutError:
           process.kill()
           await asyncio.wait_for(process.wait(), timeout=5)
@@ -582,6 +604,86 @@ class ServiceProcess:
           self.log = None
 
 
+class ProviderState(SimpleNamespace):
+  """Configure deterministic wire responses and retain bounded load evidence.
+
+  Schedule keys are (transport, name_or_ip, rdtype_or_None, cycle), names have no
+  trailing dot, and attempts start at one. A schedule is a nonempty sequence of
+  step dictionaries; its final step repeats. The optional response_factory uses
+  (transport, name_or_ip, rdtype_or_None, attempt, cycle) and supplies unscheduled
+  steps. Each step may set kind, addresses, aliases, ttl, delay, status,
+  retry_after, prefix, media, body, or close. DNS kinds retain dns_message values;
+  malformed, disconnect and drop model protocol/transport failures. RIPE kinds
+  positive, empty, error and malformed select JSON responses. begin_cycle resets
+  attempts only after all exchanges finish; aggregate counters remain cumulative.
+  """
+
+  def sample(self, collection: list[Any], value: Any) -> None:
+    if self.sample_limit is None or len(collection) < self.sample_limit:
+      collection.append(value)
+
+  def record_error(self, error: BaseException) -> None:
+    self.counters[('provider', 'handler', 'error')] += 1
+    if len(self.errors) < 32:
+      self.errors.append(repr(error))
+
+  def assert_idle(self) -> None:
+    if self.dns_active or self.ripe_active:
+      raise RuntimeError('Provider exchanges are still active')
+
+  def begin_cycle(self, cycle: int) -> None:
+    self.assert_idle()
+    self.cycle = cycle
+    self.attempts.clear()
+
+  def reset_evidence(self) -> None:
+    self.assert_idle()
+    for values in (self.requests, self.http_requests, self.response_ttls, self.errors):
+      values.clear()
+    self.counters.clear()
+    self.dns_peak_active = self.ripe_peak_active = 0
+
+  def step(self, transport: str, name: str, rdtype: int | None) -> dict[str, Any]:
+    name = name.rstrip('.').lower()
+    key = (transport, name, rdtype, self.cycle)
+    if key not in self.attempts and len(self.attempts) >= self.attempt_key_limit:
+      raise ValueError('Provider attempt-key limit exceeded; retire a completed cycle')
+    attempt = self.attempts[key] = self.attempts.get(key, 0) + 1
+    schedule = self.schedule.get(key)
+    if schedule is not None:
+      if not schedule:
+        raise ValueError('Response schedules must contain at least one step')
+      step = dict(schedule[min(attempt - 1, len(schedule) - 1)])
+    elif self.response_factory is not None:
+      step = dict(self.response_factory(transport, name, rdtype, attempt, self.cycle))
+    else:
+      step = {}
+    kind = step.get('kind', 'default')
+    # Callback values are not metric labels: keep cardinality independent of data.
+    outcome = kind if kind in self.outcomes else 'other'
+    self.counters[(transport, str(rdtype), outcome)] += 1
+    self.counters[(transport, 'attempt', 'first' if attempt == 1 else 'retry')] += 1
+    return step
+
+  def evidence(self) -> dict[str, Any]:
+    return {
+      'cycle': self.cycle,
+      'counters': [
+        {'transport': key[0], 'record': key[1], 'outcome': key[2], 'count': count}
+        for key, count in sorted(self.counters.items())
+      ],
+      'attempt_keys': len(self.attempts),
+      'sample_limit': self.sample_limit,
+      'request_samples': list(self.requests),
+      'http_samples': list(self.http_requests),
+      'dns_active': self.dns_active,
+      'ripe_active': self.ripe_active,
+      'dns_peak_active': self.dns_peak_active,
+      'ripe_peak_active': self.ripe_peak_active,
+      'errors': list(self.errors),
+    }
+
+
 @pytest.fixture
 async def e2e_service(tmp_path, dns_message, request):
   """Keep application logic real and replace only external wire protocols."""
@@ -592,7 +694,38 @@ async def e2e_service(tmp_path, dns_message, request):
   shutil.copytree(root / 'migrations', tmp_path / 'migrations', ignore=shutil.ignore_patterns('__pycache__'))
   db_path = tmp_path / 'service.sqlite'
 
-  providers = SimpleNamespace(
+  options = getattr(request, 'param', True)
+  configuration = options if isinstance(options, dict) else {}
+  load_mode = bool(configuration.get('load', False))
+  sample_limit = configuration.get('request_sample_limit', 128) if load_mode else None
+  if sample_limit is not None and (not isinstance(sample_limit, int) or sample_limit < 0):
+    raise ValueError('request_sample_limit must be a nonnegative integer')
+  providers = ProviderState(
+    cycle=0,
+    schedule={},
+    response_factory=None,
+    attempts={},
+    attempt_key_limit=1_000_000,
+    counters=Counter(),
+    sample_limit=sample_limit,
+    keepalive=bool(load_mode),
+    outcomes=frozenset(
+      {
+        'default',
+        'positive',
+        'empty',
+        'nodata',
+        'nxdomain',
+        'servfail',
+        'refused',
+        'malformed',
+        'disconnect',
+        'drop',
+        'error',
+        'alias-positive',
+        'alias-chain-positive',
+      }
+    ),
     classic='positive',
     doh='positive',
     cname_kinds={},
@@ -623,123 +756,212 @@ async def e2e_service(tmp_path, dns_message, request):
     dns_peak_active=0,
   )
 
-  def response_wire(query, transport):
-    providers.requests.append((transport, query.question[0].name.to_text(), query.question[0].rdtype))
-    kind = (
+  def response_wire(query, transport, step):
+    providers.sample(providers.requests, (transport, query.question[0].name.to_text(), query.question[0].rdtype))
+    kind = step.get('kind') or (
       getattr(providers, transport)
       if query.question[0].rdtype == dns.rdatatype.A
       else providers.cname_kinds.get(transport, 'nodata')
     )
-    addresses = providers.addresses_by_domain.get(
-      (transport, query.question[0].name.to_text()), getattr(providers, f'{transport}_addresses')
+    addresses = step.get(
+      'addresses',
+      providers.addresses_by_domain.get(
+        (transport, query.question[0].name.to_text()), getattr(providers, f'{transport}_addresses')
+      ),
     )
+    if kind == 'malformed':
+      return b'not-a-dns-message'
     message = dns_message(kind, query=query, addresses=addresses)
-    providers.response_ttls.append(sorted({record.ttl for record in (*message.answer, *message.authority)}))
+    aliases = step.get('aliases')
+    if aliases is not None:
+      message.answer.clear()
+      owner = query.question[0].name.to_text()
+      for alias in aliases:
+        target = alias.rstrip('.') + '.'
+        message.answer.append(dns.rrset.from_text(owner, 60, 'IN', 'CNAME', target))
+        owner = target
+      if (
+        addresses
+        and query.question[0].rdtype == dns.rdatatype.A
+        and kind in {'positive', 'alias-positive', 'alias-chain-positive'}
+      ):
+        message.answer.append(dns.rrset.from_text(owner, 60, 'IN', 'A', *addresses))
+    if load_mode and kind in {'nodata', 'nxdomain', 'empty'}:
+      # An authoritative negative must cover arbitrary synthetic names, not only example.test.
+      message.authority.clear()
+      zone = query.question[0].name.parent().to_text()
+      message.authority.append(dns.rrset.from_text(zone, 60, 'IN', 'SOA', f'ns.{zone} hostmaster.{zone} 1 60 60 60 60'))
+    for record in (*message.answer, *message.authority):
+      record.ttl = int(step.get('ttl', 60))
+    providers.sample(providers.response_ttls, sorted({record.ttl for record in (*message.answer, *message.authority)}))
     return message.to_wire()
+
+  handlers = set()
+
+  def spawn_handler(coroutine):
+    task = asyncio.create_task(coroutine)
+    handlers.add(task)
+
+    def finish(completed):
+      handlers.discard(completed)
+      if not completed.cancelled() and (error := completed.exception()) is not None:
+        providers.record_error(error)
+
+    task.add_done_callback(finish)
+    return task
 
   class DnsProtocol(asyncio.DatagramProtocol):
     def connection_made(self, transport):
       self.transport = transport
 
     def datagram_received(self, data, addr):
-      query = dns.message.from_wire(data)
-      wire = response_wire(query, 'classic')
-      if providers.drop_classic:
+      if len(handlers) >= 4096:
+        providers.counters[('classic', 'transport', 'overload')] += 1
         return
+      spawn_handler(self.respond(data, addr))
+
+    async def respond(self, data, addr):
       providers.dns_active += 1
       providers.dns_peak_active = max(providers.dns_peak_active, providers.dns_active)
-
-      def respond():
-        try:
-          self.transport.sendto(wire, addr)
-        finally:
-          providers.dns_active -= 1
-
-      if providers.delay:
-        loop.call_later(providers.delay, respond)
-      else:
-        respond()
+      try:
+        query = dns.message.from_wire(data)
+        step = providers.step('classic', query.question[0].name.to_text(), query.question[0].rdtype)
+        wire = response_wire(query, 'classic', step)
+        if providers.drop_classic or step.get('kind') in {'drop', 'disconnect'}:
+          return
+        if delay := step.get('delay', providers.delay):
+          await asyncio.sleep(delay)
+        self.transport.sendto(wire, addr)
+      except (dns.exception.DNSException, ValueError, IndexError, OSError) as error:
+        providers.record_error(error)
+      finally:
+        providers.dns_active -= 1
 
     def error_received(self, exc):
-      providers.errors.append(str(exc))
+      providers.record_error(exc)
 
   connections = set()
 
   async def serve_http(reader, writer):
     connections.add(writer)
-    dns_active = False
+    providers.counters[('http', 'transport', 'connections')] += 1
     try:
-      async with asyncio.timeout(5):
-        request_line = (await reader.readline()).decode('ascii').split()
-        headers = {}
-        while line := await reader.readline():
-          if line == b'\r\n':
-            break
-          key, value = line.decode('ascii').split(':', 1)
-          headers[key.lower()] = value.strip()
-        method, target, _ = request_line
-        url = urlsplit(target)
-        params = parse_qs(url.query)
-        providers.http_requests.append((method, url.path))
-        if url.path == '/dns-query':
-          providers.dns_active += 1
-          providers.dns_peak_active = max(providers.dns_peak_active, providers.dns_active)
-          dns_active = True
-        if providers.delay:
-          await asyncio.sleep(providers.delay)
-        if providers.unavailable:
+      while True:
+        # Idle pooled connections own no exchange and may expire quietly.
+        try:
+          async with asyncio.timeout(30 if providers.keepalive else 5):
+            line = await reader.readline()
+        except TimeoutError:
           return
-        pending_statuses = providers.http_statuses.get(url.path, [])
-        if pending_statuses:
-          status = pending_statuses.pop(0)
-          writer.write(
-            f'HTTP/1.1 {status} Synthetic Provider Failure\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.encode()
-          )
-          await writer.drain()
+        if not line:
           return
-        if method == 'GET' and url.path == '/dns-query':
-          assert headers.get('accept') == 'application/dns-message'
-          encoded = params['dns'][0]
-          query = dns.message.from_wire(urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)))
-          body = response_wire(query, 'doh')
-          name = query.question[0].name.to_text().rstrip('.')
-          if name in providers.hold_dns_names:
-            providers.dns_entered_by_name.setdefault(name, asyncio.Event()).set()
-            await providers.dns_release_by_name.setdefault(name, asyncio.Event()).wait()
-          if providers.hold_dns:
-            providers.dns_entered.set()
-            await providers.dns_release.wait()
-          media = 'application/dns-message'
-        elif method == 'GET' and url.path == '/data/network-info/data.json':
-          providers.requests.append(('ripe', params['resource'][0], None))
-          providers.ripe_active += 1
-          providers.ripe_peak_active = max(providers.ripe_peak_active, providers.ripe_active)
-          providers.ripe_entered.set()
+        async with asyncio.timeout(60 if load_mode else 5):
+          method, target, _ = line.decode('ascii').split()
+          headers = {}
+          header_size = 0
+          while line := await reader.readline():
+            header_size += len(line)
+            if header_size > 16384:
+              raise ValueError('Provider request headers exceed limit')
+            if line == b'\r\n':
+              break
+            key, value = line.decode('ascii').split(':', 1)
+            headers[key.lower()] = value.strip()
+          if method != 'GET' or int(headers.get('content-length', '0')) or 'transfer-encoding' in headers:
+            raise ValueError('Provider supports bodyless GET requests only')
+          url = urlsplit(target)
+          params = parse_qs(url.query)
+          query = None
+          providers.sample(providers.http_requests, (method, url.path))
+          if url.path == '/dns-query':
+            transport = 'doh'
+            assert headers.get('accept') == 'application/dns-message'
+            encoded = params['dns'][0]
+            query = dns.message.from_wire(urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)))
+            name, rdtype = query.question[0].name.to_text(), query.question[0].rdtype
+          elif url.path == '/data/network-info/data.json':
+            transport = 'ripe'
+            name, rdtype = params['resource'][0], None
+          else:
+            raise AssertionError(f'Unexpected provider request: {method} {url.path}')
+          step = providers.step(transport, name, rdtype)
+          if transport == 'doh':
+            providers.dns_active += 1
+            providers.dns_peak_active = max(providers.dns_peak_active, providers.dns_active)
+          else:
+            providers.ripe_active += 1
+            providers.ripe_peak_active = max(providers.ripe_peak_active, providers.ripe_active)
+            providers.sample(providers.requests, ('ripe', name, None))
+            providers.ripe_entered.set()
           try:
-            if providers.hold_ripe:
-              await providers.ripe_release.wait()
-            if providers.ripe_delay:
-              await asyncio.sleep(providers.ripe_delay)
-            body = json.dumps({'status': 'ok', 'data': {'prefix': None}}).encode()
-            media = 'application/json'
+            if delay := step.get('delay', providers.delay + (providers.ripe_delay if transport == 'ripe' else 0)):
+              await asyncio.sleep(delay)
+            if providers.unavailable or step.get('kind') == 'disconnect':
+              return
+            if step.get('kind') == 'drop':
+              await reader.read(1)
+              return
+            pending_statuses = providers.http_statuses.get(url.path, [])
+            legacy_status = pending_statuses.pop(0) if pending_statuses and 'status' not in step else None
+            status = int(step.get('status', legacy_status if legacy_status is not None else 200))
+            if not 100 <= status <= 599:
+              raise ValueError('Provider HTTP status must be in 100..599')
+            if legacy_status is not None:
+              body, media = b'', 'application/octet-stream'
+            elif transport == 'doh':
+              assert query is not None
+              body = response_wire(query, 'doh', step)
+              name = name.rstrip('.')
+              if name in providers.hold_dns_names:
+                providers.dns_entered_by_name.setdefault(name, asyncio.Event()).set()
+                await providers.dns_release_by_name.setdefault(name, asyncio.Event()).wait()
+              if providers.hold_dns:
+                providers.dns_entered.set()
+                await providers.dns_release.wait()
+              media = 'application/dns-message'
+            else:
+              if providers.hold_ripe:
+                await providers.ripe_release.wait()
+              kind = step.get('kind', 'empty')
+              if kind == 'malformed':
+                body = b'{invalid-json'
+              elif kind == 'error':
+                body = json.dumps({'status': 'error', 'message': 'Synthetic provider failure'}).encode()
+              else:
+                body = json.dumps({'status': 'ok', 'data': {'prefix': step.get('prefix')}}).encode()
+              media = 'application/json'
+            body = step.get('body', body)
+            close = step.get('close', not providers.keepalive) or headers.get('connection', '').lower() == 'close'
+            response_headers = (
+              f'HTTP/1.1 {status} Synthetic Provider Response\r\n'
+              f'Content-Type: {step.get("media", media)}\r\nContent-Length: {len(body)}\r\n'
+              f'Connection: {"close" if close else "keep-alive"}\r\n'
+            )
+            if 'retry_after' in step:
+              response_headers += f'Retry-After: {step["retry_after"]}\r\n'
+            writer.write((response_headers + '\r\n').encode('ascii') + body)
+            await writer.drain()
+            providers.counters[(transport, 'status', str(status))] += 1
+            if close:
+              return
           finally:
-            providers.ripe_active -= 1
-        else:
-          raise AssertionError(f'Unexpected provider request: {method} {target}')
-        writer.write(
-          f'HTTP/1.1 200 OK\r\nContent-Type: {media}\r\nContent-Length: {len(body)}\r\n'
-          'Connection: close\r\n\r\n'.encode()
-          + body
-        )
-        await writer.drain()
-    except (AssertionError, KeyError, ValueError, TimeoutError) as error:
-      providers.errors.append(repr(error))
+            if transport == 'doh':
+              providers.dns_active -= 1
+            else:
+              providers.ripe_active -= 1
+    except ConnectionError, asyncio.IncompleteReadError:
+      # Clients may cancel or time out intentionally during degraded-provider cases.
+      providers.counters[('http', 'transport', 'client_closed')] += 1
+    except (AssertionError, KeyError, ValueError, IndexError, dns.exception.DNSException, TimeoutError) as error:
+      providers.record_error(error)
     finally:
-      if dns_active:
-        providers.dns_active -= 1
       writer.close()
-      await writer.wait_closed()
-      connections.discard(writer)
+      try:
+        await writer.wait_closed()
+      except ConnectionError:
+        pass
+      finally:
+        connections.discard(writer)
 
   loop = asyncio.get_running_loop()
   # Classic DNS has no configurable port. A separate loopback address owns port 53.
@@ -748,7 +970,9 @@ async def e2e_service(tmp_path, dns_message, request):
   http_server = None
   service = None
   try:
-    http_server = await asyncio.start_server(serve_http, '127.0.0.1', 0)
+    http_server = await asyncio.start_server(
+      lambda reader, writer: spawn_handler(serve_http(reader, writer)), '127.0.0.1', 0
+    )
     provider_url = f'http://127.0.0.1:{http_server.sockets[0].getsockname()[1]}'
     # Reserve an ephemeral address before handing it to the real HTTP server.
     port_reservation = await asyncio.start_server(lambda reader, writer: writer.close(), '127.0.0.1', 0)
@@ -768,41 +992,48 @@ async def e2e_service(tmp_path, dns_message, request):
         'DB_BASE_DIR': str(tmp_path),
         'DB_FILE_NAME': db_path.name,
         'DB_TABLE_PREFIX': 'rdpr_',
-        'DB_SAVE_BATCH_TIMEOUT': '0.05',
-        'DB_SHUTDOWN_TIMEOUT': '5',
         'RIPE_STAT_BASE_URL': provider_url,
-        'REQ_CONNECTION_RETRIES': '0',
-        'DOH_CONNECTION_RETRIES': '0',
-        'RIPE_STAT_CONNECTION_RETRIES': '0',
-        'DOH_TIMEOUT_CONNECT': '2',
-        'DOH_TIMEOUT_READ': '2',
-        'DOH_TIMEOUT_WRITE': '2',
-        'DOH_TIMEOUT_POOL': '2',
-        'RIPE_STAT_TIMEOUT_CONNECT': '2',
-        'RIPE_STAT_TIMEOUT_READ': '2',
-        'RIPE_STAT_TIMEOUT_WRITE': '2',
-        'RIPE_STAT_TIMEOUT_POOL': '2',
-        'REQ_TIMEOUT_DEFAULT': '2',
-        'REQ_TIMEOUT_CONNECT': '2',
-        'REQ_TIMEOUT_READ': '2',
       }
     )
+    if not load_mode:
+      environment.update(
+        {
+          'DB_SAVE_BATCH_TIMEOUT': '0.05',
+          'DB_SHUTDOWN_TIMEOUT': '5',
+          'REQ_CONNECTION_RETRIES': '0',
+          'DOH_CONNECTION_RETRIES': '0',
+          'RIPE_STAT_CONNECTION_RETRIES': '0',
+          'DOH_TIMEOUT_CONNECT': '2',
+          'DOH_TIMEOUT_READ': '2',
+          'DOH_TIMEOUT_WRITE': '2',
+          'DOH_TIMEOUT_POOL': '2',
+          'RIPE_STAT_TIMEOUT_CONNECT': '2',
+          'RIPE_STAT_TIMEOUT_READ': '2',
+          'RIPE_STAT_TIMEOUT_WRITE': '2',
+          'RIPE_STAT_TIMEOUT_POOL': '2',
+          'REQ_TIMEOUT_DEFAULT': '2',
+          'REQ_TIMEOUT_CONNECT': '2',
+          'REQ_TIMEOUT_READ': '2',
+        }
+      )
     coverage = Coverage.current()
-    if coverage is not None:
+    if not load_mode and coverage is not None:
       environment['COVERAGE_PROCESS_START'] = str(root / 'pyproject.toml')
       coverage_file = coverage.get_option('run:data_file')
       assert isinstance(coverage_file, str)
       environment['COVERAGE_FILE'] = str(Path(coverage_file).resolve())
-    elif os.environ.get('COVERAGE_PROCESS_START'):
+    elif not load_mode and os.environ.get('COVERAGE_PROCESS_START'):
       environment['COVERAGE_PROCESS_START'] = os.environ['COVERAGE_PROCESS_START']
       if os.environ.get('COVERAGE_FILE'):
         environment['COVERAGE_FILE'] = os.environ['COVERAGE_FILE']
     service = ServiceProcess(root, tmp_path, environment)
+    service.load_mode = bool(load_mode)
     service.db_path = db_path
     service.providers = providers
     service.dns_host = dns_host
     service.doh_url = f'{provider_url}/dns-query'
-    if getattr(request, 'param', True):
+    service.provider_url = provider_url
+    if options.get('start', True) if isinstance(options, dict) else options:
       await service.start()
     yield service
   finally:
@@ -817,8 +1048,14 @@ async def e2e_service(tmp_path, dns_message, request):
       dns_transport.close()
       if http_server is not None:
         http_server.close()
-        await http_server.wait_closed()
       for writer in tuple(connections):
         writer.close()
-        await writer.wait_closed()
+      for task in tuple(handlers):
+        task.cancel()
+      if handlers:
+        async with asyncio.timeout(5):
+          await asyncio.gather(*tuple(handlers), return_exceptions=True)
+      if http_server is not None:
+        async with asyncio.timeout(5):
+          await http_server.wait_closed()
       assert providers.errors == []
