@@ -57,6 +57,7 @@ class DomainResult:
   insert: DomainSqlData = field(default_factory=DomainSqlData)
   list_id: int | None = None
   resolution_complete: bool = False
+  storage_ips: tuple[str, ...] = ()
   processing_outcome: ProcessingOutcome | None = None
   observation: Observation | None = field(default=None, repr=False, compare=False)
   admitted_at: float | None = field(default=None, repr=False, compare=False)

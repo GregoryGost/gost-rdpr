@@ -43,10 +43,28 @@ class TargetAction(StrEnum):
   IPS_DELETE_ALL = 'IPS_DELETE_ALL'
   IPS_DELETE_ID = 'IPS_DELETE_ID'
   IPS_DELETE_ADDR = 'IPS_DELETE_ADDR'
+  IPS_LIST_WITHDRAW = 'IPS_LIST_WITHDRAW'
   #
   ROS_CONFIG_ADD = 'ROS_CONFIG_ADD'
   ROS_CONFIG_DELETE_ALL = 'ROS_CONFIG_DELETE_ALL'
   ROS_CONFIG_DELETE = 'ROS_CONFIG_DELETE'
+
+
+@dataclass(frozen=True)
+class DomainResolutionIntent:
+  """An immutable prepared storage result captured before queue admission."""
+
+  id: int
+  resolution_complete: bool
+  storage_ips: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class IpListWithdrawal:
+  """Withdraw one list's ownership of selected global records."""
+
+  list_id: int
+  ip_record_ids: tuple[int, ...]
 
 
 @dataclass

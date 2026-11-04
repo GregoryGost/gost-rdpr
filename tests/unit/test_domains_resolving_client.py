@@ -6,7 +6,7 @@ import importlib
 import logging
 import math
 import sys
-import threading
+from base64 import urlsafe_b64decode
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -23,6 +23,371 @@ from prometheus_client import REGISTRY
 pytestmark = pytest.mark.unit
 
 ROS_RETRY_METHODS = frozenset({'GET', 'POST', 'PATCH', 'DELETE'})
+
+
+@pytest.mark.parametrize('field', ['domains_resolve_worker_limit', 'domains_resolve_semaphore_limit', 'queue_max_size'])
+@pytest.mark.parametrize('value', [0, -1])
+async def test_resolution_resource_limits_reject_deadlock_configuration(app, field, value):
+  from pydantic import ValidationError
+
+  with pytest.raises(ValidationError) as failure:
+    type(app.settings)(_env_file=None, **{field: value})
+  assert field in {error['loc'][0] for error in failure.value.errors()}
+
+
+async def test_fixed_domain_workers_overlap_and_writer_pressure_bounds_production(
+  app, resolver, repository, monkeypatch, dns_message, job_queues
+):
+  """A full writer boundary must bound work before all selected domains start."""
+  jobs = importlib.import_module('jobs.job_registry')
+  monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 2)
+  monkeypatch.setattr(app.settings, 'queue_max_size', 1)
+  domains = [app.dto.DomainResult(id=index, name=f'domain-{index}.example.test') for index in range(1, 65)]
+  repository.get_new_domains_for_resolve = AsyncMock(return_value=domains)
+  repository.get_dns_servers_for_resolve.return_value = ([app.Server(server='192.0.2.53')], [])
+  release, blocked = asyncio.Event(), asyncio.Event()
+  queries, admitted = [], []
+
+  async def classic(boundary, qname, rdtype, **kwargs):
+    queries.append(qname)
+    return SimpleNamespace(response=dns_message('positive', query=dns.message.make_query(qname, rdtype)))
+
+  async def writer(domain):
+    admitted.append(domain)
+    if len(admitted) == 2:
+      blocked.set()
+    await release.wait()
+
+  monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
+  repository.put_domain_after_resolve.side_effect = writer
+  original = asyncio.all_tasks()
+  task = asyncio.create_task(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW))
+  try:
+    await asyncio.wait_for(blocked.wait(), timeout=2)
+    await asyncio.wait_for(job_queues[0].put_waiting.wait(), timeout=2)
+    assert len(admitted) == len(queries) == 2
+    assert len(job_queues[0].admissions) == 3
+    assert job_queues[0].qsize() == job_queues[0].peak_size == 1
+    assert not task.done()
+    # Selected-but-unstarted domains must not each allocate a task.
+    assert len(asyncio.all_tasks() - original) <= 8
+    release.set()
+    await asyncio.wait_for(task, timeout=3)
+    assert sorted(queries) == sorted(domain.name for domain in domains)
+    assert {domain.id for domain in admitted} == set(range(1, 65))
+    assert all(domain.storage_ips == ('8.8.8.8',) for domain in admitted)
+    assert job_queues[0]._unfinished_tasks == job_queues[0].qsize() == 0
+    repository.get_dns_servers_for_resolve.assert_awaited_once_with()
+    assert asyncio.all_tasks() - original == set()
+  finally:
+    release.set()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize('endpoints', ['classic', 'mixed'])
+async def test_bulk_stored_and_check_share_the_same_dns_admission_limit(
+  app, resolver, repository, monkeypatch, dns_message, endpoints
+):
+  jobs = importlib.import_module('jobs.job_registry')
+  monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 4)
+  monkeypatch.setattr(app.settings, 'dns_operation_timeout', 5)
+  monkeypatch.setattr(app.settings, 'doh_operation_timeout', 5)
+  resolver._DomainsResolver__semaphore = asyncio.Semaphore(2)
+  servers = [app.Server(server=f'192.0.2.{value}') for value in (53, 54)]
+  repository.get_dns_servers_for_resolve.return_value = (
+    (servers, []) if endpoints == 'classic' else (servers[:1], [app.Server(server='https://dns.example.test/query')])
+  )
+  repository.get_new_domains_for_resolve = AsyncMock(
+    return_value=[app.dto.DomainResult(id=value, name=f'bulk-{value}.example.test') for value in range(1, 9)]
+  )
+  repository.get_domain_on_id = AsyncMock(
+    return_value=SimpleNamespace(id=99, name='stored.example.test', domains_list_id=None)
+  )
+  entered, release = asyncio.Event(), asyncio.Event()
+  active, peak = 0, 0
+  queries = []
+
+  async def answer(query):
+    nonlocal active, peak
+    qname = query.question[0].name.to_text().rstrip('.')
+    queries.append(qname)
+    active += 1
+    peak = max(peak, active)
+    if active == 2:
+      entered.set()
+    try:
+      await release.wait()
+      return dns_message('nodata', query=query)
+    finally:
+      active -= 1
+
+  async def classic(boundary, qname, rdtype, **kwargs):
+    return SimpleNamespace(response=await answer(dns.message.make_query(qname, rdtype)))
+
+  async def doh(request):
+    encoded = request.url.params['dns']
+    query = dns.message.from_wire(urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)))
+    message = await answer(query)
+    return httpx.Response(200, headers={'Content-Type': 'application/dns-message'}, content=message.to_wire())
+
+  monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
+  resolver._DomainsResolver__http_client = app.make_http(doh)
+  original = asyncio.all_tasks()
+  tasks = [
+    asyncio.create_task(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW)),
+    asyncio.create_task(resolver.resolve_stored_domain(99)),
+    asyncio.create_task(resolver.resolve_once('check.example.test')),
+  ]
+  try:
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    assert active == peak == 2
+    release.set()
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=3)
+    assert active == 0
+    assert peak == 2
+    assert len(queries) == 20
+    assert {'stored.example.test', 'check.example.test'} <= set(queries)
+    assert asyncio.all_tasks() - original == set()
+  finally:
+    release.set()
+    for task in tasks:
+      task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_repeated_bulk_cancellation_awaits_nested_cleanup_before_job_release(
+  app, resolver, repository, monkeypatch, dns_message, job_queues
+):
+  jobs = importlib.import_module('jobs.job_registry')
+  registry = jobs.JobRegistry()
+  monkeypatch.setattr(app.resolver, 'job_registry', registry)
+  monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 2)
+  monkeypatch.setattr(app.settings, 'queue_max_size', 1)
+  monkeypatch.setattr(app.settings, 'dns_operation_timeout', 10)
+  first = [app.dto.DomainResult(id=value, name=f'cancel-{value}.example.test') for value in range(1, 33)]
+  next_domain = app.dto.DomainResult(id=99, name='next-job.example.test')
+  repository.get_new_domains_for_resolve = AsyncMock(side_effect=[first, [next_domain]])
+  repository.get_dns_servers_for_resolve.return_value = ([app.Server(server='192.0.2.53')], [])
+  entered, cleanup, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+  active = 0
+  names = []
+
+  async def classic(boundary, qname, rdtype, **kwargs):
+    nonlocal active
+    names.append(qname)
+    if qname == next_domain.name:
+      return SimpleNamespace(response=dns_message('positive', query=dns.message.make_query(qname, rdtype)))
+    active += 1
+    if active == 2:
+      entered.set()
+    try:
+      await asyncio.Future()
+    finally:
+      cleanup.set()
+      await release.wait()
+      active -= 1
+
+  monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
+  assert await registry.try_start(jobs.Jobs.DOMAINS_RESOLVE)
+  original = asyncio.all_tasks()
+  task = asyncio.create_task(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW))
+  try:
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    task.cancel()
+    await asyncio.wait_for(cleanup.wait(), timeout=2)
+    task.cancel()
+    assert await registry.is_active(jobs.Jobs.DOMAINS_RESOLVE)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+      await asyncio.wait_for(task, timeout=2)
+    assert active == 0
+    assert not await registry.is_active(jobs.Jobs.DOMAINS_RESOLVE)
+    assert asyncio.all_tasks() - original == set()
+    assert sum(domain.processing_outcome is None for domain in first) >= 30
+    assert await registry.try_start(jobs.Jobs.DOMAINS_RESOLVE)
+    await asyncio.wait_for(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW), timeout=2)
+    assert len(job_queues) == 2
+    assert job_queues[0] is not job_queues[1]
+    assert [domain.id for domain in job_queues[1].admissions] == [99]
+    assert len(names) == 3
+    assert [call.kwargs['domain'].id for call in repository.put_domain_after_resolve.await_args_list] == [99]
+    assert not await registry.is_active(jobs.Jobs.DOMAINS_RESOLVE)
+  finally:
+    release.set()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize('entrypoint', ['stored', 'check'])
+@pytest.mark.parametrize('cancel_during_cleanup', [False, True])
+async def test_unexpected_endpoint_failure_awaits_sibling_cleanup_before_public_exit(
+  app, resolver, repository, monkeypatch, dns_message, entrypoint, cancel_during_cleanup
+):
+  """Scheduler failures must not abandon endpoint cleanup or allow later writes."""
+  repository.get_dns_servers_for_resolve.return_value = (
+    [app.Server(server='192.0.2.53'), app.Server(server='192.0.2.54')],
+    [],
+  )
+  repository.get_domain_on_id = AsyncMock(
+    return_value=SimpleNamespace(id=7, name='cleanup.example.test', domains_list_id=None)
+  )
+  monkeypatch.setattr(app.settings, 'dns_operation_timeout', 10)
+  sibling_entered, cleanup_entered, release_cleanup = asyncio.Event(), asyncio.Event(), asyncio.Event()
+  cleanup_finished = asyncio.Event()
+  endpoint_tasks = set()
+  failed_endpoint = None
+
+  class FailingReleaseSemaphore(asyncio.Semaphore):
+    async def __aexit__(self, *args):
+      await super().__aexit__(*args)
+      if asyncio.current_task() is failed_endpoint:
+        # Fail the scheduler boundary, outside ordinary provider-error handling.
+        raise RuntimeError('Synthetic endpoint semaphore release failure')
+
+  resolver._DomainsResolver__semaphore = FailingReleaseSemaphore(2)
+
+  async def classic(boundary, qname, rdtype, **kwargs):
+    nonlocal failed_endpoint
+    endpoint_tasks.add(asyncio.current_task())
+    if boundary.nameservers == ['192.0.2.53']:
+      failed_endpoint = asyncio.current_task()
+      await sibling_entered.wait()
+      return SimpleNamespace(response=dns_message('positive', query=dns.message.make_query(qname, rdtype)))
+    sibling_entered.set()
+    try:
+      await asyncio.Future()
+    finally:
+      cleanup_entered.set()
+      await release_cleanup.wait()
+      cleanup_finished.set()
+
+  monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
+  original = asyncio.all_tasks()
+  operation = (
+    resolver.resolve_stored_domain(7) if entrypoint == 'stored' else resolver.resolve_once('cleanup.example.test')
+  )
+  task = asyncio.create_task(operation)
+  try:
+    await asyncio.wait_for(cleanup_entered.wait(), timeout=2)
+    assert len(endpoint_tasks) == 2
+    assert not task.done()
+    assert not cleanup_finished.is_set()
+    if cancel_during_cleanup:
+      task.cancel()
+      # Observe the caller's completion condition while mandatory cleanup is gated.
+      done, _ = await asyncio.wait({task}, timeout=0.05)
+      assert done == set(), 'Caller exited before its endpoint cleanup was released'
+      assert not cleanup_finished.is_set()
+    repository.put_domain_after_resolve.assert_not_awaited()
+    repository.put_add_domains_to_queue.assert_not_awaited()
+    release_cleanup.set()
+    if cancel_during_cleanup:
+      with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=2)
+    elif entrypoint == 'check':
+      with pytest.raises(RuntimeError, match='Synthetic endpoint semaphore release failure'):
+        await asyncio.wait_for(task, timeout=2)
+    else:
+      await asyncio.wait_for(task, timeout=2)
+    assert cleanup_finished.is_set()
+    assert all(endpoint.done() for endpoint in endpoint_tasks)
+    assert asyncio.all_tasks() - original == set()
+    repository.get_all_ips_for_domain.assert_not_awaited()
+    repository.put_domain_after_resolve.assert_not_awaited()
+    repository.put_add_domains_to_queue.assert_not_awaited()
+  finally:
+    release_cleanup.set()
+    task.cancel()
+    await asyncio.gather(task, *endpoint_tasks, return_exceptions=True)
+
+
+async def test_repeated_cancellation_during_registry_finish_retains_reservation_until_cleanup(
+  app, resolver, repository, monkeypatch
+):
+  """Cancellation cannot release the reservation before mandatory finish completes."""
+  jobs = importlib.import_module('jobs.job_registry')
+  finish_entered, release_finish, finish_completed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+  class GatedRegistry(jobs.JobRegistry):
+    async def finish(self, job):
+      finish_entered.set()
+      await release_finish.wait()
+      await super().finish(job)
+      finish_completed.set()
+
+  registry = GatedRegistry()
+  monkeypatch.setattr(app.resolver, 'job_registry', registry)
+  repository.get_new_domains_for_resolve = AsyncMock(return_value=[])
+  assert await registry.try_start(jobs.Jobs.DOMAINS_RESOLVE)
+  original = asyncio.all_tasks()
+  task = asyncio.create_task(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW))
+  try:
+    await asyncio.wait_for(finish_entered.wait(), timeout=2)
+    for _ in range(3):
+      task.cancel()
+      # A scheduler event lets each cancellation reach the real ownership helper.
+      delivered = asyncio.Event()
+      asyncio.get_running_loop().call_soon(delivered.set)
+      await delivered.wait()
+      assert not task.done()
+      assert not finish_completed.is_set()
+      assert await registry.is_active(jobs.Jobs.DOMAINS_RESOLVE)
+      assert not await registry.try_start(jobs.Jobs.DOMAINS_RESOLVE)
+    assert task.cancelling() == 3
+    release_finish.set()
+    with pytest.raises(asyncio.CancelledError):
+      await asyncio.wait_for(task, timeout=2)
+    assert finish_completed.is_set()
+    assert not await registry.is_active(jobs.Jobs.DOMAINS_RESOLVE)
+    assert asyncio.all_tasks() - original == set()
+    repository.get_dns_servers_for_resolve.assert_not_awaited()
+    repository.put_domain_after_resolve.assert_not_awaited()
+    repository.put_add_domains_to_queue.assert_not_awaited()
+  finally:
+    release_finish.set()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize('write_stage', ['resolution', 'cname'])
+async def test_typed_writer_failure_stops_bulk_admission_and_releases_job(
+  app, resolver, repository, network, monkeypatch, job_queues, write_stage
+):
+  jobs = importlib.import_module('jobs.job_registry')
+  registry = jobs.JobRegistry()
+  monkeypatch.setattr(app.resolver, 'job_registry', registry)
+  monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 1)
+  monkeypatch.setattr(app.settings, 'queue_max_size', 1)
+  repository.get_new_domains_for_resolve = AsyncMock(
+    return_value=[app.dto.DomainResult(id=value, name=f'failure-{value}.example.test') for value in range(1, 33)]
+  )
+  repository.get_dns_servers_for_resolve.return_value = ([app.Server(server='192.0.2.53')], [])
+  requests = network({'192.0.2.53': 'alias-positive' if write_stage == 'cname' else 'positive'})
+  boundary = repository.put_domain_after_resolve if write_stage == 'resolution' else repository.put_add_domains_to_queue
+  boundary.side_effect = app.database.WriterClosedError('Synthetic closed writer')
+  assert await registry.try_start(jobs.Jobs.DOMAINS_RESOLVE)
+  original = asyncio.all_tasks()
+  with pytest.raises((app.database.DatabaseWriteError, ExceptionGroup)) as failure:
+    await asyncio.wait_for(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW), timeout=2)
+
+  def contains_writer_error(error):
+    return isinstance(error, app.database.DatabaseWriteError) or (
+      isinstance(error, BaseExceptionGroup) and any(contains_writer_error(child) for child in error.exceptions)
+    )
+
+  assert contains_writer_error(failure.value)
+  assert len(requests) == 1
+  assert len(job_queues[0].admissions) <= 2
+  assert not await registry.is_active(jobs.Jobs.DOMAINS_RESOLVE)
+  assert asyncio.all_tasks() - original == set()
+  if write_stage == 'resolution':
+    domain = repository.put_domain_after_resolve.await_args.kwargs['domain']
+    assert domain.processing_outcome == 'success'
+    assert domain.storage_ips == ('8.8.8.8',)
+  else:
+    repository.put_domain_after_resolve.assert_not_awaited()
 
 
 @pytest.mark.parametrize('transport', ['classic', 'doh'])
@@ -50,8 +415,6 @@ async def test_a_first_discovery_preserves_aliases_and_independent_ip_evidence(
   domains = [app.dto.DomainResult(id=1, name='www.example.test', list_id=7)]
   repository.get_new_domains_for_resolve = AsyncMock(return_value=domains)
   repository.get_stale_domains_for_resolve = AsyncMock(return_value=domains)
-  monkeypatch.setattr(resolver, 'domains_resolve_queue', asyncio.Queue(maxsize=1))
-  monkeypatch.setattr(resolver, '_DomainsResolver__stop_domains_resolve_event', threading.Event())
   aliases = (
     ['edge.example.test', 'terminal.example.test']
     if kind == 'alias-chain-positive'
@@ -97,8 +460,6 @@ async def test_job_reuses_one_classic_resolver_for_domains_and_fallback_but_relo
   app, resolver, repository, dns_message, monkeypatch
 ):
   jobs = importlib.import_module('jobs.job_registry')
-  monkeypatch.setattr(resolver, 'domains_resolve_queue', asyncio.Queue(maxsize=1))
-  monkeypatch.setattr(resolver, '_DomainsResolver__stop_domains_resolve_event', threading.Event())
   domains = [app.dto.DomainResult(id=index, name=f'domain-{index}.example.test') for index in (1, 2)]
   repository.get_new_domains_for_resolve = AsyncMock(return_value=domains)
   servers = [app.Server(server='192.0.2.53', id=42)]
@@ -1227,6 +1588,7 @@ async def test_policy_filtering_does_not_change_positive_cycle_status(
   assert domain.resolution_complete is complete
   assert domain.insert.ips_insert == []
   assert domain.insert.ips_delete == ([10] if complete else [])
+  assert domain.storage_ips == ()
 
 
 @pytest.mark.parametrize('stored', ['8.8.8.0', '8.8.8.0/24', '8.8.8.0/25'])
@@ -1251,7 +1613,63 @@ async def test_partial_cycle_preserves_existing_representation_without_enrichmen
   assert domain.insert.ips_insert == []
   assert domain.insert.ips_delete == []
   assert domain.resolution_complete is False
+  assert domain.storage_ips == (stored,)
+  assert repository.put_domain_after_resolve.await_args.kwargs['domain'].storage_ips == (stored,)
   ripe_boundary.assert_not_awaited()
+
+
+@pytest.mark.parametrize('complete', [True, False])
+@pytest.mark.parametrize('existing', [True, False])
+async def test_full_storage_payload_preserves_existing_filtered_match_but_never_adds_blocked_address(
+  app, resolver, repository, monkeypatch, dns_message, complete, existing
+):
+  async def classic(boundary, qname, rdtype, **kwargs):
+    if boundary.nameservers[0] == '192.0.2.54':
+      raise dns.exception.Timeout()
+    return SimpleNamespace(response=dns_message(query=dns.message.make_query(qname, rdtype), addresses=('127.0.0.1',)))
+
+  monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
+  repository.get_all_ips_for_domain.return_value = (
+    [app.Ip(id=10, ip_address='127.0.0.1', addr_type=4)] if existing else []
+  )
+  servers = [app.Server(server='192.0.2.53')]
+  if not complete:
+    servers.append(app.Server(server='192.0.2.54'))
+  domain = app.dto.DomainResult(id=1, name='filtered.example.test')
+  await resolver._DomainsResolver__dns_main_tasker(domain, servers, [])
+  assert domain.resolution_complete is complete
+  assert domain.storage_ips == (('127.0.0.1',) if existing else ())
+  assert domain.insert.ips_insert == []
+  if complete or existing:
+    assert repository.put_domain_after_resolve.await_args.kwargs['domain'].storage_ips == domain.storage_ips
+  else:
+    repository.put_domain_after_resolve.assert_not_awaited()
+
+
+async def test_partial_payload_contains_all_matching_representations_and_no_unobserved_old_address(
+  app, resolver, repository, monkeypatch, dns_message
+):
+  async def classic(boundary, qname, rdtype, **kwargs):
+    if boundary.nameservers[0] == '192.0.2.54':
+      raise dns.exception.Timeout()
+    return SimpleNamespace(response=dns_message(query=dns.message.make_query(qname, rdtype), addresses=('8.8.8.0',)))
+
+  monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
+  repository.get_all_ips_for_domain.return_value = [
+    app.Ip(id=10, ip_address='8.8.8.0', addr_type=4),
+    app.Ip(id=11, ip_address='8.8.8.0/24', addr_type=4),
+    app.Ip(id=12, ip_address='9.9.9.9', addr_type=4),
+  ]
+  ripe = AsyncMock(side_effect=AssertionError('Existing representations must not be enriched again'))
+  resolver._DomainsResolver__ripe_stat_client = SimpleNamespace(get_prefix=ripe)
+  domain = app.dto.DomainResult(id=1, name='partial.example.test')
+  await resolver._DomainsResolver__dns_main_tasker(
+    domain, [app.Server(server=f'192.0.2.{value}') for value in (53, 54)], []
+  )
+  assert set(domain.storage_ips) == {'8.8.8.0', '8.8.8.0/24'}
+  assert domain.resolution_complete is False
+  assert domain.insert.ips_insert == domain.insert.ips_delete == []
+  ripe.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -1272,6 +1690,7 @@ async def test_complete_cycle_keeps_ripe_prefix_and_failure_contract(app, resolv
   domain.result.A = ['8.8.8.0']
   current = [app.Ip(id=10, ip_address='8.8.8.0/25', addr_type=4)]
   await resolver._DomainsResolver__ips_processing(domain=domain, current_ips=current)
+  assert domain.storage_ips == (expected,)
   if expected == '8.8.8.0/25':
     assert domain.insert.ips_insert == []
     assert domain.insert.ips_delete == []
@@ -1554,7 +1973,8 @@ async def test_prepared_processing_success_survives_writer_admission_failure(
     with pytest.raises(asyncio.CancelledError):
       await resolver._DomainsResolver__dns_main_tasker(domain, [app.Server(server='192.0.2.53')], [])
   else:
-    await resolver._DomainsResolver__dns_main_tasker(domain, [app.Server(server='192.0.2.53')], [])
+    with pytest.raises(app.database.WriterClosedError):
+      await resolver._DomainsResolver__dns_main_tasker(domain, [app.Server(server='192.0.2.53')], [])
   resolver._DomainsResolver__finish_domain_observation(domain)
   assert domain.processing_outcome == 'success'
   assert run.snapshot()['success'] == 1
@@ -1797,20 +2217,21 @@ async def test_overlapping_stored_operations_keep_their_own_observations(
 
 
 async def test_resolve_queue_measures_admission_and_residence_from_successful_put(
-  app,
-  resolver,
-  repository,
-  network,
-  monkeypatch,
+  app, resolver, repository, network, monkeypatch
 ):
   metrics = importlib.import_module('metrics.metrics')
+  jobs = importlib.import_module('jobs.job_registry')
   clock = SimpleNamespace(value=10.0)
   monkeypatch.setattr(metrics, 'perf_counter', lambda: clock.value)
   monkeypatch.setattr(app.resolver, 'perf_counter', lambda: clock.value)
-  monkeypatch.setattr(resolver, '_DomainsResolver__stop_domains_resolve_event', threading.Event())
   domain = app.dto.DomainResult(id=1, name='www.example.test')
+  queues = []
 
   class TimedQueue(asyncio.Queue):
+    def __init__(self, *args, **kwargs):
+      super().__init__(*args, **kwargs)
+      queues.append(self)
+
     async def put(self, item):
       clock.value = 100.0
       await super().put(item)
@@ -1820,15 +2241,15 @@ async def test_resolve_queue_measures_admission_and_residence_from_successful_pu
       clock.value = 125.0
       return item
 
-  resolver.domains_resolve_queue = TimedQueue(maxsize=2)
+  monkeypatch.setattr(app.resolver, 'Queue', TimedQueue)
+  repository.get_new_domains_for_resolve = AsyncMock(return_value=[domain])
   network({'192.0.2.53': 'nodata'})
   repository.get_dns_servers_for_resolve.return_value = ([app.Server(server='192.0.2.53')], [])
   before_admission = metric_total('resolution_queue_duration_seconds_sum', queue='resolve', phase='admission')
   before_residence = metric_total('resolution_queue_duration_seconds_sum', queue='resolve', phase='residence')
-  await resolver._DomainsResolver__put_domain(domain)
-  clock.value = 110.0
-  await asyncio.wait_for(resolver._DomainsResolver__task_process_domains_resolve_from_queue(1, 1), timeout=2)
-  await asyncio.wait_for(resolver.domains_resolve_queue.join(), timeout=2)
+  await asyncio.wait_for(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW), timeout=2)
+  assert len(queues) == 1
+  assert queues[0]._unfinished_tasks == queues[0].qsize() == 0
   assert (
     metric_total('resolution_queue_duration_seconds_sum', queue='resolve', phase='admission') - before_admission == 90
   )
@@ -1872,25 +2293,22 @@ async def test_single_checks_reload_dns_and_explicit_selection_bypasses_configur
 
 
 @pytest.mark.parametrize('mode', ['new', 'stale'])
-async def test_empty_job_does_not_read_dns_or_admit_work(app, resolver, repository, monkeypatch, mode):
+async def test_empty_job_does_not_read_dns_or_admit_work(app, resolver, repository, job_queues, mode):
   jobs = importlib.import_module('jobs.job_registry')
-  monkeypatch.setattr(resolver, 'domains_resolve_queue', asyncio.Queue(maxsize=1))
   repository.get_new_domains_for_resolve = AsyncMock(return_value=[])
   repository.get_stale_domains_for_resolve = AsyncMock(return_value=[])
   repository.get_dns_servers_for_resolve.side_effect = RuntimeError('An empty job needs no configuration')
   await asyncio.wait_for(resolver.domains_resolve(getattr(jobs.Jobs, f'DOMAINS_RESOLVE_{mode.upper()}')), timeout=2)
   repository.get_dns_servers_for_resolve.assert_not_awaited()
   repository.put_domain_after_resolve.assert_not_awaited()
-  assert resolver.domains_resolve_queue.qsize() == resolver.domains_resolve_queue._unfinished_tasks == 0
+  assert job_queues == []
 
 
 @pytest.mark.parametrize('mode', ['new', 'stale'])
 async def test_job_copies_dns_collections_before_network_work(
-  app, resolver, repository, monkeypatch, dns_message, mode
+  app, resolver, repository, monkeypatch, dns_message, job_queues, mode
 ):
   jobs = importlib.import_module('jobs.job_registry')
-  monkeypatch.setattr(resolver, 'domains_resolve_queue', asyncio.Queue(maxsize=1))
-  monkeypatch.setattr(resolver, '_DomainsResolver__stop_domains_resolve_event', threading.Event())
   domains = [app.dto.DomainResult(id=index, name=f'domain-{index}.example.test') for index in (1, 2)]
   repository.get_new_domains_for_resolve = AsyncMock(return_value=domains)
   repository.get_stale_domains_for_resolve = AsyncMock(return_value=domains)
@@ -1911,7 +2329,8 @@ async def test_job_copies_dns_collections_before_network_work(
   repository.get_dns_servers_for_resolve.assert_awaited_once_with()
   assert repository.put_domain_after_resolve.await_count == 2
   assert all(domain.resolution_complete for domain in domains)
-  assert resolver.domains_resolve_queue._unfinished_tasks == 0
+  assert len(job_queues) == 1
+  assert job_queues[0]._unfinished_tasks == job_queues[0].qsize() == 0
 
 
 @pytest.mark.parametrize(

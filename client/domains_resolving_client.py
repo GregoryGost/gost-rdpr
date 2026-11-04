@@ -1,24 +1,22 @@
 from asyncio import (
   CancelledError,
   Queue,
+  QueueShutDown,
   Semaphore,
   TaskGroup,
   create_task,
   gather,
-  sleep,
+  shield,
   timeout,
-  wait_for,
 )
 from base64 import urlsafe_b64encode
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Coroutine, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from ipaddress import IPv4Address, IPv4Network, ip_address, ip_network
 from math import ceil
-from threading import Event
 from time import perf_counter
-from types import CoroutineType
-from typing import Dict, List, Literal, Self
+from typing import Any, Dict, List, Literal, Self
 
 from dns.asyncresolver import Resolver
 from dns.exception import DNSException
@@ -36,7 +34,7 @@ from httpx import AsyncClient, HTTPError, Timeout
 from client.http_base_client import HttpClient
 from client.ripe_stat_client import RipeStatClient, RipeStatClientError
 from config.config import settings
-from database.db import DnsConfigurationReadError, DomainIpReadError, db
+from database.db import DatabaseWriteError, DnsConfigurationReadError, DomainIpReadError, db
 from jobs.job_registry import Jobs, job_registry
 from logger.logger import logger
 from metrics.metrics import (
@@ -62,9 +60,47 @@ from models.dto.queue_dto import notify_observation
 from models.http.dns_servers_resp import DnsElementResp
 from models.http.domains_req import DomainsPostElementReq
 from models.http.domains_resp import DomainElementResp
-from utils.utils import get_ip_network_address, get_ip_version
+from utils.utils import check_ip_allow, get_ip_network_address, get_ip_version
 
 type _DnsServersSnapshot = tuple[tuple[DnsServerDto, ...], tuple[DnsServerDto, ...]]
+
+
+async def _await_owned[T](operation: Coroutine[Any, Any, T], *, cancel_on_cancel: bool = True) -> T:
+  """Retain an operation until its cleanup completes, even after repeated cancellation."""
+  task = create_task(operation)
+  try:
+    return await shield(task)
+  except CancelledError:
+    if cancel_on_cancel:
+      task.cancel()
+    completion = gather(task, return_exceptions=True)
+    while not completion.done():
+      try:
+        await shield(completion)
+      except CancelledError:
+        pass
+    raise
+
+
+async def _gather_owned[T](operations: Sequence[Coroutine[Any, Any, T]]) -> list[T]:
+  """Preserve input order and cancel/await every sibling on an abnormal exit."""
+  tasks = [create_task(operation) for operation in operations]
+  group = gather(*tasks)
+  try:
+    # Shield running endpoints so this owner controls their cancellation.
+    return list(await shield(group))
+  finally:
+    for task in tasks:
+      if not task.done():
+        task.cancel()
+
+    async def finish_siblings() -> None:
+      await gather(*tasks, return_exceptions=True)
+      if group.done() and not group.cancelled():
+        group.exception()
+
+    # A later cancellation must not interrupt siblings already running their cleanup.
+    await _await_owned(finish_siblings(), cancel_on_cancel=False)
 
 
 @dataclass(frozen=True)
@@ -205,11 +241,6 @@ def classify_dns_response(
 
 
 class DomainsResolver:
-  __stop_domains_resolve_event: Event = Event()
-  __queue_sleep_timeout: float = settings.queue_sleep_timeout
-  __queue_get_timeout: float = settings.queue_get_timeout
-  __task_exception_error_timeout: float = 10.0
-
   __semaphore: Semaphore = Semaphore(settings.domains_resolve_semaphore_limit)
 
   __http_client: AsyncClient = HttpClient.get_client(
@@ -227,8 +258,6 @@ class DomainsResolver:
   __ripe_stat_client: RipeStatClient = RipeStatClient()
   __ripe_stat_semaphore: Semaphore = Semaphore(settings.ripe_stat_requests_semaphore_limit)
 
-  domains_resolve_queue: Queue[DomainResult] = Queue(maxsize=settings.queue_max_size)
-
   def __init__(self: Self) -> None:
     logger.info(f'{self.__class__.__name__} init')
 
@@ -243,52 +272,6 @@ class DomainsResolver:
       tuple(DnsServerDto(server=server.server, id=server.id) for server in doh),
     )
 
-  # Get domains from Queue
-  async def __task_process_domains_resolve_from_queue(
-    self: Self, count_all: int, log_every: int, dns_servers: _DnsServersSnapshot | None = None
-  ) -> None:
-    if count_all > 0 and dns_servers is None:
-      dns_servers = await self.__dns_snapshot()
-    if dns_servers is None:
-      return
-    dns_context = _DefaultDnsContext(settings.dns_timeout, settings.dns_lifetime)
-    logger.info('STARTING A FLOW - Resolve domains')
-    processed: int = 0
-    while not self.__stop_domains_resolve_event.is_set() and processed < count_all:
-      try:
-        domain: DomainResult = await wait_for(self.domains_resolve_queue.get(), timeout=self.__queue_get_timeout)
-      except TimeoutError:
-        await sleep(self.__queue_sleep_timeout)
-        continue
-      try:
-        if domain.admitted_at is not None:
-          observe_duration(queue_duration, domain.admitted_at, queue='resolve', phase='residence', outcome='dequeued')
-          domain.admitted_at = None
-        notify_observation(domain.observation, 'processing_started', perf_counter())
-        logger.debug(f'START resolving domain element {domain=}')
-        await self.__dns_main_tasker(
-          domain=domain,
-          default_dns_servers=dns_servers[0],
-          doh_dns_servers=dns_servers[1],
-          dns_context=dns_context,
-        )
-        logger.debug(f'END resolving domain element {domain=}')
-      except CancelledError:
-        if domain.processing_outcome is None:
-          domain.processing_outcome = ProcessingOutcome.CANCELLED
-        raise
-      except Exception as err:
-        logger.error(f'Unexpected error in flow - Resolve domains : {err}', exc_info=True)
-        await sleep(self.__task_exception_error_timeout)
-      finally:
-        self.__finish_domain_observation(domain)
-        self.domains_resolve_queue.task_done()
-        processed += 1
-        residue: int = count_all - processed
-        if processed % log_every == 0 or residue == 0:
-          logger.info(f'Domains attempted: {processed}, residue: {residue}')
-    logger.info('STOP FLOW - Resolve domains')
-
   async def __dns_main_tasker(
     self: Self,
     domain: DomainResult,
@@ -300,6 +283,7 @@ class DomainsResolver:
     logger.debug(f'START resolve domain {domain=} ...')
     domain.resolution_complete = False
     domain.processing_outcome = None
+    domain.storage_ips = ()
     domain.result.A.clear()
     domain.insert.ips_insert.clear()
     domain.insert.ips_delete.clear()
@@ -310,7 +294,7 @@ class DomainsResolver:
         self.__resolve_server(domain, server, 'doh') for server in doh_dns_servers
       ]
       # Run parallel tasks
-      outcomes: list[DnsQueryOutcome] = list(await gather(*tasks))
+      outcomes = await _gather_owned(tasks)
       try:
         known_cnames = {_absolute_name(from_text(cname.domain)) for cname in discovered_cnames or []}
         additional_cnames = [
@@ -320,6 +304,8 @@ class DomainsResolver:
         ]
         if additional_cnames:
           await self.__persist_cnames(additional_cnames)
+      except DatabaseWriteError:
+        raise
       except Exception as err:
         logger.warning(f'[{err.__class__.__name__}]: additional CNAME discovery failed')
       statuses = {outcome.status for outcome in outcomes}
@@ -345,13 +331,15 @@ class DomainsResolver:
       # INSERT IPS (send to Queue)
       # DELETE IPS (send to Queue)
       # UPDATE DOMAINS (send to Queue)
-      if complete or domain.insert.ips_insert:
+      if complete or domain.storage_ips:
         await db.put_domain_after_resolve(domain=domain)
       logger.debug(f'FINAL resolve domain {domain=}')
     except CancelledError:
       if domain.processing_outcome is None:
         domain.processing_outcome = ProcessingOutcome.CANCELLED
       notify_observation(domain.observation, domain.processing_outcome, perf_counter())
+      raise
+    except DatabaseWriteError:
       raise
     except DomainIpReadError:
       domain.processing_outcome = ProcessingOutcome.FAILURE
@@ -368,6 +356,8 @@ class DomainsResolver:
   async def __persist_cnames(self: Self, cnames: list[DomainsPostElementReq]) -> None:
     try:
       await db.put_add_domains_to_queue(domains=cnames)
+    except DatabaseWriteError:
+      raise
     except Exception as err:
       logger.warning(f'[{err.__class__.__name__}]: CNAME discovery could not be queued')
 
@@ -686,6 +676,12 @@ class DomainsResolver:
         for address in resolved_ips
         if domain.resolution_complete or address not in current_ips_by_network_address
       ]
+      prepared_ips = [
+        record.ip_address
+        for address in resolved_ips
+        if not domain.resolution_complete
+        for record in current_ips_by_network_address.get(address, [])
+      ]
       storage_ips: dict[str, str] = {}
       pending = iter(pending_ips)
 
@@ -726,6 +722,9 @@ class DomainsResolver:
 
         if not is_current_value_present:
           new_ips.append(desired_ip)
+        # Retain existing domain representations; filtering still applies to new values.
+        if is_current_value_present or check_ip_allow(desired_ip.ip_address):
+          prepared_ips.append(desired_ip.ip_address)
 
       if domain.resolution_complete:
         for stale_ip_records in current_ips_by_network_address.values():
@@ -735,65 +734,108 @@ class DomainsResolver:
         domain.append_ips_to_insert(ips=new_ips)
       if len(remove_ips) > 0:
         domain.append_ips_to_delete(ips=remove_ips)
+      domain.storage_ips = tuple(dict.fromkeys(prepared_ips))
     except Exception as err:
       raise err
 
-  # Job
-
-  # Put domains to Queue
   async def domains_resolve(self: Self, job_mode: Jobs) -> None:
+    """Resolve a selected batch with job-local bounded admission and owned workers."""
     run = ResolutionRun('new' if job_mode == Jobs.DOMAINS_RESOLVE_NEW else 'stale')
     normal = False
     logger.info(f'Domains resolve mode={job_mode} - START')
     try:
-      #
-      match job_mode:
-        case Jobs.DOMAINS_RESOLVE_NEW:
-          domains: List[DomainResult] = await db.get_new_domains_for_resolve()
-        case Jobs.DOMAINS_RESOLVE_STALE:
-          domains: List[DomainResult] = await db.get_stale_domains_for_resolve()
-        case _:
-          raise Exception(f'Unknown domains resolve job_mode:{job_mode}')
-      len_domains: int = len(domains)
-      run.select(len_domains)
-      for domain in domains:
-        domain.observation = run.observe()
-      resolve_domains_log_every: int = settings.resolve_domains_log_every
-      log_every: int = max(1, ceil(len_domains / resolve_domains_log_every))
-      logger.info(f'Domains for resolve mode={job_mode}: {len_domains}, log_every: {log_every}')
-      if len_domains > 0:
-        dns_servers = await self.__dns_snapshot()
-        #
-        logger.debug(f'Start task {job_mode} ...')
-        self.__stop_domains_resolve_event.clear()
-        create_task(
-          coro=self.__task_process_domains_resolve_from_queue(
-            count_all=len_domains, log_every=log_every, dns_servers=dns_servers
-          ),
-          name=f'__task_process_domains_resolve_from_queue_{job_mode}',
-        )
-        [await self.__put_domain(domain) for domain in domains]
-        # STOP domains resolve
-        await self.domains_resolve_queue.join()
-        self.__stop_domains_resolve_event.set()
-        logger.info(f'Domains resolve mode={job_mode} - DONE')
-      else:
-        logger.info(f'Domains resolve mode={job_mode} - Not found domains for resolve. DONE')
+      await _await_owned(self.__resolve_batch(job_mode, run))
       normal = True
     except DnsConfigurationReadError:
       logger.error('Domains resolve could not read DNS configuration')
       raise
+    except DatabaseWriteError:
+      logger.error('Domains resolve writer admission failed')
+      raise
     except Exception as err:
       logger.error(f'Try Domains resolve mode={job_mode} failed [{err.__class__.__name__}] : {err}', exc_info=True)
     finally:
+      await _await_owned(self.__finish_job(run, normal), cancel_on_cancel=False)
+
+  @staticmethod
+  async def __finish_job(run: ResolutionRun, normal: bool) -> None:
+    try:
       run.finish(normal)
+    finally:
       await job_registry.finish(Jobs.DOMAINS_RESOLVE)
 
-  async def __put_domain(self, domain: DomainResult) -> None:
+  async def __resolve_batch(self, job_mode: Jobs, run: ResolutionRun) -> None:
+    match job_mode:
+      case Jobs.DOMAINS_RESOLVE_NEW:
+        domains = await db.get_new_domains_for_resolve()
+      case Jobs.DOMAINS_RESOLVE_STALE:
+        domains = await db.get_stale_domains_for_resolve()
+      case _:
+        raise ValueError(f'Unknown domains resolve job_mode:{job_mode}')
+    count_all = len(domains)
+    run.select(count_all)
+    for domain in domains:
+      domain.observation = run.observe()
+    if not domains:
+      logger.info(f'Domains resolve mode={job_mode} - Not found domains for resolve. DONE')
+      return
+
+    # Configuration and resolver settings are fixed before producer/worker admission.
+    dns_servers = await self.__dns_snapshot()
+    dns_context = _DefaultDnsContext(settings.dns_timeout, settings.dns_lifetime)
+    queue: Queue[DomainResult] = Queue(maxsize=settings.queue_max_size)
+    worker_count = min(settings.domains_resolve_worker_limit, count_all)
+    log_every = max(1, ceil(count_all / max(1, settings.resolve_domains_log_every)))
+    processed = 0
+
+    async def produce() -> None:
+      for domain in domains:
+        await self.__put_domain(queue, domain)
+      queue.shutdown()
+
+    async def consume() -> None:
+      nonlocal processed
+      while True:
+        try:
+          domain = await queue.get()
+        except QueueShutDown:
+          return
+        try:
+          if domain.admitted_at is not None:
+            observe_duration(queue_duration, domain.admitted_at, queue='resolve', phase='residence', outcome='dequeued')
+            domain.admitted_at = None
+          notify_observation(domain.observation, 'processing_started', perf_counter())
+          await self.__dns_main_tasker(domain, dns_servers[0], dns_servers[1], dns_context=dns_context)
+        except CancelledError:
+          if domain.processing_outcome is None:
+            domain.processing_outcome = ProcessingOutcome.CANCELLED
+          raise
+        except DatabaseWriteError:
+          raise
+        except Exception as err:
+          logger.error(f'Unexpected error in flow - Resolve domains : {err}', exc_info=True)
+        finally:
+          try:
+            self.__finish_domain_observation(domain)
+          finally:
+            queue.task_done()
+          processed += 1
+          if processed % log_every == 0 or processed == count_all:
+            logger.info(f'Domains attempted: {processed}, residue: {count_all - processed}')
+
+    try:
+      await _gather_owned([produce(), *(consume() for _ in range(worker_count))])
+    finally:
+      # Abandoned work is local to this job and must never wait for cancelled consumers.
+      queue.shutdown(immediate=True)
+    logger.info(f'Domains resolve mode={job_mode} - DONE')
+
+  @staticmethod
+  async def __put_domain(queue: Queue[DomainResult], domain: DomainResult) -> None:
     started = perf_counter()
     outcome = 'rejected'
     try:
-      await self.domains_resolve_queue.put(item=domain)
+      await queue.put(item=domain)
       domain.admitted_at = perf_counter()
       outcome = 'admitted'
     except CancelledError:
@@ -804,6 +846,12 @@ class DomainsResolver:
 
   async def resolve_once(
     self: Self, domain_name: str, selected_dns_servers: List[DnsElementResp] | None = None
+  ) -> CheckDomainResultDto:
+    """Resolve configured endpoints in order and await their cleanup before returning."""
+    return await _await_owned(self.__resolve_once(domain_name, selected_dns_servers))
+
+  async def __resolve_once(
+    self, domain_name: str, selected_dns_servers: list[DnsElementResp] | None
   ) -> CheckDomainResultDto:
     name: str = domain_name.strip().rstrip('.')
     if not name:
@@ -822,7 +870,7 @@ class DomainsResolver:
         else:
           raise RuntimeError(f'DNS server ID={selected_dns_server.id} does not contain a server address')
     #
-    tasks: list[CoroutineType] = []
+    tasks: list[Coroutine[Any, Any, DnsServerResolveResultDto]] = []
     dns_context = _DefaultDnsContext(settings.dns_timeout, settings.dns_lifetime)
     #
     for dns_server in default_dns_servers:
@@ -832,11 +880,15 @@ class DomainsResolver:
     if not tasks:
       raise RuntimeError('DNS servers for resolve not found')
     #
-    results: list[DnsServerResolveResultDto] = list(await gather(*tasks))
+    results = await _gather_owned(tasks)
     #
     return CheckDomainResultDto(domain=name, results=results)
 
   async def resolve_stored_domain(self: Self, domain_id: int) -> None:
+    """Resolve one stored domain and retain all work through cancellation cleanup."""
+    await _await_owned(self.__resolve_stored_domain(domain_id))
+
+  async def __resolve_stored_domain(self, domain_id: int) -> None:
     run = ResolutionRun('stored')
     domain: DomainResult | None = None
     normal = False
@@ -864,6 +916,9 @@ class DomainsResolver:
       raise
     except DnsConfigurationReadError:
       logger.error('Stored domain resolve could not read DNS configuration')
+      raise
+    except DatabaseWriteError:
+      logger.error('Stored domain resolve writer admission failed')
       raise
     except Exception as err:
       normal = domain is not None

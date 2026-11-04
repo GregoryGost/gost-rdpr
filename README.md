@@ -59,7 +59,7 @@ Available environment variables
 | `APP_HOST` | str | `0.0.0.0` | Listen on IP addr. `0.0.0.0` - Listen on all IP addresses |
 | `APP_PORT` | int | `4000` | Listen on TCP/IP specific port |
 | `APP_LOG_LEVEL` | str | `error` | Application level logging |
-| `QUEUE_MAX_SIZE` | int | `1000` | Maximum size of each individual queue |
+| `QUEUE_MAX_SIZE` | int | `1000` | Positive maximum size of each individual queue; producers wait when it is full |
 | `QUEUE_GET_TIMEOUT` | float | `0.1` | Maximum waiting time for a queue entry. 0.1s = 100ms |
 | `QUEUE_SLEEP_TIMEOUT` | float | `0.01` | The maximum wait time while the queue is empty. At the same time, the infinite loop should allow the scheduler to integrate other tasks into the overall flow. 0.01s = 10ms |
 | `RESOLVE_DOMAINS_LOG_EVERY` | int | `10` | Specifies the number of messages that will be logged during domain resolution. Distributes the total volume of domains to resolve among this number |
@@ -110,7 +110,8 @@ Available environment variables
 | `DOH_OPERATION_TIMEOUT` | float | `10.0` | Total budget for one DoH A or CNAME operation, including semaphore, pool, retry and response-body waits |
 | `DOMAINS_FILTERED_MIN_LEN` | int | `3` | The minimum domain length required to save it to the database. This is necessary to filter out empty domains that, for some reason, are generated in MikroTik scripts |
 | `DOMAINS_UPDATE_INTERVAL` | int | `172800` | Domain selection period. This means that if a domain has been processed, it will not be processed again until this period has passed. Specified in seconds. 172800s = 2days |
-| `DOMAINS_RESOLVE_SEMAPHORE_LIMIT` | int | `60` | Limit of concurrent domain resolving tasks |
+| `DOMAINS_RESOLVE_WORKER_LIMIT` | int | `4` | Positive maximum number of domains processed concurrently within one bulk job |
+| `DOMAINS_RESOLVE_SEMAPHORE_LIMIT` | int | `20` | Positive shared limit of concurrent classic DNS and DoH A/CNAME operations, including single-domain checks |
 | `DOMAINS_RESOLVE_NEW_BATCH_SIZE` | int | `500` | Limit for sampling the number of domains that have never been processed |
 | `DOMAINS_RESOLVE_STALE_BATCH_SIZE` | int | `2000` | Limit for sampling the number of previously processed domains |
 | `DOMAINS_BLACK_LIST` | str | `None` | Domains that should not be included in the database. Comma-separated list |
@@ -213,6 +214,42 @@ Graceful shutdown closes queue admission, finishes accepted commands and the fin
 database engines. A deadline or forced cancellation reports unresolved work and retains ownership of any ongoing
 cleanup. `DB_SHUTDOWN_TIMEOUT` covers the database wait, not the total application or container shutdown time.
 The queue is process-local and does not recover pending commands after a crash or forced process termination.
+
+## Shared IP ownership
+
+Each exact IP address or CIDR has one global record, with independent domain and IP-list support relationships.
+Domain output includes all addresses supported by that domain; global IP output and RouterOS contain one record
+per exact address. Their scalar domain/list fields identify a representative support. The existing representative
+stays selected while that support exists; removing it selects a remaining support deterministically. Explicit IP
+comments and gateway flags remain properties of the global record.
+
+A complete trustworthy IPv4 result replaces only that domain's IPv4 support and advances its refresh checkpoint
+in the same writer transaction. Partial results add reliable positive support; failures preserve existing support
+and checkpoints. Support from another domain keeps the address present. DNS and IP-list support remain independent,
+including when they refer to the same domain. IP-list refresh withdraws only the affected list support.
+
+An IP explicitly assigned to a positive domain ID participates in that domain's DNS reconciliation, including when
+it was added manually. Domain ID `0` represents standalone ownership. Explicit `/ips` deletion and blocked-address
+cleanup remove the global record and all its support; a later permitted positive observation can create it again.
+
+Migration `migration_202618042123.py` upgrades existing ownership without rewriting previous migration sources or
+history. It preserves existing IP IDs and metadata and records the previously known owner/list relationship.
+Previously discarded secondary owners can only be learned through subsequent DNS observations. Startup validates
+the upgraded schema and support relationships before starting the writer. Running an older application against
+the upgraded database is unsupported; reverting requires the matching previous database and application version.
+
+## Concurrent domain processing
+
+Each nonempty new-domain or stale-domain job owns a bounded queue and up to `DOMAINS_RESOLVE_WORKER_LIMIT`
+asynchronous workers. A worker processes a whole domain through DNS, address preparation and writer admission.
+The batch-size settings control how many domains are selected; the worker limit controls how many are in progress.
+`DOMAINS_RESOLVE_SEMAPHORE_LIMIT` separately limits DNS/DoH A/CNAME operations across bulk and single-domain work.
+RIPEstat retains its own shared limit. Waiting for either bounded queue applies backpressure to the producers.
+
+Normal completion waits for all domain workers. Cancellation and terminal writer-admission failures stop admission
+and await the producer, workers and nested queries before releasing the job reservation. Unstarted work remains
+unstarted, and every later job receives a fresh queue. Already admitted database commands remain owned by the
+single writer; completion of domain processing does not establish that those commands have committed.
 
 ## DNS configuration during resolution
 
@@ -371,6 +408,49 @@ The production client SHA256 changed from
 The measurement JSON records complete source/test hashes and the controlled provider TTL of 60 seconds. Each successful
 pass had eight distinct endpoint/name/type keys and no repetition within the pass. Its immediate warm rerun repeated
 those keys, illustrating possible cache reuse under forced repetition rather than the normal 48-hour refresh cycle.
+
+### Domain worker pool measurement
+
+On 2026-11-04, the corrected shared-IP implementation was measured with one and four domain workers on the same
+16-domain workload. Both sides used the same storage model, local providers, initial rows, writer/network settings
+and cold/warm RIPEstat cache conditions. DNS response caching stayed disabled. The two transports returned shared
+addresses, making retained support for every domain part of the measured result.
+
+Explicit settings included `QUEUE_MAX_SIZE=4`, `DB_SAVE_BATCH_SIZE=1000`, `DB_SAVE_BATCH_TIMEOUT=0.05`,
+`DOMAINS_RESOLVE_SEMAPHORE_LIMIT=20` and `RIPE_STAT_REQUESTS_SEMAPHORE_LIMIT=5`. Slow providers delayed each response
+by 20 ms; unavailable providers returned classic SERVFAIL and disconnected DoH. HTTP retries were disabled.
+The environment was Windows AMD64, Python 3.15.2, SQLite 3.53.4 and the dependency versions recorded above.
+
+| Provider / cache | Processing domains/s, 1 / 4 workers | Confirmed commands/s, 1 / 4 workers | DNS p95 estimate ms, 1 / 4 workers |
+| ---------------- | ----------------------------------: | ---------------------------------: | --------------------------------: |
+| Fast / cold | 57.45 / 82.76 | 46.94 / 57.77 | 36.67 / 24.64 |
+| Fast / warm | 65.35 / 73.84 | 58.20 / 53.58 | 30.00 / 40.00 |
+| Slow / cold | 24.82 / 58.53 | 23.88 / 47.08 | 48.75 / 71.36 |
+| Slow / warm | 21.66 / 53.25 | 20.51 / 47.84 | 80.00 / 86.67 |
+| Unavailable / cold | 64.48 / 108.10 | 0 / 0 | 20.20 / 23.50 |
+| Unavailable / warm | 64.22 / 110.91 | 0 / 0 | 21.00 / 30.00 |
+
+All eight successful scenarios confirmed 16 domain commands/checkpoints, three global IP rows and 33 independent
+supports, including retained IPv6. All four unavailable scenarios kept the initial two IP rows/two supports and
+advanced no checkpoint. Successful jobs performed 32 DNS operations; unavailable jobs performed 64 with conditional
+CNAME discovery. Cold/warm successful passes made exactly two/zero RIPEstat network lookups.
+
+With slow DNS, observed simultaneous provider queries increased from two to eight, within the common limit of 20.
+Peak application task counts were 14-15 with one worker and 26 with four, including server/writer tasks. Each
+cold/warm process created two producers and two/eight domain consumers. Per-scenario child CPU deltas ranged from
+0.078125 to 0.375 seconds; process-lifetime peak RSS ranged from 119,521,280 to 120,578,048 bytes.
+The separate six-address slow-RIPEstat scenario observed six calls, peak concurrency two at a configured limit of
+two, one confirmed command, 0.31044 seconds wall time and 0.125 seconds child CPU.
+
+These are single local samples with polling and transparent task-measurement overhead. Histogram tails are bucket
+estimates. The fast/warm saved rate decreased and the slow-provider DNS p95 estimates increased with four workers;
+the results establish bounded overlap and improved slow-provider throughput, without a uniform speed or latency SLA.
+
+Measured resolver SHA256: `b923fbbf4713ef3de4f144550819ca753856adac8809c6c80438cfee012308a9` on base commit
+`318c87ee4648e33fec7b005d6f9c25d983fa75a4` plus the implementation/test changes. The exact validation snapshot was
+`cd6fe0db4ddf5662f2ffa7e006061095e40d8d42a55fd29608d6efaa981ff72b` before this measurement prose was added.
+The existing load command writes `measurement-baseline.json` and `slow-ripe-measurement.json` under its temporary
+directory, including input hashes, settings, actual supports, rates, queue/query tails and child resource evidence.
 
 ## MikroTik RouterOS
 

@@ -30,7 +30,7 @@ class Settings(BaseSettings):
   app_port: int = Field(default=4000)
   app_log_level: str = Field(default='error')
   # Queue section
-  queue_max_size: int = Field(default=1000)
+  queue_max_size: int = Field(default=1000, gt=0)
   queue_get_timeout: float = Field(default=0.1)
   queue_sleep_timeout: float = Field(default=0.01)
   resolve_domains_log_every: int = Field(default=10)
@@ -95,7 +95,8 @@ class Settings(BaseSettings):
   domains_update_interval: int = Field(default=172800)  # default 2 days
   domains_resolve_new_batch_size: int = Field(default=500)
   domains_resolve_stale_batch_size: int = Field(default=2000)
-  domains_resolve_semaphore_limit: int = Field(default=20)
+  domains_resolve_worker_limit: int = Field(default=4, gt=0)
+  domains_resolve_semaphore_limit: int = Field(default=20, gt=0)
   domains_black_list: str = Field(default='')
   # Lists section
   lists_update_interval_sec: int = Field(default=604800)  # default 7 days

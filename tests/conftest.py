@@ -38,6 +38,23 @@ from pydantic_settings.sources import DotEnvSettingsSource
 _coverage_migration_directories = set()
 
 
+def observe_child_tasks():
+  """Install transparent task accounting without replacing application behavior."""
+  original = asyncio.BaseEventLoop.create_task
+  evidence = {'peak_active_tasks': 0, 'created_by_coroutine': {}}
+
+  def create_task(loop, coroutine, *args, **kwargs):
+    task = original(loop, coroutine, *args, **kwargs)
+    name = getattr(coroutine, '__qualname__', type(coroutine).__name__)
+    counts = evidence['created_by_coroutine']
+    counts[name] = counts.get(name, 0) + 1
+    evidence['peak_active_tasks'] = max(evidence['peak_active_tasks'], len(asyncio.all_tasks(loop)))
+    return task
+
+  asyncio.BaseEventLoop.create_task = create_task
+  return evidence
+
+
 def normalize_migration_coverage(data, root, directories):
   """Merge identical migration copies and exclude test-owned migration fault code."""
   from coverage import CoverageData
@@ -195,6 +212,30 @@ def repository(app, monkeypatch):
   )
   monkeypatch.setattr(app.resolver, 'db', boundary)
   return boundary
+
+
+@pytest.fixture
+def job_queues(app, monkeypatch):
+  """Observe the actual per-job queue rather than inject a shared legacy queue."""
+  queues = []
+
+  class ObservedQueue(asyncio.Queue):
+    def __init__(self, *args, **kwargs):
+      super().__init__(*args, **kwargs)
+      self.admissions = []
+      self.peak_size = 0
+      self.put_waiting = asyncio.Event()
+      queues.append(self)
+
+    async def put(self, item):
+      if self.full():
+        self.put_waiting.set()
+      await super().put(item)
+      self.admissions.append(item)
+      self.peak_size = max(self.peak_size, self.qsize())
+
+  monkeypatch.setattr(app.resolver, 'Queue', ObservedQueue)
+  return queues
 
 
 @pytest.fixture
@@ -431,9 +472,14 @@ class ServiceProcess:
   async def start(self):
     # The wrapper only converts test-owned stdin into SIGINT; main.py owns the app.
     bootstrap = (
-      'import _thread, os, runpy, sys, threading\n'
+      'import _thread, asyncio, json, os, runpy, sys, threading\n'
       'from pathlib import Path\n'
-      'from hashlib import sha256\n' + inspect.getsource(normalize_migration_coverage) + '\n'
+      'from hashlib import sha256\n'
+      + inspect.getsource(normalize_migration_coverage)
+      + '\n'
+      + inspect.getsource(observe_child_tasks)
+      + '\n'
+      'task_evidence = observe_child_tasks() if os.environ.get("TEST_TASK_MEASUREMENTS") else None\n'
       'def stop():\n'
       '  os.read(sys.stdin.fileno(), 1)\n'
       '  _thread.interrupt_main()\n'
@@ -448,6 +494,8 @@ class ServiceProcess:
       'except KeyboardInterrupt:\n'
       '  pass\n'
       'finally:\n'
+      '  if task_evidence is not None:\n'
+      '    Path(os.environ["TEST_TASK_MEASUREMENTS"]).write_text(json.dumps(task_evidence), encoding="utf-8")\n'
       '  if coverage is not None:\n'
       '    coverage.stop()\n'
       '    normalize_migration_coverage(coverage.get_data(), Path(sys.argv[1]).parent, [Path.cwd() / "migrations"])\n'
@@ -549,6 +597,8 @@ async def e2e_service(tmp_path, dns_message, request):
     ripe_delay=0.0,
     ripe_active=0,
     ripe_peak_active=0,
+    dns_active=0,
+    dns_peak_active=0,
   )
 
   def response_wire(query, transport):
@@ -574,10 +624,19 @@ async def e2e_service(tmp_path, dns_message, request):
       wire = response_wire(query, 'classic')
       if providers.drop_classic:
         return
+      providers.dns_active += 1
+      providers.dns_peak_active = max(providers.dns_peak_active, providers.dns_active)
+
+      def respond():
+        try:
+          self.transport.sendto(wire, address)
+        finally:
+          providers.dns_active -= 1
+
       if providers.delay:
-        loop.call_later(providers.delay, self.transport.sendto, wire, address)
+        loop.call_later(providers.delay, respond)
       else:
-        self.transport.sendto(wire, address)
+        respond()
 
     def error_received(self, error):
       providers.errors.append(str(error))
@@ -586,6 +645,7 @@ async def e2e_service(tmp_path, dns_message, request):
 
   async def serve_http(reader, writer):
     connections.add(writer)
+    dns_active = False
     try:
       async with asyncio.timeout(5):
         request_line = (await reader.readline()).decode('ascii').split()
@@ -599,6 +659,10 @@ async def e2e_service(tmp_path, dns_message, request):
         url = urlsplit(target)
         params = parse_qs(url.query)
         providers.http_requests.append((method, url.path))
+        if url.path == '/dns-query':
+          providers.dns_active += 1
+          providers.dns_peak_active = max(providers.dns_peak_active, providers.dns_active)
+          dns_active = True
         if providers.delay:
           await asyncio.sleep(providers.delay)
         if providers.unavailable:
@@ -645,6 +709,8 @@ async def e2e_service(tmp_path, dns_message, request):
     except (AssertionError, KeyError, ValueError, TimeoutError) as error:
       providers.errors.append(repr(error))
     finally:
+      if dns_active:
+        providers.dns_active -= 1
       writer.close()
       await writer.wait_closed()
       connections.discard(writer)

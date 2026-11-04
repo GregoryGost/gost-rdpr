@@ -25,7 +25,7 @@ from types import ModuleType
 from typing import Any, Dict, List, Optional, Self, Sequence, Tuple, cast
 
 from aiosqlite import __version__ as aiosqlite_version
-from sqlalchemy import Result, Row, delete, event, func, insert, select, text, update
+from sqlalchemy import Result, Row, delete, event, exists, func, insert, select, text, update
 from sqlalchemy import __version__ as sqlalchemy_version
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool
@@ -42,10 +42,11 @@ from metrics.metrics import (
   queue_duration,
   writer_duration,
 )
+from migrations.migration_202618042123 import ip_schema_kind, validate_support_schema, validate_support_state
 from models.db.dns_servers_dbo import DnsServersDbo
 from models.db.domains_dbo import DomainsDbo
 from models.db.domains_lists_dbo import DomainsListsDbo
-from models.db.ip_records_dbo import IpRecordsDbo
+from models.db.ip_records_dbo import IpRecordsDbo, IpSupportDbo
 from models.db.ips_lists_dbo import IpsListsDbo
 from models.db.migrations_dbo import MigrationsDbo
 from models.db.ros_configs_dbo import RosConfigsDbo
@@ -55,7 +56,13 @@ from models.dto.domains_lists_dto import DomainsListDto
 from models.dto.ip_record_dto import IpRecordDto
 from models.dto.ips_lists_dto import IpsListDto
 from models.dto.migrations_dto import MigrationsDto
-from models.dto.queue_dto import QueueElementDto, TargetAction, notify_observation
+from models.dto.queue_dto import (
+  DomainResolutionIntent,
+  IpListWithdrawal,
+  QueueElementDto,
+  TargetAction,
+  notify_observation,
+)
 from models.dto.ros_config_dto import RosConfigDto
 from models.http.dns_servers_req import DnsPostElementReq
 from models.http.dns_servers_resp import DnsElementResp, DnsPayloadResp
@@ -97,6 +104,7 @@ from utils.utils import calculate_checksum, check_ip_allow, get_ip_version
 
 LEGACY_IMPORT_MIGRATION = 'migration_202511031501.py'
 GATEWAY_MIGRATION = 'migration_202618042122.py'
+IP_SUPPORT_MIGRATION = 'migration_202618042123.py'
 STARTUP_MIGRATION_CHECKSUMS = {
   LEGACY_IMPORT_MIGRATION: '293ddda35db4553c0174d8ecb07902add5bb664a7137e0ce6f36a05899b83fa7',
   GATEWAY_MIGRATION: '563a6f0d402a11b7e044b60ec29a64cf81f3216f00f3aacc5da2da82cf72e80c',
@@ -363,6 +371,13 @@ class DataBase:
         if GATEWAY_MIGRATION in completed:
           if IpRecordsDbo.__tablename__ not in original_schema or not await self.__gateway_effect(conn):
             raise DatabaseWriteError('Completed gateway migration has an incompatible schema')
+        if IP_SUPPORT_MIGRATION in completed:
+          if await ip_schema_kind(conn) != 'current':
+            raise DatabaseWriteError('Completed IP ownership migration has an incompatible schema')
+          await validate_support_schema(conn)
+          await validate_support_state(conn)
+        elif IpSupportDbo.__tablename__ in original_schema:
+          await validate_support_schema(conn)
         legacy_counts, remap_default_domain = await self.__startup_legacy_preflight(conn, original_schema, completed)
         await conn.run_sync(MigrationsDbo.metadata.create_all)
         await self.__main_migrations(
@@ -382,6 +397,7 @@ class DataBase:
             )
           )
         await self.__check_startup_foreign_keys(conn)
+        await validate_support_state(conn)
         await conn.commit()
       except BaseException:
         self.__initialization_failed = True
@@ -412,6 +428,12 @@ class DataBase:
     }
 
   async def __compatible_current_table(self, conn: AsyncConnection, name: str, sql: str | None) -> bool:
+    if name == IpRecordsDbo.__tablename__:
+      try:
+        await ip_schema_kind(conn, allow_missing_gateway=True)
+      except RuntimeError:
+        return False
+      return True
     table = MigrationsDbo.metadata.tables[name]
     if sql is None or self.__startup_sql_tokens(sql) != self.__startup_sql_tokens(
       str(CreateTable(table).compile(dialect=conn.dialect))
@@ -524,7 +546,7 @@ class DataBase:
     return result.scalar_one()
 
   async def __check_startup_foreign_keys(self, conn: AsyncConnection) -> None:
-    for name in self.__legacy_targets().values():
+    for name in (*self.__legacy_targets().values(), IpSupportDbo.__tablename__):
       result = await conn.execute(text('SELECT * FROM pragma_foreign_key_check(:name)'), {'name': name})
       if result.first() is not None:
         raise DatabaseWriteError('Managed database foreign key integrity check failed')
@@ -1373,7 +1395,7 @@ class DataBase:
     try:
       domains_resolved_element: QueueElementDto = QueueElementDto(
         target=TargetAction.DOMAINS_RESOLVED,
-        elements=[domain],
+        elements=[DomainResolutionIntent(domain.id, domain.resolution_complete, tuple(domain.storage_ips))],
         observations=(domain.observation,) if domain.observation is not None else (),
       )
       await self.__put_write(item=domains_resolved_element)
@@ -1686,6 +1708,16 @@ class DataBase:
       logger.error(f'Unexpected error - Try send IP address records for deletion to Queue : {err}', exc_info=True)
       return False
 
+  async def put_withdraw_ip_list_records_to_queue(self, list_id: int, ids: list[int]) -> None:
+    """Wait for admission of a source-scoped IP-list membership withdrawal."""
+    if ids:
+      await self.__put_write(
+        QueueElementDto(
+          target=TargetAction.IPS_LIST_WITHDRAW,
+          elements=[IpListWithdrawal(list_id, tuple(ids))],
+        )
+      )
+
   async def cleanup_not_allowed_ip_records(self: Self) -> None:
     logger.debug('Start cleanup of IP address records blocked by IP_NOT_ALLOWED')
     try:
@@ -1952,7 +1984,7 @@ class DataBase:
         # add ips
         if len(active_ips_lists) > 0:
           ips_add: List[IpsPostElementReq] = []
-          ips_delete: List[IpRecordDto] = []
+          withdrawals: list[tuple[int, list[int]]] = []
           for list in active_ips_lists:
             if list.found_elements == None:
               continue  # if hash not change in get_ips_from_lists - found_elements is None
@@ -1963,10 +1995,12 @@ class DataBase:
               for ip in list.found_elements
               if ip not in current_ips_list
             ]
-            [ips_delete.append(ip) for ip in current_ips if ip.ip_address not in list.found_elements]
+            withdrawals.append(
+              (list.id, [ip.id for ip in current_ips if ip.id is not None and ip.ip_address not in list.found_elements])
+            )
           await self.put_add_ips_to_queue(ips=ips_add)
-          for ip in ips_delete:
-            await self.put_delete_ips_to_queue(id_or_ip=ip.id)
+          for list_id, ids in withdrawals:
+            await self.put_withdraw_ip_list_records_to_queue(list_id, ids)
           await self.update_ips_lists(ips_lists=active_ips_lists)
     except DatabaseWriteError:
       raise
@@ -2267,6 +2301,90 @@ class DataBase:
       self.__failure_summaries.clear()
       logger.info('Database writer stopped')
 
+  async def __add_explicit_ips(self, session: AsyncSession, items: list[dict[str, Any]]) -> None:
+    """Create explicit records while preserving supported duplicate semantics."""
+    for item in items:
+      if item['domain_id'] is None:
+        continue
+      current = (
+        await session.execute(select(IpRecordsDbo.id).where(IpRecordsDbo.ip_address == item['ip_address']))
+      ).scalar_one_or_none()
+      if current is not None:
+        supported = (
+          await session.execute(select(IpSupportDbo.id).where(IpSupportDbo.ip_record_id == current).limit(1))
+        ).first()
+        if supported is not None:
+          continue
+      # Validate context before replacing a transient orphan. Domain 0 is real.
+      if not (await session.execute(select(DomainsDbo.id).where(DomainsDbo.id == item['domain_id']))).first():
+        raise DatabaseWriteError('Explicit IP domain is unavailable')
+      if (
+        item['ip_list_id'] is not None
+        and not (await session.execute(select(IpsListsDbo.id).where(IpsListsDbo.id == item['ip_list_id']))).first()
+      ):
+        raise DatabaseWriteError('Explicit IP list is unavailable')
+      if current is not None:
+        await session.execute(delete(IpRecordsDbo).where(IpRecordsDbo.id == current))
+      created = (
+        await session.execute(insert(IpRecordsDbo).values(**item).prefix_with('OR IGNORE').returning(IpRecordsDbo.id))
+      ).scalar_one_or_none()
+      if created is not None:
+        await session.execute(
+          insert(IpSupportDbo).values(ip_record_id=created, domain_id=item['domain_id'], ip_list_id=item['ip_list_id'])
+        )
+
+  async def __reconcile_domain(self, session: AsyncSession, intent: DomainResolutionIntent) -> None:
+    """Apply a complete prepared set or additive partial evidence in writer order."""
+    if intent.id <= 0 or not (await session.execute(select(DomainsDbo.id).where(DomainsDbo.id == intent.id))).first():
+      raise DatabaseWriteError('Resolved domain is unavailable')
+    addresses = tuple(dict.fromkeys(intent.storage_ips))
+    for address in addresses:
+      addr_type = get_ip_version(address)
+      if addr_type != 4:
+        raise DatabaseWriteError('Resolved storage payload must contain IPv4 addresses')
+      await session.execute(
+        insert(IpRecordsDbo)
+        .values(ip_address=address, domain_id=intent.id, addr_type=addr_type)
+        .prefix_with('OR IGNORE')
+      )
+      ip_id = (await session.execute(select(IpRecordsDbo.id).where(IpRecordsDbo.ip_address == address))).scalar_one()
+      await session.execute(
+        insert(IpSupportDbo).values(ip_record_id=ip_id, domain_id=intent.id, ip_list_id=None).prefix_with('OR IGNORE')
+      )
+    if intent.resolution_complete:
+      obsolete = select(IpRecordsDbo.id).where(IpRecordsDbo.addr_type == 4)
+      if addresses:
+        obsolete = obsolete.where(IpRecordsDbo.ip_address.not_in(addresses))
+      await session.execute(
+        delete(IpSupportDbo).where(IpSupportDbo.domain_id == intent.id, IpSupportDbo.ip_record_id.in_(obsolete))
+      )
+
+  async def __finish_ip_supports(self, session: AsyncSession) -> None:
+    """Delete final orphans and repair only vanished incumbent projections."""
+    has_support = exists().where(IpSupportDbo.ip_record_id == IpRecordsDbo.id)
+    await session.execute(delete(IpRecordsDbo).where(~has_support))
+    incumbent = exists().where(
+      IpSupportDbo.ip_record_id == IpRecordsDbo.id,
+      IpSupportDbo.domain_id == IpRecordsDbo.domain_id,
+      IpSupportDbo.ip_list_id.is_not_distinct_from(IpRecordsDbo.ip_list_id),
+    )
+    representative = (
+      select(IpSupportDbo.domain_id, IpSupportDbo.ip_list_id)
+      .where(IpSupportDbo.ip_record_id == IpRecordsDbo.id)
+      .order_by(IpSupportDbo.domain_id, IpSupportDbo.ip_list_id.is_not(None), IpSupportDbo.ip_list_id)
+      .limit(1)
+      .correlate(IpRecordsDbo)
+    )
+    await session.execute(
+      update(IpRecordsDbo)
+      .where(~incumbent)
+      .values(
+        domain_id=representative.with_only_columns(IpSupportDbo.domain_id).scalar_subquery(),
+        ip_list_id=representative.with_only_columns(IpSupportDbo.ip_list_id).scalar_subquery(),
+        updated_at=IpRecordsDbo.updated_at,
+      )
+    )
+
   async def __batch_items_commit(self: Self, queue_elements: List[QueueElementDto]) -> None:
     """Persist one atomic batch and translate all persistence failures."""
     logger.debug(f'Try prepare elements count={len(queue_elements)} ...')
@@ -2414,24 +2532,17 @@ class DataBase:
         if queue_element.target == TargetAction.IPS_ADD
         for item in queue_element.elements  # item = IpsPostElementReq
       ]
-      ips_resolved_add: List[Dict[str, str | int]] = [
-        {
-          IpRecordsDbo.ip_address.property.key: ip_record.ip_address,
-          IpRecordsDbo.domain_id.property.key: domain_result.id,
-          IpRecordsDbo.addr_type.property.key: ip_record.addr_type,
-        }
-        for queue_element in queue_elements
-        if queue_element.target == TargetAction.DOMAINS_RESOLVED
-        for domain_result in queue_element.elements  # item = DomainResult
-        for ip_record in domain_result.insert.ips_insert  # ip_record = IpRecordDto
+      resolution_intents: list[DomainResolutionIntent] = [
+        intent
+        for element in queue_elements
+        if element.target == TargetAction.DOMAINS_RESOLVED
+        for intent in element.elements
       ]
-      ips_resolved_delete: List[int] = [
-        ip_id
-        for queue_element in queue_elements
-        if queue_element.target == TargetAction.DOMAINS_RESOLVED
-        for domain_result in queue_element.elements  # item = DomainResult
-        if domain_result.resolution_complete
-        for ip_id in domain_result.insert.ips_delete  # ip_id = int
+      list_withdrawals: list[IpListWithdrawal] = [
+        withdrawal
+        for element in queue_elements
+        if element.target == TargetAction.IPS_LIST_WITHDRAW
+        for withdrawal in element.elements
       ]
       ips_id_delete: List[int] = [
         item
@@ -2504,14 +2615,19 @@ class DataBase:
       if len(ips_lists_update) > 0:
         await db_session.execute(update(IpsListsDbo), ips_lists_update)
       # IPS
-      if len(ips_add) > 0:
-        await IpRecordsDbo.add_batch(db_session=db_session, items=ips_add)
-      if len(ips_resolved_add) > 0:
-        await IpRecordsDbo.add_batch(db_session=db_session, items=ips_resolved_add)
+      if ips_add:
+        await self.__add_explicit_ips(db_session, ips_add)
+      for intent in resolution_intents:
+        await self.__reconcile_domain(db_session, intent)
+      for withdrawal in list_withdrawals:
+        await db_session.execute(
+          delete(IpSupportDbo).where(
+            IpSupportDbo.ip_list_id == withdrawal.list_id,
+            IpSupportDbo.ip_record_id.in_(withdrawal.ip_record_ids),
+          )
+        )
       if len(ips_id_delete) > 0:
         await db_session.execute(delete(IpRecordsDbo).where(IpRecordsDbo.id.in_(ips_id_delete)))
-      if len(ips_resolved_delete) > 0:
-        await db_session.execute(delete(IpRecordsDbo).where(IpRecordsDbo.id.in_(ips_resolved_delete)))
       if len(ips_addr_delete) > 0:
         await db_session.execute(delete(IpRecordsDbo).where(IpRecordsDbo.ip_address.in_(ips_addr_delete)))
       if len(ips_delete_all) > 0:
@@ -2533,6 +2649,7 @@ class DataBase:
       if len(ros_configs_delete_all) > 0:
         await db_session.execute(delete(RosConfigsDbo).where(RosConfigsDbo.id > 0))
       #
+      await self.__finish_ip_supports(db_session)
       # Any failure from commit itself has an ambiguous physical outcome.
       commit_started = True
       commit_timer = perf_counter()

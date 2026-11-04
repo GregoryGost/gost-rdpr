@@ -9,7 +9,6 @@ import os
 import shutil
 import sqlite3
 import sys
-import threading
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -156,6 +155,9 @@ def assert_legacy_import(path):
       (6, 'router.example.test', 'dummy-user', 'dummy-password', 'routes', 'router', '2001-02-03 04:05:06', None)
     ]
     assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
+    assert connection.execute(
+      'SELECT ip_record_id,domain_id,ip_list_id FROM rdpr_ip_supports ORDER BY ip_record_id'
+    ).fetchall() == [(11, 0, 8), (12, 7, None)]
     assert (
       connection.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
@@ -229,6 +231,319 @@ async def seed(app, store, *, resolved=False, checkpoint=None):
         {'id': 14, 'domain_id': 1, 'addr_type': 4, 'ip_address': '8.8.8.0/25'},
       ],
     )
+    await connection.execute(
+      insert(app.database.IpSupportDbo),
+      [{'ip_record_id': value, 'domain_id': 1, 'ip_list_id': None} for value in range(10, 15)],
+    )
+
+
+async def support_snapshot(store):
+  """Read source ownership independently of the compatibility owner projection."""
+  async with store._DataBase__read_engine.connect() as connection:
+    rows = await connection.execute(
+      text(
+        'SELECT ip.ip_address, s.domain_id, s.ip_list_id FROM rdpr_ip_supports AS s '
+        'JOIN rdpr_ip_records AS ip ON ip.id=s.ip_record_id'
+      )
+    )
+    return set(rows.all())
+
+
+async def queue_resolution(app, store, domain_id, addresses, *, complete=True):
+  command = app.dto.DomainResult(
+    id=domain_id,
+    name=f'domain-{domain_id}.example.test',
+    resolution_complete=complete,
+    storage_ips=tuple(addresses),
+  )
+  await store.put_domain_after_resolve(command)
+  return command
+
+
+async def add_support_domains(app, store):
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.DomainsDbo),
+      [{'id': value, 'name': f'domain-{value}.example.test', 'resolved': False} for value in (0, 1, 2)],
+    )
+
+
+@pytest.mark.parametrize('order', [(1, 2), (2, 1)])
+async def test_shared_address_union_survives_independent_complete_withdrawal(app, store, order):
+  """A complete negative withdraws one source, not a globally shared address."""
+  await add_support_domains(app, store)
+  for domain_id in order:
+    await queue_resolution(app, store, domain_id, ['8.8.8.8'])
+  await flush_queue(store)
+  assert await support_snapshot(store) == {('8.8.8.8', 1, None), ('8.8.8.8', 2, None)}
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      text(
+        "UPDATE rdpr_ip_records SET ros_comment='incumbent metadata', use_default_gw=1, "
+        "created_at='2001-02-03 04:05:06', updated_at='2002-03-04 05:06:07' WHERE ip_address='8.8.8.8'"
+      )
+    )
+  async with store._DataBase__read_engine.connect() as connection:
+    before = (
+      await connection.execute(
+        text(
+          'SELECT id, addr_type, ip_address, ros_comment, use_default_gw, created_at, updated_at FROM rdpr_ip_records'
+        )
+      )
+    ).one()
+  for domain_id in (1, 2):
+    assert [row.ip_address for row in await store.get_all_ips_for_domain(domain_id)] == ['8.8.8.8']
+  await queue_resolution(app, store, order[0], [])
+  await flush_queue(store)
+  assert await store.get_all_ips_for_domain(order[0]) == []
+  assert [row.ip_address for row in await store.get_all_ips_for_domain(order[1])] == ['8.8.8.8']
+  async with store._DataBase__read_engine.connect() as connection:
+    after = (
+      await connection.execute(
+        text(
+          'SELECT id, addr_type, ip_address, ros_comment, use_default_gw, created_at, updated_at FROM rdpr_ip_records'
+        )
+      )
+    ).one()
+    owner = (await connection.execute(text('SELECT domain_id, ip_list_id FROM rdpr_ip_records'))).one()
+  assert after == before
+  assert tuple(owner) == (order[1], None)
+  await queue_resolution(app, store, order[1], [])
+  await flush_queue(store)
+  assert await support_snapshot(store) == set()
+  async with store._DataBase__read_engine.connect() as connection:
+    assert (await connection.execute(select(app.database.IpRecordsDbo.id))).all() == []
+
+
+@pytest.mark.parametrize('withdraw_first', [True, False])
+async def test_same_batch_dns_handoff_keeps_global_identity_and_metadata(app, store, withdraw_first):
+  await add_support_domains(app, store)
+  await queue_resolution(app, store, 1, ['8.8.8.8'])
+  await flush_queue(store)
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(text("UPDATE rdpr_ip_records SET ros_comment='retained', use_default_gw=1"))
+  async with store._DataBase__read_engine.connect() as connection:
+    before = (await connection.execute(text('SELECT * FROM rdpr_ip_records'))).one()
+  actions = [(1, ()), (2, ('8.8.8.8',))]
+  for domain_id, addresses in actions if withdraw_first else reversed(actions):
+    await queue_resolution(app, store, domain_id, addresses)
+  await flush_queue(store)
+  async with store._DataBase__read_engine.connect() as connection:
+    after = (await connection.execute(text('SELECT * FROM rdpr_ip_records'))).one()
+  assert after[0] == before[0]
+  assert after[3:] == before[3:]
+  assert await support_snapshot(store) == {('8.8.8.8', 2, None)}
+
+
+async def test_same_domain_full_payload_is_fifo_and_frozen_at_admission(app, store):
+  await add_support_domains(app, store)
+  first = await queue_resolution(app, store, 1, ['8.8.8.8', '9.9.9.9'])
+  await queue_resolution(app, store, 1, ['9.9.9.9'])
+  last = await queue_resolution(app, store, 1, ['1.1.1.1'], complete=False)
+  first.id = 2
+  first.storage_ips = ('4.2.2.2',)
+  last.storage_ips = ()
+  last.resolution_complete = True
+  # Obsolete ID deltas cannot remove a different source or replace the full payload.
+  last.insert.ips_delete = [999]
+  await flush_queue(store)
+  assert await support_snapshot(store) == {('9.9.9.9', 1, None), ('1.1.1.1', 1, None)}
+  async with store._DataBase__read_engine.connect() as connection:
+    rows = (await connection.execute(text('SELECT id, resolved, last_resolved_at FROM rdpr_domains ORDER BY id'))).all()
+  assert [(row[0], row[1], row[2] is not None) for row in rows] == [(0, 0, False), (1, 1, True), (2, 0, False)]
+
+
+@pytest.mark.parametrize('selector', ['domain', 'domain_list'])
+async def test_parent_deletion_removes_only_its_supports(app, store, selector):
+  await add_support_domains(app, store)
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.DomainsListsDbo).values(id=5, name='source list', url='https://lists.example.test/domains')
+    )
+    await connection.execute(text('UPDATE rdpr_domains SET domain_list_id=5 WHERE id=1'))
+  for domain_id in (1, 2):
+    await queue_resolution(app, store, domain_id, ['8.8.8.8'])
+  await flush_queue(store)
+  if selector == 'domain':
+    await store.put_delete_domains_to_queue(id=1)
+  else:
+    await store.put_delete_domains_list_to_queue(id=5)
+  await flush_queue(store)
+  assert await support_snapshot(store) == {('8.8.8.8', 2, None)}
+  assert [row.ip_address for row in await store.get_all_ips_for_domain(2)] == ['8.8.8.8']
+
+
+async def test_list_withdrawal_is_scoped_but_explicit_ip_deletion_is_global(app, store):
+  await add_support_domains(app, store)
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.IpsListsDbo),
+      [{'id': value, 'name': f'list-{value}', 'url': f'https://lists.example.test/{value}'} for value in (7, 8)],
+    )
+  await queue_resolution(app, store, 1, ['8.8.8.8'])
+  await flush_queue(store)
+  async with store._DataBase__write_engine.begin() as connection:
+    ip_id = (await connection.execute(select(app.database.IpRecordsDbo.id))).scalar_one()
+    await connection.execute(
+      insert(app.database.IpSupportDbo),
+      [
+        {'ip_record_id': ip_id, 'domain_id': 1, 'ip_list_id': 7},
+        {'ip_record_id': ip_id, 'domain_id': 2, 'ip_list_id': 8},
+      ],
+    )
+  assert [row.ip_address for row in await store.get_all_ips_on_ips_list(7)] == ['8.8.8.8']
+  await store.put_withdraw_ip_list_records_to_queue(7, [ip_id])
+  await flush_queue(store)
+  assert await support_snapshot(store) == {('8.8.8.8', 1, None), ('8.8.8.8', 2, 8)}
+  assert await store.get_all_ips_on_ips_list(7) == []
+  await store.put_delete_ips_list_to_queue(id=8)
+  await flush_queue(store)
+  assert await support_snapshot(store) == {('8.8.8.8', 1, None)}
+  await store.put_delete_ips_to_queue(ip_id)
+  await flush_queue(store)
+  assert await support_snapshot(store) == set()
+  assert await store.get_all_ips_for_domain(1) == []
+
+
+async def test_domain_complete_withdraws_manual_list_support_without_pinning_it(app, store):
+  await add_support_domains(app, store)
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.IpsListsDbo).values(id=7, name='manual list', url='https://lists.example.test/ips')
+    )
+  request = importlib.import_module('models.http.ips_req').IpsPostElementReq
+  await store.put_add_ips_to_queue([request(addr='8.8.8.8', domain_id=1, list_id=7)])
+  await flush_queue(store)
+  assert await support_snapshot(store) == {('8.8.8.8', 1, 7)}
+  await queue_resolution(app, store, 1, ['8.8.8.8'])
+  await flush_queue(store)
+  assert await support_snapshot(store) == {('8.8.8.8', 1, 7), ('8.8.8.8', 1, None)}
+  await queue_resolution(app, store, 1, [])
+  await flush_queue(store)
+  assert await support_snapshot(store) == set()
+
+
+async def test_manual_none_and_supported_duplicate_never_create_ownership(app, store):
+  await add_support_domains(app, store)
+  request = importlib.import_module('models.http.ips_req').IpsPostElementReq
+  await store.put_add_ips_to_queue(
+    [
+      request(addr='8.8.8.8', domain_id=1, ros_comment='incumbent', use_default_gw=True),
+      request(addr='8.8.8.8', domain_id=2, ros_comment='duplicate'),
+      request(addr='9.9.9.9', domain_id=None),
+    ]
+  )
+  await flush_queue(store)
+  assert await support_snapshot(store) == {('8.8.8.8', 1, None)}
+  async with store._DataBase__read_engine.connect() as connection:
+    assert (
+      await connection.execute(text('SELECT ip_address, domain_id, ros_comment, use_default_gw FROM rdpr_ip_records'))
+    ).all() == [('8.8.8.8', 1, 'incumbent', 1)]
+
+
+async def test_explicit_creation_replaces_only_targeted_transient_orphan(app, store):
+  await add_support_domains(app, store)
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.DomainsListsDbo).values(id=5, name='retiring list', url='https://lists.example.test/domains')
+    )
+    await connection.execute(text('UPDATE rdpr_domains SET domain_list_id=5 WHERE id=1'))
+  await queue_resolution(app, store, 1, ['8.8.8.8', '9.9.9.9'])
+  await flush_queue(store)
+  request = importlib.import_module('models.http.ips_req').IpsPostElementReq
+  await store.put_delete_domains_list_to_queue(id=5)
+  await store.put_add_ips_to_queue(
+    [request(addr='8.8.8.8', domain_id=2, ros_comment='explicit replacement', use_default_gw=True)]
+  )
+  await flush_queue(store)
+  assert await support_snapshot(store) == {('8.8.8.8', 2, None)}
+  async with store._DataBase__read_engine.connect() as connection:
+    assert (
+      await connection.execute(text('SELECT ip_address, domain_id, ros_comment, use_default_gw FROM rdpr_ip_records'))
+    ).all() == [('8.8.8.8', 2, 'explicit replacement', 1)]
+
+
+async def test_missing_parent_cannot_hide_behind_an_existing_shared_address(app, store, monkeypatch):
+  await add_support_domains(app, store)
+  await queue_resolution(app, store, 2, ['8.8.8.8'])
+  await flush_queue(store)
+  await store.put_delete_domains_to_queue(id=1)
+  await flush_queue(store)
+  before = await support_snapshot(store)
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+  await queue_resolution(app, store, 1, ['8.8.8.8'], complete=False)
+  await store.start_writer()
+  await asyncio.wait_for(asyncio.shield(store.writer_task), timeout=2)
+  assert store.writer_state == 'FAILED'
+  assert isinstance(store.writer_failure, app.database.DatabaseWriteError)
+  assert store.writer_failure.committed is False
+  assert await support_snapshot(store) == before
+
+
+async def test_complete_and_direct_domain_delete_roll_back_the_entire_batch(app, store, monkeypatch):
+  await seed(app, store)
+  before, supports = await snapshot(app, store), await support_snapshot(store)
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 2)
+  monkeypatch.setattr(app.settings, 'db_save_batch_timeout', 3600)
+  await store.put_delete_domains_to_queue(id=1)
+  await queue_resolution(app, store, 1, ['8.8.4.4'])
+  await store.start_writer()
+  await asyncio.wait_for(asyncio.shield(store.writer_task), timeout=2)
+  assert store.writer_state == 'FAILED'
+  assert store.pending_count == 2
+  assert store.unknown_count == 0
+  assert await snapshot(app, store) == before
+  assert await support_snapshot(store) == supports
+
+
+async def test_full_real_writer_queue_backpressures_pool_and_retains_admitted_command_on_cancel(
+  app, store, resolver, network, monkeypatch, job_queues
+):
+  jobs = importlib.import_module('jobs.job_registry')
+  monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 2)
+  monkeypatch.setattr(app.settings, 'queue_max_size', 1)
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+  waiting = asyncio.Event()
+
+  class WriterQueue(asyncio.Queue):
+    async def put(self, item):
+      if self.full():
+        waiting.set()
+      await super().put(item)
+
+  store.db_save_queue = WriterQueue(maxsize=1)
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.DomainsDbo),
+      [{'id': value, 'name': f'queued-{value}.example.test', 'resolved': False} for value in range(1, 65)],
+    )
+    await connection.execute(insert(app.database.DnsServersDbo).values(id=42, server='192.0.2.53'))
+  requests = network({'192.0.2.53': 'positive'})
+  task = asyncio.create_task(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW))
+  try:
+    await asyncio.wait_for(waiting.wait(), timeout=2)
+    await asyncio.wait_for(job_queues[0].put_waiting.wait(), timeout=2)
+    assert store.writer_task is None
+    assert store.db_save_queue.qsize() == 1
+    assert len(requests) <= 3
+    assert job_queues[0].qsize() == 1
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await asyncio.wait_for(task, timeout=2)
+    # Admission already transferred exactly one result to the database writer.
+    assert store.db_save_queue.qsize() == store.db_save_queue._unfinished_tasks == 1
+    assert store.pending_count == 1
+    assert await support_snapshot(store) == set()
+    await store.start_writer()
+    await asyncio.wait_for(store.db_save_queue.join(), timeout=2)
+    supports = await support_snapshot(store)
+    assert len(supports) == 1
+    assert {(address, list_id) for address, _, list_id in supports} == {('8.8.8.8', None)}
+    assert store.pending_count == store.unknown_count == 0
+    assert store.writer_state == 'RUNNING'
+  finally:
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 async def snapshot(app, store):
@@ -328,6 +643,7 @@ async def test_writer_independently_gates_deletion_and_checkpoint(app, store, co
   await seed(app, store)
   before = await snapshot(app, store)
   command = app.dto.DomainResult(id=1, name='www.example.test', resolution_complete=complete)
+  command.storage_ips = ('8.8.4.4',)
   command.insert.ips_insert = [app.Ip(ip_address='8.8.4.4', addr_type=4)]
   command.insert.ips_delete = [10, 12, 13, 14]
   await store.put_domain_after_resolve(command)
@@ -354,6 +670,7 @@ async def test_checkpoint_failure_rolls_back_ip_addition_and_deletion(app, store
       )
     )
   command = app.dto.DomainResult(id=1, name='www.example.test', resolution_complete=True)
+  command.storage_ips = ('8.8.4.4',)
   command.insert.ips_insert = [app.Ip(ip_address='8.8.4.4', addr_type=4)]
   command.insert.ips_delete = [10]
   monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
@@ -1286,6 +1603,7 @@ async def test_mixed_domain_delete_and_partial_resolution_preserve_grouping(app,
   monkeypatch.setattr(app.settings, 'db_save_batch_size', 3)
   monkeypatch.setattr(app.settings, 'db_save_batch_timeout', 3600.0)
   command = app.dto.DomainResult(id=1, name='www.example.test', resolution_complete=False)
+  command.storage_ips = ('8.8.4.4',)
   command.insert.ips_insert = [app.Ip(ip_address='8.8.4.4', addr_type=4)]
   # Existing grouping inserts resolved IPs before deleting domains in one batch.
   await store.put_delete_domains_to_queue(id=1)
@@ -1314,6 +1632,7 @@ async def test_late_resolution_after_parent_deletion_fails_without_orphan_or_rep
   await store.start_writer()
   await asyncio.wait_for(store.db_save_queue.join(), timeout=2)
   command = app.dto.DomainResult(id=1, name='www.example.test', resolution_complete=True)
+  command.storage_ips = ('8.8.4.4',)
   command.insert.ips_insert = [app.Ip(ip_address='8.8.4.4', addr_type=4)]
   await store.put_domain_after_resolve(command)
   await asyncio.wait_for(asyncio.shield(store.writer_task), timeout=2)
@@ -1481,6 +1800,11 @@ async def configure_public_domain(service, *, resolved=True):
         (domain_id, 6, '2001:4860:4860::8888', 'existing IPv6', 1),
       ],
     )
+    connection.execute(
+      'INSERT INTO rdpr_ip_supports (ip_record_id, domain_id, ip_list_id) '
+      'SELECT id, domain_id, ip_list_id FROM rdpr_ip_records WHERE domain_id=?',
+      (domain_id,),
+    )
   return domain_id
 
 
@@ -1496,6 +1820,59 @@ def public_flow_snapshot(service, domain_id):
       (domain_id,),
     ).fetchall()
   return domain, {row[2]: row for row in rows}
+
+
+@pytest.mark.e2e
+async def test_public_bulk_shared_addresses_keep_surviving_domain_and_durable_union(e2e_service):
+  service = e2e_service
+  names = ['first-shared.example.test', 'second-shared.example.test']
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    assert (
+      await client.post('/dns', json=[{'server': service.dns_host}, {'doh_server': service.doh_url}])
+    ).status_code == 200
+    assert (await client.post('/domains', json=[{'domain': name} for name in names])).status_code == 200
+    async with asyncio.timeout(5):
+      while True:
+        rows = (await client.get('/domains')).json()['payload']
+        ids = {row['name']: row['id'] for row in rows if row['name'] in names}
+        dns_rows = (await client.get('/dns', params={'default': 'false'})).json()['payload']
+        if len(ids) == 2 and len(dns_rows) == 2:
+          break
+        await asyncio.sleep(0.01)
+    assert (await client.post('/commands/domains/resolve/new')).status_code == 200
+    _, fields = await completed_metrics(client, mode='new', selected=2)
+    assert fields['success'] == fields['admitted'] == fields['confirmed'] == 2
+    for domain_id in ids.values():
+      response = await client.get(f'/domains/{domain_id}')
+      assert response.status_code == 200
+      assert set(response.json()['ips_v4']) == {'8.8.8.8', '8.8.4.4'}
+    with closing(sqlite3.connect(service.db_path)) as connection:
+      original_ips = connection.execute('SELECT * FROM rdpr_ip_records ORDER BY id').fetchall()
+      assert len(original_ips) == 2
+      assert connection.execute('SELECT COUNT(*) FROM rdpr_ip_supports').fetchone() == (4,)
+    assert (await client.delete(f'/domains/{ids[names[0]]}')).status_code == 200
+    async with asyncio.timeout(5):
+      while (await client.get(f'/domains/{ids[names[0]]}')).status_code != 404:
+        await asyncio.sleep(0.01)
+    response = await client.get(f'/domains/{ids[names[1]]}')
+    assert response.status_code == 200
+    assert set(response.json()['ips_v4']) == {'8.8.8.8', '8.8.4.4'}
+  await service.stop()
+  with closing(sqlite3.connect(service.db_path)) as connection:
+    surviving = connection.execute('SELECT * FROM rdpr_ip_records ORDER BY id').fetchall()
+    assert [row[0] for row in surviving] == [row[0] for row in original_ips]
+    assert [row[3:] for row in surviving] == [row[3:] for row in original_ips]
+    assert connection.execute('SELECT domain_id,COUNT(*) FROM rdpr_ip_supports GROUP BY domain_id').fetchall() == [
+      (ids[names[1]], 2)
+    ]
+  before = sqlite_snapshot(service.db_path)
+  await service.start()
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    response = await client.get(f'/domains/{ids[names[1]]}')
+    assert response.status_code == 200
+    assert set(response.json()['ips_v4']) == {'8.8.8.8', '8.8.4.4'}
+  await service.stop()
+  assert sqlite_snapshot(service.db_path) == before
 
 
 @pytest.mark.e2e
@@ -1737,6 +2114,12 @@ async def test_public_empty_startup_and_restart_preserve_schema_defaults_and_his
       ('persisted.example.test',),
     ]
     assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
+    supports_query = {'rdpr_': 'SELECT * FROM rdpr_ip_supports', '': 'SELECT * FROM ip_supports'}[prefix]
+    assert connection.execute(supports_query).fetchall() == []
+    assert {(row[3], row[6]) for row in connection.execute(f'PRAGMA foreign_key_list({prefix}ip_records)')} == {
+      ('domain_id', 'SET NULL'),
+      ('ip_list_id', 'SET NULL'),
+    }
   before = sqlite_snapshot(service.db_path)
   await service.start()
   async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
@@ -1746,6 +2129,75 @@ async def test_public_empty_startup_and_restart_preserve_schema_defaults_and_his
   await service.stop()
   assert sqlite_snapshot(service.db_path) == before
   assert service.providers.requests == []
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+@pytest.mark.parametrize('prefix', ['rdpr_', ''])
+@pytest.mark.parametrize('unique_form', ['inline', 'index'])
+async def test_public_current_schema_upgrade_backfills_source_and_preserves_rows_and_history(
+  e2e_service, prefix, unique_form
+):
+  """Represent the previous supported owner schema, including its two UNIQUE forms."""
+  service = e2e_service
+  service.environment['DB_TABLE_PREFIX'] = prefix
+  queries = {
+    'rdpr_': (
+      'DELETE FROM rdpr_migrations WHERE name=?',
+      'SELECT * FROM rdpr_migrations ORDER BY id',
+      'INSERT INTO rdpr_ip_records VALUES (17,NULL,0,4,?,?,?,?,?)',
+      'SELECT * FROM rdpr_ip_records',
+      'SELECT * FROM rdpr_migrations WHERE name!=? ORDER BY id',
+      'SELECT ip_record_id,domain_id,ip_list_id FROM rdpr_ip_supports',
+    ),
+    '': (
+      'DELETE FROM migrations WHERE name=?',
+      'SELECT * FROM migrations ORDER BY id',
+      'INSERT INTO ip_records VALUES (17,NULL,0,4,?,?,?,?,?)',
+      'SELECT * FROM ip_records',
+      'SELECT * FROM migrations WHERE name!=? ORDER BY id',
+      'SELECT ip_record_id,domain_id,ip_list_id FROM ip_supports',
+    ),
+  }[prefix]
+  await service.start()
+  await service.stop()
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    connection.execute(queries[0], ('migration_202618042123.py',))
+    old_history = connection.execute(queries[1]).fetchall()
+    connection.execute(f'DROP TABLE {prefix}ip_supports')
+    connection.execute(f'DROP TABLE {prefix}ip_records')
+    unique = ' UNIQUE' if unique_form == 'inline' else ''
+    connection.execute(f"""
+      CREATE TABLE {prefix}ip_records (
+        id INTEGER NOT NULL PRIMARY KEY, ip_list_id INTEGER, domain_id INTEGER NOT NULL,
+        addr_type INTEGER NOT NULL, ip_address TEXT NOT NULL{unique}, ros_comment TEXT,
+        use_default_gw BOOLEAN DEFAULT 0 NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+        updated_at TIMESTAMP, CHECK (ip_address != ''),
+        FOREIGN KEY (domain_id) REFERENCES {prefix}domains(id) ON DELETE CASCADE,
+        FOREIGN KEY (ip_list_id) REFERENCES {prefix}ips_lists(id) ON DELETE CASCADE
+      )
+    """)
+    for column in ('domain_id', 'ip_list_id', 'ip_address'):
+      if column == 'ip_address' and unique_form == 'inline':
+        continue
+      index_unique = 'UNIQUE ' if column == 'ip_address' and unique_form == 'index' else ''
+      connection.execute(f'CREATE {index_unique}INDEX ix_{prefix}ip_records_{column} ON {prefix}ip_records ({column})')
+    connection.execute(
+      queries[2],
+      ('8.8.8.0/24', 'preserved legacy metadata', 1, '2001-02-03 04:05:06', '2002-03-04 05:06:07'),
+    )
+    before_ip = connection.execute(queries[3]).fetchall()
+  await service.start()
+  await service.stop()
+  with closing(sqlite3.connect(service.db_path)) as connection:
+    assert connection.execute(queries[3]).fetchall() == before_ip
+    assert connection.execute(queries[4], ('migration_202618042123.py',)).fetchall() == old_history
+    assert connection.execute(queries[5]).fetchall() == [(17, 0, None)]
+    assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
+  upgraded = sqlite_snapshot(service.db_path)
+  await service.start()
+  await service.stop()
+  assert sqlite_snapshot(service.db_path) == upgraded
 
 
 @pytest.mark.e2e
@@ -1799,11 +2251,14 @@ async def test_public_historical_gateway_upgrade_preserves_old_data_and_all_hist
     assert connection.execute('SELECT * FROM rdpr_migrations WHERE id<=34 ORDER BY id').fetchall() == old_history
     assert connection.execute('SELECT * FROM rdpr_domains WHERE id=7').fetchone() == old_domain
     assert connection.execute('SELECT * FROM rdpr_ip_records WHERE id=17').fetchone() == (*old_ip, 0)
+    assert connection.execute('SELECT ip_record_id,domain_id,ip_list_id FROM rdpr_ip_supports').fetchall() == [
+      (17, 7, None)
+    ]
     assert connection.execute('SELECT server, description FROM rdpr_dns_servers WHERE id=0').fetchone() == (
       '9.9.9.9',
       'custom',
     )
-    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations').fetchone() == (6,)
+    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations').fetchone() == (7,)
   before = sqlite_snapshot(service.db_path)
   await service.start()
   await service.stop()
@@ -1850,7 +2305,7 @@ async def test_public_legacy_import_failure_rolls_back_and_fresh_process_recover
   assert_legacy_import(service.db_path)
   with closing(sqlite3.connect(service.db_path)) as connection:
     assert connection.execute('SELECT * FROM rdpr_migrations WHERE id<=42 ORDER BY id').fetchall() == old_history
-    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations').fetchone() == (5,)
+    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations').fetchone() == (6,)
   recovered = sqlite_snapshot(service.db_path)
   await service.start()
   await service.stop()
@@ -1942,6 +2397,84 @@ async def test_completed_gateway_history_cannot_mask_missing_original_effect(app
   with pytest.raises(app.database.DatabaseWriteError):
     await startup_store.setup()
   assert sqlite_snapshot(path) == before
+
+
+@pytest.mark.parametrize('missing_effect', ['support_table', 'owner_fk', 'support_row', 'unique_index'])
+async def test_completed_support_migration_refuses_missing_effects_before_schema_repair(
+  app, startup_store, missing_effect
+):
+  await startup_store.setup()
+  await startup_store.close(timeout=2)
+  path = Path(app.settings.db_path)
+  with closing(sqlite3.connect(path)) as connection, connection:
+    connection.execute("INSERT INTO rdpr_domains (id,name,resolved) VALUES (7,'existing.example.test',1)")
+    connection.execute("INSERT INTO rdpr_ip_records (id,domain_id,addr_type,ip_address) VALUES (17,7,4,'8.8.8.8')")
+    connection.execute('INSERT INTO rdpr_ip_supports (ip_record_id,domain_id) VALUES (17,7)')
+    if missing_effect == 'support_table':
+      connection.execute('DROP TABLE rdpr_ip_supports')
+    elif missing_effect == 'support_row':
+      connection.execute('DELETE FROM rdpr_ip_supports')
+    elif missing_effect == 'unique_index':
+      indexes = [row for row in connection.execute('PRAGMA index_list(rdpr_ip_supports)') if row[2] and row[4]]
+      assert len(indexes) == 2
+      index_name = indexes[0][1]
+      assert index_name.replace('_', '').isalnum()
+      connection.execute(f'DROP INDEX "{index_name}"')
+    else:
+      connection.execute('PRAGMA writable_schema=ON')
+      ddl = connection.execute("SELECT sql FROM sqlite_master WHERE name='rdpr_ip_records'").fetchone()[0]
+      assert 'SET NULL' in ddl
+      connection.execute(
+        "UPDATE sqlite_master SET sql=? WHERE name='rdpr_ip_records'",
+        (ddl.replace('SET NULL', 'CASCADE'),),
+      )
+      connection.execute('PRAGMA writable_schema=OFF')
+  before = sqlite_snapshot(path)
+  fresh = app.database.DataBase()
+  try:
+    with pytest.raises(app.database.DatabaseWriteError):
+      await fresh.setup()
+    assert fresh.writer_task is None
+    assert sqlite_snapshot(path) == before
+  finally:
+    await fresh._DataBase__read_engine.dispose()
+    await fresh._DataBase__write_engine.dispose()
+
+
+async def test_support_schema_enforces_independent_context_uniqueness_and_cascade(app, startup_store):
+  await startup_store.setup()
+  await startup_store.close(timeout=2)
+  path = Path(app.settings.db_path)
+  with closing(sqlite3.connect(path)) as connection, connection:
+    connection.execute('PRAGMA foreign_keys=ON')
+    connection.execute("INSERT INTO rdpr_domains (id,name,resolved) VALUES (7,'support.example.test',0)")
+    connection.execute(
+      "INSERT INTO rdpr_ips_lists (id,name,url,attempts) VALUES (8,'source','https://lists.example.test/8',0)"
+    )
+    connection.execute("INSERT INTO rdpr_ip_records (id,domain_id,addr_type,ip_address) VALUES (17,7,4,'8.8.8.8')")
+    connection.execute('INSERT INTO rdpr_ip_supports (ip_record_id,domain_id) VALUES (17,7)')
+    connection.execute('INSERT INTO rdpr_ip_supports (ip_record_id,domain_id,ip_list_id) VALUES (17,7,8)')
+    for query in (
+      'INSERT INTO rdpr_ip_supports (ip_record_id,domain_id) VALUES (17,7)',
+      'INSERT INTO rdpr_ip_supports (ip_record_id,domain_id,ip_list_id) VALUES (17,7,8)',
+      'INSERT INTO rdpr_ip_supports (ip_record_id,domain_id) VALUES (17,999)',
+    ):
+      with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(query)
+    ip_fks = connection.execute('PRAGMA foreign_key_list(rdpr_ip_records)').fetchall()
+    assert {(row[3], row[6]) for row in ip_fks} == {('domain_id', 'SET NULL'), ('ip_list_id', 'SET NULL')}
+    support_fks = connection.execute('PRAGMA foreign_key_list(rdpr_ip_supports)').fetchall()
+    assert {(row[2], row[3], row[6]) for row in support_fks} == {
+      ('rdpr_ip_records', 'ip_record_id', 'CASCADE'),
+      ('rdpr_domains', 'domain_id', 'CASCADE'),
+      ('rdpr_ips_lists', 'ip_list_id', 'CASCADE'),
+    }
+    connection.execute('DELETE FROM rdpr_ips_lists WHERE id=8')
+    assert connection.execute('SELECT domain_id,ip_list_id FROM rdpr_ip_supports').fetchall() == [(7, None)]
+    connection.execute('DELETE FROM rdpr_domains WHERE id=7')
+    assert connection.execute('SELECT * FROM rdpr_ip_supports').fetchall() == []
+    assert connection.execute('SELECT id,domain_id FROM rdpr_ip_records').fetchall() == [(17, None)]
+    assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
 
 
 @pytest.mark.parametrize('migration_name', ['migration_202511031501.py', 'migration_202618042122.py'])
@@ -2122,7 +2655,7 @@ async def test_startup_error_after_physical_commit_keeps_writer_stopped_and_allo
   assert startup_store.writer_state == 'FAILED'
   path = Path(app.settings.db_path)
   with closing(sqlite3.connect(path)) as connection:
-    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations WHERE applied_at IS NOT NULL').fetchone() == (3,)
+    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations WHERE applied_at IS NOT NULL').fetchone() == (4,)
     assert connection.execute('SELECT id, name FROM rdpr_domains').fetchall() == [(0, 'default')]
   committed = sqlite_snapshot(path)
   recovered = app.database.DataBase()
@@ -2722,8 +3255,6 @@ async def test_dns_job_reads_once_and_activates_committed_changes_only_for_next_
   app, store, resolver, monkeypatch, dns_message, mode
 ):
   jobs = importlib.import_module('jobs.job_registry')
-  monkeypatch.setattr(resolver, 'domains_resolve_queue', asyncio.Queue(maxsize=1))
-  monkeypatch.setattr(resolver, '_DomainsResolver__stop_domains_resolve_event', threading.Event())
   async with store._DataBase__write_engine.begin() as connection:
     await connection.execute(insert(app.database.DnsServersDbo).values(id=42, server='192.0.2.53'))
     await connection.execute(
@@ -2817,11 +3348,9 @@ async def test_dns_configuration_ignores_enqueue_and_rollback_until_writer_commi
 
 @pytest.mark.parametrize('mode', ['new', 'stale'])
 async def test_dns_read_failure_is_typed_and_prevents_job_admission_and_persistence(
-  app, store, resolver, monkeypatch, mode, caplog
+  app, store, resolver, monkeypatch, job_queues, mode, caplog
 ):
   jobs = importlib.import_module('jobs.job_registry')
-  monkeypatch.setattr(resolver, 'domains_resolve_queue', asyncio.Queue(maxsize=1))
-  monkeypatch.setattr(resolver, '_DomainsResolver__stop_domains_resolve_event', threading.Event())
   await seed(app, store, resolved=mode == 'stale', checkpoint=STALE_CHECKPOINT if mode == 'stale' else None)
   before = await snapshot(app, store)
   async with store._DataBase__write_engine.begin() as connection:
@@ -2836,7 +3365,7 @@ async def test_dns_read_failure_is_typed_and_prevents_job_admission_and_persiste
     await asyncio.wait_for(resolver.domains_resolve(getattr(jobs.Jobs, f'DOMAINS_RESOLVE_{mode.upper()}')), timeout=3)
   with pytest.raises(app.database.DnsConfigurationReadError):
     await resolver.resolve_stored_domain(1)
-  assert resolver.domains_resolve_queue.qsize() == resolver.domains_resolve_queue._unfinished_tasks == 0
+  assert job_queues == []
   assert store.pending_count == store.unknown_count == 0
   assert await snapshot(app, store) == before
   assert store._DataBase__read_engine.pool.checkedout() == 0
@@ -2846,16 +3375,10 @@ async def test_dns_read_failure_is_typed_and_prevents_job_admission_and_persiste
 @pytest.mark.parametrize('mode', ['new', 'stale'])
 @pytest.mark.parametrize('configuration', ['empty', 'unknown-only'])
 async def test_successful_dns_selection_without_endpoints_rejects_nonempty_job_before_admission(
-  app, store, resolver, monkeypatch, mode, configuration
+  app, store, resolver, monkeypatch, job_queues, mode, configuration
 ):
   jobs = importlib.import_module('jobs.job_registry')
   network_calls, admissions, selections = [], [], []
-  queue = asyncio.Queue(maxsize=1)
-  original_put = queue.put
-
-  async def put(item):
-    admissions.append(item)
-    await original_put(item)
 
   async def reject_network(*args, **kwargs):
     network_calls.append((args, kwargs))
@@ -2865,9 +3388,6 @@ async def test_successful_dns_selection_without_endpoints_rejects_nonempty_job_b
     if 'UNION ALL' in statement and 'rdpr_dns_servers' in statement:
       selections.append(statement)
 
-  monkeypatch.setattr(queue, 'put', put)
-  monkeypatch.setattr(resolver, 'domains_resolve_queue', queue)
-  monkeypatch.setattr(resolver, '_DomainsResolver__stop_domains_resolve_event', threading.Event())
   monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', reject_network)
   monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', reject_network)
   await seed(app, store, resolved=mode == 'stale', checkpoint=STALE_CHECKPOINT if mode == 'stale' else None)
@@ -2895,7 +3415,7 @@ async def test_successful_dns_selection_without_endpoints_rejects_nonempty_job_b
     assert str(app.settings.db_path) not in str(failure.value)
     assert 'rdpr_dns_servers' not in str(failure.value)
     assert network_calls == admissions == []
-    assert queue.qsize() == queue._unfinished_tasks == 0
+    assert job_queues == []
     assert store.db_save_queue.qsize() == store.db_save_queue._unfinished_tasks == 0
     assert store.pending_count == store.unknown_count == 0
     assert await snapshot(app, store) == before
@@ -3191,10 +3711,10 @@ def histogram_percentiles(samples, before, name, **selected_labels):
 @pytest.mark.e2e
 @pytest.mark.e2e_load
 async def test_reproducible_local_measurement_baseline(e2e_service, tmp_path):
-  """Measure fixed local work with real DNS/HTTP, app lifespan, queue, and SQLite."""
+  """Compare bounded workers with identical persisted sources and controlled protocols."""
   service = e2e_service
   first_id = await configure_public_domain(service, resolved=False)
-  names = ['www.example.test', *[f'baseline-{index}.example.test' for index in range(3)]]
+  names = ['www.example.test', *[f'baseline-{index}.example.test' for index in range(15)]]
   async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
     response = await client.post('/domains', json=[{'domain': name} for name in names[1:]])
     assert response.status_code == 200
@@ -3218,7 +3738,8 @@ async def test_reproducible_local_measurement_baseline(e2e_service, tmp_path):
       'RIPE_STAT_EMPTY_PREFIX_CACHE_TTL_SEC': '3600',
       'RIPE_STAT_CACHE_LOCK_TTL_SEC': '120',
       'RIPE_STAT_CACHE_SIZE': '10000',
-      'QUEUE_MAX_SIZE': '1000',
+      'QUEUE_MAX_SIZE': '4',
+      'TEST_TASK_MEASUREMENTS': str(tmp_path / 'application-task-measurements.json'),
     }
   )
   scenarios = []
@@ -3227,8 +3748,31 @@ async def test_reproducible_local_measurement_baseline(e2e_service, tmp_path):
     for key, value in service.environment.items()
     if key.startswith(('DB_', 'REQ_', 'DNS_', 'DOH_', 'DOMAINS_', 'QUEUE_', 'RIPE_'))
   }
-  for schedule, delay, unavailable in [('fast', 0.0, False), ('slow', 0.02, False), ('unavailable', 0.0, True)]:
+  with closing(sqlite3.connect(service.db_path)) as connection:
+    initial_ips = connection.execute(
+      'SELECT id,ip_list_id,domain_id,addr_type,ip_address,ros_comment,use_default_gw,created_at,updated_at '
+      'FROM rdpr_ip_records ORDER BY id'
+    ).fetchall()
+    initial_supports = connection.execute('SELECT ip_record_id,domain_id,ip_list_id FROM rdpr_ip_supports').fetchall()
+  for schedule, delay, unavailable, worker_limit in [
+    (schedule, delay, unavailable, worker_limit)
+    for schedule, delay, unavailable in [('fast', 0.0, False), ('slow', 0.02, False), ('unavailable', 0.0, True)]
+    for worker_limit in (1, 4)
+  ]:
     await service.stop()
+    with closing(sqlite3.connect(service.db_path)) as connection, connection:
+      connection.execute('DELETE FROM rdpr_ip_supports')
+      connection.execute('DELETE FROM rdpr_ip_records')
+      connection.executemany(
+        'INSERT INTO rdpr_ip_records '
+        '(id,ip_list_id,domain_id,addr_type,ip_address,ros_comment,use_default_gw,created_at,updated_at) '
+        'VALUES (?,?,?,?,?,?,?,?,?)',
+        initial_ips,
+      )
+      connection.executemany(
+        'INSERT INTO rdpr_ip_supports (ip_record_id,domain_id,ip_list_id) VALUES (?,?,?)', initial_supports
+      )
+    service.environment['DOMAINS_RESOLVE_WORKER_LIMIT'] = str(worker_limit)
     service.providers.delay = delay
     service.providers.unavailable = unavailable
     service.providers.classic = 'servfail' if unavailable else 'positive'
@@ -3243,6 +3787,8 @@ async def test_reproducible_local_measurement_baseline(e2e_service, tmp_path):
           before_rows = connection.execute(
             'SELECT id, domain_id, addr_type, ip_address FROM rdpr_ip_records ORDER BY id'
           ).fetchall()
+        assert service.providers.dns_active == 0
+        service.providers.dns_peak_active = 0
         before = parse_samples((await client.get('/metrics')).text)
         request_offset = len(service.providers.requests)
         http_offset = len(service.providers.http_requests)
@@ -3286,12 +3832,25 @@ async def test_reproducible_local_measurement_baseline(e2e_service, tmp_path):
           checkpoints = connection.execute(
             'SELECT id, resolved, last_resolved_at FROM rdpr_domains WHERE id>0 ORDER BY id'
           ).fetchall()
+          actual_supports = connection.execute(
+            'SELECT ip.ip_address,s.domain_id,s.ip_list_id FROM rdpr_ip_supports AS s '
+            'JOIN rdpr_ip_records AS ip ON ip.id=s.ip_record_id ORDER BY ip.ip_address,s.domain_id'
+          ).fetchall()
           assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
         if unavailable:
           assert actual_rows == before_rows
+          assert set(actual_supports) == {
+            (address, domain_id, list_id)
+            for ip_id, domain_id, list_id in initial_supports
+            for row_id, _, _, _, address, *_ in initial_ips
+            if row_id == ip_id
+          }
           assert all(row[1:] == (0, None) for row in checkpoints)
         else:
-          assert {'8.8.8.0', '8.8.4.0'} <= {row[3] for row in actual_rows}
+          assert {row[3] for row in actual_rows} == {'8.8.8.0', '8.8.4.0', '2001:4860:4860::8888'}
+          assert set(actual_supports) == {
+            (address, domain_id, None) for domain_id in ids for address in ('8.8.8.0', '8.8.4.0')
+          } | {('2001:4860:4860::8888', first_id, None)}
           assert all(row[1] == 1 and row[2] is not None for row in checkpoints)
         network_count = sample_total(samples, 'resolution_ripe_duration_seconds_count', phase='network') - sample_total(
           before, 'resolution_ripe_duration_seconds_count', phase='network'
@@ -3327,6 +3886,10 @@ async def test_reproducible_local_measurement_baseline(e2e_service, tmp_path):
         scenarios.append(
           {
             'schedule': schedule,
+            'worker_limit': worker_limit,
+            'actual_supports': actual_supports,
+            'peak_provider_dns_queries': service.providers.dns_peak_active,
+            'dns_query_limit': 20,
             'cache': temperature,
             'provider_delay_seconds': delay,
             'http_provider_disconnects': unavailable,
@@ -3352,6 +3915,13 @@ async def test_reproducible_local_measurement_baseline(e2e_service, tmp_path):
             'resource_sample_count': len(resources),
           }
         )
+    await service.stop()
+    task_measurements = json.loads(Path(service.environment['TEST_TASK_MEASUREMENTS']).read_text(encoding='utf-8'))
+    assert 0 < task_measurements['peak_active_tasks'] < 100
+    assert service.providers.dns_active == 0
+    for scenario in scenarios[-2:]:
+      scenario['child_task_measurements_for_cold_and_warm_process'] = task_measurements
+      assert 0 < scenario['peak_provider_dns_queries'] <= min(20, worker_limit * 2)
   source_paths = [
     'main.py',
     'pyproject.toml',
@@ -3376,7 +3946,7 @@ async def test_reproducible_local_measurement_baseline(e2e_service, tmp_path):
   artifact.write_text(
     json.dumps(
       {
-        'scope': 'local controlled protocol baseline; not production performance or a speedup comparison',
+        'scope': 'local controlled worker1/worker4 comparison with real confirmed source persistence',
         'dataset': names,
         'settings': settings,
         'python': sys.version,
@@ -3393,7 +3963,7 @@ async def test_reproducible_local_measurement_baseline(e2e_service, tmp_path):
     ),
     encoding='utf-8',
   )
-  assert len(scenarios) == 6
+  assert len(scenarios) == 12
 
 
 async def test_http_pool_enforces_capacity_and_cancelled_stream_releases_connection(app, monkeypatch):
@@ -3619,6 +4189,11 @@ async def test_public_ripe_deadline_preserves_existing_cidr_and_adds_host_fallba
     connection.execute(
       'INSERT INTO rdpr_ip_records (domain_id, addr_type, ip_address) VALUES (?, 4, ?)',
       (domain_id, '8.8.8.0/25'),
+    )
+    connection.execute(
+      'INSERT INTO rdpr_ip_supports (ip_record_id, domain_id) '
+      'SELECT id, domain_id FROM rdpr_ip_records WHERE ip_address=?',
+      ('8.8.8.0/25',),
     )
   before = public_flow_snapshot(service, domain_id)
   service.providers.hold_ripe = True

@@ -492,6 +492,12 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
   Ordinary DNS resolvers and their fixed timeout/lifetime settings belong to one job or single-domain operation;
   each endpoint's resolver is reused within that scope. DNS response caching remains disabled pending evidence of
   useful TTLs and repeated queries.
+- Bulk resolution: each job owns a bounded local queue and a fixed pool limited by
+  `domains_resolve_worker_limit` (default `4`). `domains_resolve_semaphore_limit` (default `20`) independently bounds
+  classic DNS/DoH A and CNAME operations across bulk, stored-domain and check entrypoints. Both limits and
+  `queue_max_size` must be positive. Producers wait for queue space and workers wait for writer admission.
+  Job and endpoint tasks are retained through failure/cancellation cleanup before releasing the job reservation;
+  abandoned local work cannot enter a later job. Writer-admitted commands remain owned by the database component.
 - Public API docs: runtime `/docs` and `/docs/openapi.json`; checked-in export `docs/OPENAPI.json`.
   Contract changes must reconcile models, route metadata, tests, and the export when applicable.
 - Active FastAPI rule/skill: `python_fastapi.md` + `python-fastapi-expert`.
@@ -533,6 +539,15 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
   Inspect the full runner before edits: it currently invokes both available `upgrade` and `downgrade` functions,
   and records migration names/checksums. A downgrade stub does not establish tested rollback support.
   Do not rewrite already applied migrations or run them against existing data as part of agent setup.
+- Shared IP storage: `IpRecordsDbo` is globally unique by exact address; `IpSupportDbo` in the same model module
+  records independent domain/non-list and domain/list supports. Scalar domain/list fields are nullable `SET NULL`
+  compatibility projections, retaining a valid incumbent or selecting a deterministic remaining support.
+  Domain and IP-list reads traverse distinct supported global records. Explicit IP administration still deletes
+  the global entity; IP-list refresh withdraws only that list's support. Domain `0` is a real standalone context.
+- Shared IP migration: `migration_202618042123.py` preserves global IDs/metadata and backfills only known old contexts.
+  Startup validates completed migration effects before `create_all`. Unknown/incompatible schema fails atomically.
+  Previously discarded secondary owners can be learned only from later DNS evidence. An old app on the upgraded
+  database and automatic downgrade are unsupported; rollback requires restoring the paired prior app and database.
 - Active database toolkit skill: `python-sqlalchemy-core`.
 - Active database-specific skill: `python-sqlalchemy-sqlite`.
 - Dependency versions source: `pyproject.toml` and `poetry.lock`.
@@ -554,6 +569,11 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
   batch-size/time based writes; this queue is not durable.
 - Transaction policy: batch writer uses `BEGIN IMMEDIATE` and owns commit/rollback.
   Enqueue completion is not a commit acknowledgement and does not guarantee immediate read-after-write.
+- Resolution payload: admission freezes domain ID, completeness and the full prepared `storage_ips` tuple.
+  Resolution intents reconcile supports in admission order inside the existing category phases. Complete IPv4
+  evidence withdraws only that domain's absent supports and advances its checkpoint; partial evidence only adds,
+  failures preserve prior state, and IPv6 is untouched. Orphan cleanup/projection repair follows all successful
+  batch phases, preserving retained IP IDs/metadata and avoiding incidental `updated_at` changes.
 - Deployment process/worker assumption: one Python application process per database.
   Verify again before any multi-worker/process change.
 - Writer lifecycle: `DataBase` owns its queue, pending batch and writer/cleanup tasks; setup starts one writer.
