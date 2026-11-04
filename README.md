@@ -59,7 +59,7 @@ Available environment variables
 | `APP_HOST` | str | `0.0.0.0` | Listen on IP addr. `0.0.0.0` - Listen on all IP addresses |
 | `APP_PORT` | int | `4000` | Listen on TCP/IP specific port |
 | `APP_LOG_LEVEL` | str | `error` | Application level logging |
-| `QUEUE_MAX_SIZE` | int | `1000` | Positive maximum size of each individual queue; producers wait when it is full |
+| `QUEUE_MAX_SIZE` | int | `1000` | Positive writer queue capacity and maximum accepted, unstarted explicit domain operations; admission waits when full |
 | `QUEUE_GET_TIMEOUT` | float | `0.1` | Maximum waiting time for a queue entry. 0.1s = 100ms |
 | `QUEUE_SLEEP_TIMEOUT` | float | `0.01` | The maximum wait time while the queue is empty. At the same time, the infinite loop should allow the scheduler to integrate other tasks into the overall flow. 0.01s = 10ms |
 | `RESOLVE_DOMAINS_LOG_EVERY` | int | `10` | Specifies the number of messages that will be logged during domain resolution. Distributes the total volume of domains to resolve among this number |
@@ -68,7 +68,7 @@ Available environment variables
 | `DB_BASE_DIR` | str | `db` | A separate folder containing the database. It is also later mounted in a container for downloading to a local PC |
 | `DB_FILE_NAME` | str | `rdpr-db.sqlite` | Database file name |
 | `DB_TABLE_PREFIX` | str | `rdpr_` | Prefix for database table names |
-| `DB_SAVE_BATCH_SIZE` | int | `1000` | The maximum number of all insert, update, and delete events in the database queue. This means we write a maximum of 1000 events to the file at a time (which can be very frequent). But you should also look at the timeout parameter |
+| `DB_SAVE_BATCH_SIZE` | int | `1000` | Maximum queued commands in one writer transaction; independent of domain scan membership and IP row count |
 | `DB_SAVE_BATCH_TIMEOUT` | float | `5.0` | Maximum time in seconds from the first event in a pending batch until that partial batch is flushed |
 | `DB_SHUTDOWN_TIMEOUT` | float | `20.0` | Time in seconds to wait for the database writer during shutdown. Expiry reports unresolved writes; it does not imply a successful drain |
 | `DB_TUNE_JOURNAL_MODE` | str | `WAL` | SQLite journal mode: `WAL`, `DELETE`, `TRUNCATE`, `PERSIST` or `MEMORY`. `OFF` is rejected because transactions require rollback support |
@@ -78,10 +78,10 @@ Available environment variables
 | `DB_TUNE_MMAP_SIZE` | int | `0` | Maximum database file memory mapping in bytes. `0` disables mapping; a negative value restores the SQLite build default. The effective size may be capped by SQLite or the platform |
 | `DB_TUNE_CACHE_SIZE` | int | `-2048` | If the value is negative, SQLite treats it as kibibytes; `-2048` means about 2 MiB cache. Positive values are interpreted as number of database pages. Lower values reduce RAM usage; higher values may improve performance at the cost of memory |
 | `DB_TUNE_BUSY_TIMEOUT` | int | `2000` | This is the timeout (in milliseconds) during which SQLite will retry acquiring a lock instead of immediately failing with a "database is locked" error. Defaults in SQLite to 0 (no wait). |
-| `DB_POOL_SIZE` | int | `10` | The number of connections to keep open inside the connection pool |
+| `DB_POOL_SIZE` | int | `5` | The number of connections to keep open inside the read connection pool |
 | `DB_POOL_RECYCLE` | int | `1500` | This setting causes the pool to recycle connections after the given number of seconds has passed |
 | `DB_POOL_TIMEOUT` | int | `30` | Number of seconds to wait before giving up on getting a connection from the pool |
-| `DB_POOL_SIZE_OVERFLOW` | int | `2` | The number of connections to allow in connection pool `overflow`, that is connections that can be opened above and beyond the `db_pool_size` setting, which defaults to five |
+| `DB_POOL_SIZE_OVERFLOW` | int | `0` | Maximum additional read connections above `DB_POOL_SIZE` |
 | `ATTEMPTS_LIMIT` | int | `5` | How many times a file must be checked with a negative result before it (and all its child entities) are deleted from the database |
 | `HTTPX_LOG_LEVEL` | str | `error` | HTTPX logging level |
 | `REQ_CONNECTION_RETRIES` | int | `3` | Maximum additional attempts through `httpx-retries`, subject to the named client's method, status, exception and retry-sleep policy |
@@ -109,11 +109,11 @@ Available environment variables
 | `DOH_RETRY_TOTAL_TIMEOUT` | float | `1.0` | Maximum cumulative DoH retry sleep |
 | `DOH_OPERATION_TIMEOUT` | float | `10.0` | Total budget for one DoH A or CNAME operation, including semaphore, pool, retry and response-body waits |
 | `DOMAINS_FILTERED_MIN_LEN` | int | `3` | The minimum domain length required to save it to the database. This is necessary to filter out empty domains that, for some reason, are generated in MikroTik scripts |
-| `DOMAINS_UPDATE_INTERVAL` | int | `172800` | Domain selection period. This means that if a domain has been processed, it will not be processed again until this period has passed. Specified in seconds. 172800s = 2days |
-| `DOMAINS_RESOLVE_WORKER_LIMIT` | int | `4` | Positive maximum number of domains processed concurrently within one bulk job |
+| `DOMAINS_UPDATE_INTERVAL` | int | `172800` | Seconds after a complete resolution checkpoint before automatic stale eligibility; explicit saved-ID requests bypass this interval |
+| `DOMAINS_RESOLVE_WORKER_LIMIT` | int | `4` | Positive shared maximum of saving domain operations in DNS, preparation or writer admission across new, stale and explicit requests |
 | `DOMAINS_RESOLVE_SEMAPHORE_LIMIT` | int | `20` | Positive shared limit of concurrent classic DNS and DoH A/CNAME operations, including single-domain checks |
-| `DOMAINS_RESOLVE_NEW_BATCH_SIZE` | int | `500` | Limit for sampling the number of domains that have never been processed |
-| `DOMAINS_RESOLVE_STALE_BATCH_SIZE` | int | `2000` | Limit for sampling the number of previously processed domains |
+| `DOMAINS_RESOLVE_NEW_BATCH_SIZE` | int | `500` | Legacy setting retained for configuration compatibility; automatic NEW scans now select their complete finite membership |
+| `DOMAINS_RESOLVE_STALE_BATCH_SIZE` | int | `2000` | Legacy setting retained for configuration compatibility; automatic STALE scans now select their complete finite membership |
 | `DOMAINS_BLACK_LIST` | str | `None` | Domains that should not be included in the database. Comma-separated list |
 | `LISTS_UPDATE_INTERVAL_SEC` | int | `604800` | The period after which the file must be uploaded and verified again. Specified in seconds. 604800s = 7days |
 | `IP_NOT_ALLOWED` | str | `0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4, ::/128, ::1/128, fc00::/7, fe80::/10, ff00::/8, 2001:db8::/32` | Comma-separated CIDR networks that must not be saved in the database. |
@@ -210,9 +210,11 @@ New writer connections receive the configured SQLite settings, including foreign
 cascades, before the batch transaction. A resolution command referencing a deleted domain fails its batch rather
 than creating orphan IP records; the normal terminal-failure policy then applies.
 
-Graceful shutdown closes queue admission, finishes accepted commands and the final partial batch, then releases the
-database engines. A deadline or forced cancellation reports unresolved work and retains ownership of any ongoing
-cleanup. `DB_SHUTDOWN_TIMEOUT` covers the database wait, not the total application or container shutdown time.
+Graceful shutdown first closes saving-coordinator admission and cleans up work not yet admitted to the writer.
+It then closes writer admission, finishes accepted commands and the final partial batch, and releases the database
+engines. Mandatory outcome bookkeeping remains alive through retained native cleanup before HTTP clients close.
+A deadline or forced cancellation reports unresolved work and retains ownership of any ongoing cleanup.
+`DB_SHUTDOWN_TIMEOUT` covers the database wait, not the total application or container shutdown time.
 The queue is process-local and does not recover pending commands after a crash or forced process termination.
 
 ## Shared IP ownership
@@ -240,16 +242,36 @@ the upgraded database is unsupported; reverting requires the matching previous d
 
 ## Concurrent domain processing
 
-Each nonempty new-domain or stale-domain job owns a bounded queue and up to `DOMAINS_RESOLVE_WORKER_LIMIT`
-asynchronous workers. A worker processes a whole domain through DNS, address preparation and writer admission.
-The batch-size settings control how many domains are selected; the worker limit controls how many are in progress.
-`DOMAINS_RESOLVE_SEMAPHORE_LIMIT` separately limits DNS/DoH A/CNAME operations across bulk and single-domain work.
-RIPEstat retains its own shared limit. Waiting for either bounded queue applies backpressure to the producers.
+One application-owned coordinator shares `DOMAINS_RESOLVE_WORKER_LIMIT` workers across new-domain, stale-domain and
+explicit saved-ID resolution. A worker handles DNS, address preparation and writer admission, then becomes available
+without waiting for commit. `DOMAINS_RESOLVE_SEMAPHORE_LIMIT` independently limits DNS/DoH A/CNAME operations across
+all entrypoints, including checks without saving. RIPEstat retains its separate shared limit.
 
-Normal completion waits for all domain workers. Cancellation and terminal writer-admission failures stop admission
-and await the producer, workers and nested queries before releasing the job reservation. Unstarted work remains
-unstarted, and every later job receives a fresh queue. Already admitted database commands remain owned by the
-single writer; completion of domain processing does not establish that those commands have committed.
+Accepting NEW demand pauses subsequent STALE dispatch, including during selection. Already started STALE operations
+finish normally; free workers take ready NEW work. Explicit saved-ID requests have the same priority, even for a
+recently resolved domain. Each accepted explicit request receives a distinct fresh attempt. Attempts for the same ID
+are serial; another ready NEW domain can run while that ID waits for its predecessor's known writer outcome.
+Checks without saving use an independent request path. Neither switching priority nor finishing a pass waits for
+all STALE commits. Continuous NEW demand can postpone STALE work indefinitely.
+
+Each automatic pass reads its entire finite eligible membership in stable order as lightweight detached records.
+Results, IP snapshots and endpoint tasks are created when processing starts. Snapshot and ownership metadata use
+O(N) memory; they are not a constant-memory stream. The legacy NEW/STALE batch-size settings no longer cap a pass.
+`DB_SAVE_BATCH_SIZE` controls writer commands per transaction, `DOMAINS_UPDATE_INTERVAL` controls stale freshness,
+and the worker and semaphore limits control different levels of concurrency.
+
+A repeated NEW trigger after membership capture records one pending successor; repeated mass triggers coalesce.
+The successor takes its snapshot after the current NEW list finishes processing/admission, without waiting for all
+commits. At most one current and one pending NEW pass are retained. Domains committed after capture need a later
+trigger. Repeated active STALE requests retain the already-active
+response. Active or pending-write domains and real attempts crossing selection/adoption are excluded from duplicate
+automatic work. A cancelled reservation alone is not coverage. Unknown write outcomes retain domain ownership;
+there is no TTL-based release or automatic replay.
+
+Cancellation awaits nested preadmission cleanup and preserves work needed by other interests. HTTP acceptance
+transfers work to the coordinator, so client disconnection does not remove an accepted request. Writer-admitted
+commands remain owned by the database. Terminal writer failure stops saving dispatch and fails pending obligations,
+while retaining unknown-outcome ownership. Processing completion does not establish commit or crash durability.
 
 ## DNS configuration during resolution
 
@@ -318,7 +340,9 @@ credentials and run IDs are not metric labels. CNAME `no_alias` does not prove a
 
 Run processing outcomes are `success`, `partial`, `failure` and actual processing cancellation. Confirmed absence
 of addresses is successful evidence. Partial evidence remains partial even when no new addresses require a write.
-Admission failure is separate from an already established processing result. Best-effort CNAME discovery and RIPEstat
+Admission failure is separate from an already established processing result. Automatic coverage by another attempt
+does not create another physical attempt or commit; explicit operations retain the `stored` metric origin even with
+NEW priority. Best-effort CNAME discovery and RIPEstat
 fallback have their own observations.
 
 Persistence fields distinguish `admitted`, `pending`, `confirmed`, `known_not_committed` and `unknown`, plus rejected

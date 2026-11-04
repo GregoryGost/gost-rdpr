@@ -1,22 +1,25 @@
 from asyncio import (
   CancelledError,
-  Queue,
-  QueueShutDown,
+  Event,
   Semaphore,
+  Task,
   TaskGroup,
   create_task,
+  current_task,
   gather,
   shield,
+  sleep,
   timeout,
 )
 from base64 import urlsafe_b64encode
+from collections import deque
 from collections.abc import AsyncGenerator, Coroutine, Sequence
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from ipaddress import IPv4Address, IPv4Network, ip_address, ip_network
-from math import ceil
 from time import perf_counter
-from typing import Any, Dict, List, Literal, Self
+from typing import Any, Literal, Self
 
 from dns.asyncresolver import Resolver
 from dns.exception import DNSException
@@ -52,14 +55,14 @@ from models.dto.domains_dto import (
   DnsQueryOutcome,
   DnsQueryStatus,
   DnsServerResolveResultDto,
+  DomainCandidate,
   DomainResult,
   ProcessingOutcome,
 )
 from models.dto.ip_record_dto import IpRecordDto
-from models.dto.queue_dto import notify_observation
+from models.dto.queue_dto import WriteOutcome, WriteReceipt, notify_observation
 from models.http.dns_servers_resp import DnsElementResp
 from models.http.domains_req import DomainsPostElementReq
-from models.http.domains_resp import DomainElementResp
 from utils.utils import check_ip_allow, get_ip_network_address, get_ip_version
 
 type _DnsServersSnapshot = tuple[tuple[DnsServerDto, ...], tuple[DnsServerDto, ...]]
@@ -96,8 +99,7 @@ async def _gather_owned[T](operations: Sequence[Coroutine[Any, Any, T]]) -> list
 
     async def finish_siblings() -> None:
       await gather(*tasks, return_exceptions=True)
-      if group.done() and not group.cancelled():
-        group.exception()
+      await gather(group, return_exceptions=True)
 
     # A later cancellation must not interrupt siblings already running their cleanup.
     await _await_owned(finish_siblings(), cancel_on_cancel=False)
@@ -109,6 +111,8 @@ class _DefaultDnsContext:
 
   timeout: float
   lifetime: float
+  dns_budget: float = field(default_factory=lambda: settings.dns_operation_timeout)
+  doh_budget: float = field(default_factory=lambda: settings.doh_operation_timeout)
   resolvers: dict[str, Resolver] = field(default_factory=dict)
 
   def resolver_for(self, server: str) -> Resolver:
@@ -120,6 +124,9 @@ class _DefaultDnsContext:
       resolver.lifetime = self.lifetime
       self.resolvers[server] = resolver
     return resolver
+
+
+_saving_dns_context: ContextVar[_DefaultDnsContext | None] = ContextVar('saving_dns_context', default=None)
 
 
 class _DnsResponseError(ValueError):
@@ -307,7 +314,10 @@ class DomainsResolver:
       except DatabaseWriteError:
         raise
       except Exception as err:
-        logger.warning(f'[{err.__class__.__name__}]: additional CNAME discovery failed')
+        logger.warning(
+          f'[{err.__class__.__name__}]: additional CNAME discovery failed',
+          exc_info=RuntimeError('Additional CNAME discovery failed'),
+        )
       statuses = {outcome.status for outcome in outcomes}
       complete = bool(outcomes) and statuses in ({DnsQueryStatus.ADDRESSES}, {DnsQueryStatus.ABSENT})
       domain.result.A = sorted(
@@ -322,7 +332,7 @@ class DomainsResolver:
         notify_observation(domain.observation, domain.processing_outcome, perf_counter())
         return
       # Ips processing for domain
-      current_ips: List[IpRecordDto] = await db.get_all_ips_for_domain(domain_id=domain.id)
+      current_ips: list[IpRecordDto] = await db.get_all_ips_for_domain(domain_id=domain.id)
       domain.resolution_complete = complete
       # add new ips, remove not resolved ips but current exists
       await self.__ips_processing(domain=domain, current_ips=current_ips)
@@ -351,7 +361,10 @@ class DomainsResolver:
       if domain.processing_outcome is None:
         domain.processing_outcome = ProcessingOutcome.FAILURE
       notify_observation(domain.observation, domain.processing_outcome, perf_counter())
-      logger.error(f'[{err.__class__.__name__}]: domain resolving cycle failed')
+      logger.error(
+        f'[{err.__class__.__name__}]: domain resolving cycle failed',
+        exc_info=RuntimeError('Domain resolving cycle failed'),
+      )
 
   async def __persist_cnames(self: Self, cnames: list[DomainsPostElementReq]) -> None:
     try:
@@ -359,7 +372,10 @@ class DomainsResolver:
     except DatabaseWriteError:
       raise
     except Exception as err:
-      logger.warning(f'[{err.__class__.__name__}]: CNAME discovery could not be queued')
+      logger.warning(
+        f'[{err.__class__.__name__}]: CNAME discovery could not be queued',
+        exc_info=RuntimeError('CNAME discovery could not be queued'),
+      )
 
   async def __resolve_server(
     self: Self,
@@ -435,7 +451,13 @@ class DomainsResolver:
     wait_started = perf_counter()
     acquired = False
     measurement = dict(outcome='failure', reason='none')
-    deadline = timeout(settings.doh_operation_timeout if transport == 'doh' else settings.dns_operation_timeout)
+    context = _saving_dns_context.get()
+    budget = (
+      (context.doh_budget if transport == 'doh' else context.dns_budget)
+      if context is not None
+      else (settings.doh_operation_timeout if transport == 'doh' else settings.dns_operation_timeout)
+    )
+    deadline = timeout(budget)
     try:
       async with deadline, self.__semaphore:
         acquired = True
@@ -483,6 +505,7 @@ class DomainsResolver:
         except _DnsResponseError as err:
           reason = str(err)
         except Exception as err:
+          logger.debug('DNS query failed', exc_info=RuntimeError('DNS query failed'))
           reason = err.__class__.__name__
         measurement.update(reason=reason)
         return DnsQueryOutcome(dns_server.server, 'doh', lookup_type, DnsQueryStatus.FAILURE, reason=reason)
@@ -506,6 +529,7 @@ class DomainsResolver:
         except _DnsResponseError as err:
           reason = str(err)
         except Exception as err:
+          logger.debug('DNS query failed', exc_info=RuntimeError('DNS query failed'))
           reason = err.__class__.__name__
         measurement.update(reason=reason)
         return DnsQueryOutcome(dns_server.server, 'classic', lookup_type, DnsQueryStatus.FAILURE, reason=reason)
@@ -513,7 +537,7 @@ class DomainsResolver:
       return DnsQueryOutcome(dns_server.server, 'classic', lookup_type, DnsQueryStatus.FAILURE, reason='timeout')
 
   async def __cname_doh_resolver(
-    self: Self, domain: DomainResult, dns_server: DnsServerDto, cname_domains: List[DomainsPostElementReq]
+    self: Self, domain: DomainResult, dns_server: DnsServerDto, cname_domains: list[DomainsPostElementReq]
   ) -> None:
     try:
       async with self.__dns_observation(dns_server, 'doh', 'CNAME') as measurement:
@@ -524,7 +548,10 @@ class DomainsResolver:
           cname_domains.extend(DomainsPostElementReq(domain=cname, list_id=domain.list_id) for cname in cnames)
         except Exception as err:
           measurement.update(reason=str(err) if isinstance(err, _DnsResponseError) else type(err).__name__)
-          logger.debug(f'[{err.__class__.__name__}]: DoH CNAME discovery failed')
+          logger.debug(
+            f'[{err.__class__.__name__}]: DoH CNAME discovery failed',
+            exc_info=RuntimeError('DoH CNAME discovery failed'),
+          )
     except TimeoutError:
       logger.debug('CNAME discovery operation timed out')
 
@@ -532,7 +559,7 @@ class DomainsResolver:
     self: Self,
     domain: DomainResult,
     dns_server: DnsServerDto,
-    cname_domains: List[DomainsPostElementReq],
+    cname_domains: list[DomainsPostElementReq],
     dns_context: _DefaultDnsContext | None = None,
   ) -> None:
     try:
@@ -544,7 +571,10 @@ class DomainsResolver:
           cname_domains.extend(DomainsPostElementReq(domain=cname, list_id=domain.list_id) for cname in cnames)
         except Exception as err:
           measurement.update(reason=str(err) if isinstance(err, _DnsResponseError) else type(err).__name__)
-          logger.debug(f'[{err.__class__.__name__}]: classic CNAME discovery failed')
+          logger.debug(
+            f'[{err.__class__.__name__}]: classic CNAME discovery failed',
+            exc_info=RuntimeError('Classic CNAME discovery failed'),
+          )
     except TimeoutError:
       logger.debug('CNAME discovery operation timed out')
 
@@ -580,7 +610,7 @@ class DomainsResolver:
   # IPS
 
   @staticmethod
-  def __get_current_cidr_for_resolved_ip(resolved_ip: str, current_ip_records: List[IpRecordDto]) -> str | None:
+  def __get_current_cidr_for_resolved_ip(resolved_ip: str, current_ip_records: list[IpRecordDto]) -> str | None:
     for record in current_ip_records:
       if '/' not in record.ip_address:
         continue
@@ -588,7 +618,7 @@ class DomainsResolver:
         return record.ip_address
     return None
 
-  async def __get_ip_address_for_storage(self: Self, resolved_ip: str, current_ip_records: List[IpRecordDto]) -> str:
+  async def __get_ip_address_for_storage(self: Self, resolved_ip: str, current_ip_records: list[IpRecordDto]) -> str:
     parsed_ip = ip_address(resolved_ip)
 
     if not isinstance(parsed_ip, IPv4Address) or not parsed_ip.is_global:
@@ -653,15 +683,15 @@ class DomainsResolver:
       )
       return resolved_ip
 
-  async def __ips_processing(self: Self, domain: DomainResult, current_ips: List[IpRecordDto]) -> None:
+  async def __ips_processing(self: Self, domain: DomainResult, current_ips: list[IpRecordDto]) -> None:
     logger.debug(f'IP prepare for {domain.name}')
     logger.debug(f'{domain=}, {current_ips=}')
     try:
-      resolved_ips: List[str] = list(dict.fromkeys(str(IPv4Address(address)) for address in domain.result.A))
-      current_ips_by_network_address: Dict[str, List[IpRecordDto]] = {}
-      desired_ips_by_network_address: Dict[str, IpRecordDto] = {}
-      new_ips: List[IpRecordDto] = []
-      remove_ips: List[IpRecordDto] = []
+      resolved_ips: list[str] = list(dict.fromkeys(str(IPv4Address(address)) for address in domain.result.A))
+      current_ips_by_network_address: dict[str, list[IpRecordDto]] = {}
+      desired_ips_by_network_address: dict[str, IpRecordDto] = {}
+      new_ips: list[IpRecordDto] = []
+      remove_ips: list[IpRecordDto] = []
 
       for record in current_ips:
         if get_ip_version(record.ip_address) != 4:
@@ -738,114 +768,27 @@ class DomainsResolver:
     except Exception as err:
       raise err
 
-  async def domains_resolve(self: Self, job_mode: Jobs) -> None:
-    """Resolve a selected batch with job-local bounded admission and owned workers."""
-    run = ResolutionRun('new' if job_mode == Jobs.DOMAINS_RESOLVE_NEW else 'stale')
-    normal = False
-    logger.info(f'Domains resolve mode={job_mode} - START')
+  async def domains_resolve(self, job_mode: Jobs) -> None:
+    """Wait for this caller's automatic pass without owning other interests."""
+    await saving_coordinator.resolve_scan(job_mode, self)
+
+  async def saving_dns_snapshot(self) -> _DnsServersSnapshot:
+    """Capture immutable DNS rows for one saving operation."""
+    return await self.__dns_snapshot()
+
+  async def process_saving_domain(
+    self, domain: DomainResult, servers: _DnsServersSnapshot, context: _DefaultDnsContext
+  ) -> None:
+    """Run the existing DNS evidence and immutable writer preparation flow."""
+    context_token = _saving_dns_context.set(context)
     try:
-      await _await_owned(self.__resolve_batch(job_mode, run))
-      normal = True
-    except DnsConfigurationReadError:
-      logger.error('Domains resolve could not read DNS configuration')
-      raise
-    except DatabaseWriteError:
-      logger.error('Domains resolve writer admission failed')
-      raise
-    except Exception as err:
-      logger.error(f'Try Domains resolve mode={job_mode} failed [{err.__class__.__name__}] : {err}', exc_info=True)
+      await self.__dns_main_tasker(domain, servers[0], servers[1], dns_context=context)
     finally:
-      await _await_owned(self.__finish_job(run, normal), cancel_on_cancel=False)
-
-  @staticmethod
-  async def __finish_job(run: ResolutionRun, normal: bool) -> None:
-    try:
-      run.finish(normal)
-    finally:
-      await job_registry.finish(Jobs.DOMAINS_RESOLVE)
-
-  async def __resolve_batch(self, job_mode: Jobs, run: ResolutionRun) -> None:
-    match job_mode:
-      case Jobs.DOMAINS_RESOLVE_NEW:
-        domains = await db.get_new_domains_for_resolve()
-      case Jobs.DOMAINS_RESOLVE_STALE:
-        domains = await db.get_stale_domains_for_resolve()
-      case _:
-        raise ValueError(f'Unknown domains resolve job_mode:{job_mode}')
-    count_all = len(domains)
-    run.select(count_all)
-    for domain in domains:
-      domain.observation = run.observe()
-    if not domains:
-      logger.info(f'Domains resolve mode={job_mode} - Not found domains for resolve. DONE')
-      return
-
-    # Configuration and resolver settings are fixed before producer/worker admission.
-    dns_servers = await self.__dns_snapshot()
-    dns_context = _DefaultDnsContext(settings.dns_timeout, settings.dns_lifetime)
-    queue: Queue[DomainResult] = Queue(maxsize=settings.queue_max_size)
-    worker_count = min(settings.domains_resolve_worker_limit, count_all)
-    log_every = max(1, ceil(count_all / max(1, settings.resolve_domains_log_every)))
-    processed = 0
-
-    async def produce() -> None:
-      for domain in domains:
-        await self.__put_domain(queue, domain)
-      queue.shutdown()
-
-    async def consume() -> None:
-      nonlocal processed
-      while True:
-        try:
-          domain = await queue.get()
-        except QueueShutDown:
-          return
-        try:
-          if domain.admitted_at is not None:
-            observe_duration(queue_duration, domain.admitted_at, queue='resolve', phase='residence', outcome='dequeued')
-            domain.admitted_at = None
-          notify_observation(domain.observation, 'processing_started', perf_counter())
-          await self.__dns_main_tasker(domain, dns_servers[0], dns_servers[1], dns_context=dns_context)
-        except CancelledError:
-          if domain.processing_outcome is None:
-            domain.processing_outcome = ProcessingOutcome.CANCELLED
-          raise
-        except DatabaseWriteError:
-          raise
-        except Exception as err:
-          logger.error(f'Unexpected error in flow - Resolve domains : {err}', exc_info=True)
-        finally:
-          try:
-            self.__finish_domain_observation(domain)
-          finally:
-            queue.task_done()
-          processed += 1
-          if processed % log_every == 0 or processed == count_all:
-            logger.info(f'Domains attempted: {processed}, residue: {count_all - processed}')
-
-    try:
-      await _gather_owned([produce(), *(consume() for _ in range(worker_count))])
-    finally:
-      # Abandoned work is local to this job and must never wait for cancelled consumers.
-      queue.shutdown(immediate=True)
-    logger.info(f'Domains resolve mode={job_mode} - DONE')
-
-  @staticmethod
-  async def __put_domain(queue: Queue[DomainResult], domain: DomainResult) -> None:
-    started = perf_counter()
-    outcome = 'rejected'
-    try:
-      await queue.put(item=domain)
-      domain.admitted_at = perf_counter()
-      outcome = 'admitted'
-    except CancelledError:
-      outcome = 'cancelled'
-      raise
-    finally:
-      observe_duration(queue_duration, started, queue='resolve', phase='admission', outcome=outcome)
+      _saving_dns_context.reset(context_token)
+      self.__finish_domain_observation(domain)
 
   async def resolve_once(
-    self: Self, domain_name: str, selected_dns_servers: List[DnsElementResp] | None = None
+    self: Self, domain_name: str, selected_dns_servers: list[DnsElementResp] | None = None
   ) -> CheckDomainResultDto:
     """Resolve configured endpoints in order and await their cleanup before returning."""
     return await _await_owned(self.__resolve_once(domain_name, selected_dns_servers))
@@ -857,8 +800,8 @@ class DomainsResolver:
     if not name:
       raise ValueError('Domain name must not be empty')
     #
-    default_dns_servers: List[DnsServerDto] = []
-    doh_dns_servers: List[DnsServerDto] = []
+    default_dns_servers: list[DnsServerDto] = []
+    doh_dns_servers: list[DnsServerDto] = []
     if selected_dns_servers is None:
       default_dns_servers, doh_dns_servers = await db.get_dns_servers_for_resolve()
     else:
@@ -884,46 +827,750 @@ class DomainsResolver:
     #
     return CheckDomainResultDto(domain=name, results=results)
 
-  async def resolve_stored_domain(self: Self, domain_id: int) -> None:
-    """Resolve one stored domain and retain all work through cancellation cleanup."""
-    await _await_owned(self.__resolve_stored_domain(domain_id))
+  async def resolve_stored_domain(self, domain_id: int) -> None:
+    """Wait for one distinct saved-ID operation and retain cancellation cleanup."""
+    await saving_coordinator.resolve_stored(domain_id, self)
 
-  async def __resolve_stored_domain(self, domain_id: int) -> None:
-    run = ResolutionRun('stored')
-    domain: DomainResult | None = None
-    normal = False
-    logger.info(f'Immediate resolving stored domain ID={domain_id} - START')
+
+@dataclass(eq=False, slots=True)
+class _SavingPass:
+  mode: Jobs
+  resolver: DomainsResolver
+  detached: bool
+  run: ResolutionRun
+  done: Event = field(default_factory=Event)
+  callers: int = 0
+  servers: _DnsServersSnapshot | None = None
+  context: _DefaultDnsContext | None = None
+  remaining: int = 0
+  adopted: bool = False
+  finished: bool = False
+  cancelled: bool = False
+  error: BaseException | None = None
+
+
+@dataclass(eq=False, slots=True)
+class _SavingOperation:
+  token: int
+  domain_id: int
+  resolver: DomainsResolver
+  candidate: DomainCandidate | None = None
+  source: _SavingPass | None = None
+  interests: list[_SavingPass] = field(default_factory=list)
+  explicit: bool = False
+  capacity_reserved: bool = False
+  stored: bool = False
+  detached: bool = False
+  priority: bool = False
+  started: bool = False
+  attempted: bool = False
+  processed: bool = False
+  cancelled: bool = False
+  task: Task[None] | None = None
+  receipt: WriteReceipt | None = None
+  done: Event | None = None
+  error: BaseException | None = None
+  queued_at: float | None = None
+
+
+@dataclass(slots=True)
+class _SelectionTicket:
+  generation: int
+  attempted: set[int]
+  changed: set[int] = field(default_factory=set)
+
+
+class SavingCoordinator:
+  """Own saving priority, finite scan membership and per-ID physical lifecycles.
+
+  Control transitions contain no awaits. SQL, DNS, admission and cleanup run
+  outside those transitions, so request registration never waits for them.
+  """
+
+  def __init__(self) -> None:
+    self._running = False
+    self._stopping = False
+    self._failure: BaseException | None = None
+    self._generation = 0
+    self._token = 0
+    self._owners: dict[int, list[_SavingOperation]] = {}
+    self._priority: deque[_SavingOperation] = deque()
+    self._stale: deque[_SavingOperation] = deque()
+    self._priority_waiting = 0
+    self._explicit_count = 0
+    self._passes: set[_SavingPass] = set()
+    self._scans: deque[_SavingPass] = deque()
+    self._new_request: _SavingPass | None = None
+    self._current_new: _SavingPass | None = None
+    self._ticket: _SelectionTicket | None = None
+    self._receipts: dict[int, _SavingOperation] = {}
+    self._active: dict[int, _SavingOperation] = {}
+    self._workers: list[Task[None]] = []
+    self._scan_task: Task[None] | None = None
+    self._capture_task: Task[None] | None = None
+    self._capturing: _SavingPass | None = None
+    self._bookkeeping_task: Task[None] | None = None
+    self._ready = Event()
+    self._scan_ready = Event()
+    self._outcomes = Event()
+    self._capacity = Event()
+    self._idle = Event()
+
+  async def start(self) -> None:
+    """Start one configured worker pool after the database writer is ready."""
+    if self._running:
+      self._check_open()
+      return
+    if self._owners:
+      raise DatabaseWriteError('Saving coordinator retains unresolved domain ownership')
+    self._stopping = False
+    self._failure = None
+    self._ready = Event()
+    self._scan_ready = Event()
+    self._outcomes = Event()
+    self._capacity = Event()
+    self._idle = Event()
+    self._idle.set()
+    self._running = True
+    db.register_writer_failure_wakeup(self._outcomes)
+    self._workers = [create_task(self._worker()) for _ in range(settings.domains_resolve_worker_limit)]
+    self._scan_task = create_task(self._scan_loop())
+    self._bookkeeping_task = create_task(self._bookkeep())
+    self._check_open()
+
+  def _check_open(self) -> None:
+    failure = self._failure or db.writer_failure
+    if failure is not None:
+      raise DatabaseWriteError('Saving coordinator stopped after database writer failure') from failure
+    if self._stopping:
+      raise DatabaseWriteError('Saving coordinator is stopping')
+
+  def _changed(self, domain_id: int) -> None:
+    self._generation += 1
+    if self._ticket is not None:
+      self._ticket.changed.add(domain_id)
+
+  @staticmethod
+  def _finish_residence(operation: _SavingOperation, outcome: str) -> None:
+    if operation.queued_at is not None:
+      observe_duration(queue_duration, operation.queued_at, queue='resolve', phase='residence', outcome=outcome)
+      operation.queued_at = None
+
+  def _queue(self, operation: _SavingOperation) -> None:
+    if operation.queued_at is None:
+      operation.queued_at = perf_counter()
+    (self._priority if operation.priority else self._stale).append(operation)
+    self._ready.set()
+    self._idle.clear()
+
+  def _register_scan(self, mode: Jobs, resolver: DomainsResolver, detached: bool) -> _SavingPass | None:
+    self._check_open()
+    if mode not in {Jobs.DOMAINS_RESOLVE_NEW, Jobs.DOMAINS_RESOLVE_STALE}:
+      raise ValueError(f'Unknown domains resolve mode: {mode}')
+    if mode == Jobs.DOMAINS_RESOLVE_STALE and any(item.mode == mode for item in self._passes):
+      return None
+    if mode == Jobs.DOMAINS_RESOLVE_NEW and self._new_request is not None:
+      self._new_request.detached |= detached
+      self._new_request.callers += int(not detached)
+      return self._new_request
+    operation = _SavingPass(
+      mode, resolver, detached, ResolutionRun('new' if mode == Jobs.DOMAINS_RESOLVE_NEW else 'stale')
+    )
+    operation.callers = int(not detached)
+    self._passes.add(operation)
+    self._scans.append(operation)
+    if mode == Jobs.DOMAINS_RESOLVE_NEW:
+      self._new_request = operation
+    self._idle.clear()
+    self._scan_ready.set()
+    self._ready.set()
+    return operation
+
+  async def submit_scan(self, mode: Jobs, resolver: DomainsResolver | None = None) -> bool:
+    """Register HTTP-owned demand before returning acceptance; active STALE returns false."""
+    await self.start()
+    accepted = self._register_scan(mode, resolver or DomainsResolver(), True) is not None
+    if accepted:
+      await job_registry.try_start(Jobs.DOMAINS_RESOLVE)
+    return accepted
+
+  async def resolve_scan(self, mode: Jobs, resolver: DomainsResolver) -> None:
+    """Wait for a caller-owned pass; cancellation removes only that pass's interest."""
+    await self.start()
+    operation = self._register_scan(mode, resolver, False)
+    if operation is None:
+      return
+    await job_registry.try_start(Jobs.DOMAINS_RESOLVE)
     try:
-      domain_record: DomainElementResp | None = await db.get_domain_on_id(id=domain_id)
-      if domain_record is None:
-        logger.warning(f'Domain ID={domain_id} not found for resolving')
-        normal = True
-        return
-      domain = DomainResult(id=domain_record.id, name=domain_record.name, list_id=domain_record.domains_list_id)
-      run.select(1)
-      domain.observation = run.observe()
-      notify_observation(domain.observation, 'processing_started', perf_counter())
-      #
-      default_dns, doh_dns = await self.__dns_snapshot()
-      if not default_dns and not doh_dns:
-        raise RuntimeError('DNS servers for resolve not found')
-      #
-      await self.__dns_main_tasker(domain=domain, default_dns_servers=default_dns, doh_dns_servers=doh_dns)
-      normal = True
+      await operation.done.wait()
+      if operation.error is not None:
+        raise operation.error
     except CancelledError:
-      if domain is not None and domain.processing_outcome is None:
-        domain.processing_outcome = ProcessingOutcome.CANCELLED
+      operation.callers -= 1
+      if not operation.detached and not operation.callers:
+        await _await_owned(self._cancel_pass(operation), cancel_on_cancel=False)
       raise
-    except DnsConfigurationReadError:
-      logger.error('Stored domain resolve could not read DNS configuration')
+    finally:
+      if not self._passes:
+        await _await_owned(self._finish_activity(), cancel_on_cancel=False)
+
+  async def _register_stored(self, domain_id: int, resolver: DomainsResolver, detached: bool) -> _SavingOperation:
+    started = perf_counter()
+    outcome = 'rejected'
+    try:
+      operation = await self._accept_stored(domain_id, resolver, detached)
+      outcome = 'admitted'
+      return operation
+    except CancelledError:
+      outcome = 'cancelled'
       raise
-    except DatabaseWriteError:
-      logger.error('Stored domain resolve writer admission failed')
+    finally:
+      observe_duration(queue_duration, started, queue='resolve', phase='admission', outcome=outcome)
+
+  async def _accept_stored(self, domain_id: int, resolver: DomainsResolver, detached: bool) -> _SavingOperation:
+    await self.start()
+    while self._explicit_count >= settings.queue_max_size:
+      self._capacity.clear()
+      self._check_open()
+      await self._capacity.wait()
+    self._check_open()
+    self._explicit_count += 1
+    self._idle.clear()
+    self._token += 1
+    owners = self._owners.get(domain_id)
+    if owners and not owners[0].started and not owners[0].explicit and not owners[0].priority:
+      # Preserve the automatic interest, but give the replacement a fresh token
+      # and stored origin. Promotion itself is never actual-attempt evidence.
+      operation = owners[0]
+      self._finish_residence(operation, 'promoted')
+      operation.token = self._token
+      operation.resolver = resolver
+      operation.candidate = None
+      operation.explicit = True
+      operation.capacity_reserved = True
+      operation.stored = True
+      operation.detached = detached
+      operation.priority = True
+      operation.done = Event()
+      self._priority_waiting += 1
+      self._changed(domain_id)
+      self._queue(operation)
+    else:
+      operation = _SavingOperation(
+        self._token,
+        domain_id,
+        resolver,
+        explicit=True,
+        capacity_reserved=True,
+        stored=True,
+        detached=detached,
+        priority=True,
+        done=Event(),
+      )
+      self._priority_waiting += 1
+      if owners is None:
+        self._owners[domain_id] = [operation]
+        self._queue(operation)
+      else:
+        operation.queued_at = perf_counter()
+        owners.append(operation)
+      self._changed(domain_id)
+    self._ready.set()
+    return operation
+
+  async def submit_stored(self, domain_id: int, resolver: DomainsResolver | None = None) -> None:
+    """Accept one distinct saved-ID operation with bounded explicit backpressure."""
+    await self._register_stored(domain_id, resolver or DomainsResolver(), True)
+
+  async def resolve_stored(self, domain_id: int, resolver: DomainsResolver) -> None:
+    """Wait for processing/admission; writer-admitted work remains database-owned."""
+    operation = await self._register_stored(domain_id, resolver, False)
+    try:
+      if operation.done is not None:
+        await operation.done.wait()
+      if operation.error is not None:
+        raise operation.error
+    except CancelledError:
+      operation.detached = False
+      operation.explicit = False
+      await _await_owned(self._cancel_unneeded(operation), cancel_on_cancel=False)
+      raise
+
+  def _has_priority(self) -> bool:
+    return (
+      self._priority_waiting > 0
+      or any(operation.priority and not operation.processed for operation in self._active.values())
+      or any(item.mode == Jobs.DOMAINS_RESOLVE_NEW and not item.adopted and not item.cancelled for item in self._passes)
+    )
+
+  def _take(self) -> _SavingOperation | None:
+    for queue in (self._priority, self._stale):
+      if queue is self._stale and self._has_priority():
+        break
+      while queue:
+        operation = queue.popleft()
+        owners = self._owners.get(operation.domain_id)
+        if (
+          operation.cancelled
+          or operation.started
+          or not owners
+          or owners[0] is not operation
+          or (queue is self._stale and operation.priority)
+        ):
+          continue
+        self._finish_residence(operation, 'dequeued')
+        operation.started = True
+        self._active[operation.token] = operation
+        self._changed(operation.domain_id)
+        return operation
+    return None
+
+  async def _worker(self) -> None:
+    while not self._stopping and self._failure is None:
+      operation = self._take()
+      if operation is None:
+        self._ready.clear()
+        await self._ready.wait()
+        continue
+      operation.task = create_task(self._execute(operation))
+      try:
+        await gather(operation.task, return_exceptions=True)
+      finally:
+        # A child cancelled before its first step cannot run its own finally.
+        self._finish_operation(operation)
+
+  async def _execute(self, operation: _SavingOperation) -> None:
+    domain: DomainResult | None = None
+    run: ResolutionRun | None = None
+    try:
+      self._check_open()
+      if operation.stored:
+        candidate = await db.get_domain_candidate_for_resolve(operation.domain_id)
+        servers = await operation.resolver.saving_dns_snapshot() if candidate is not None else None
+        context = _DefaultDnsContext(settings.dns_timeout, settings.dns_lifetime)
+      else:
+        candidate = operation.candidate
+        source = operation.source
+        servers = source.servers if source is not None else None
+        context = source.context if source is not None else None
+      self._check_open()
+      if operation.cancelled:
+        return
+      if candidate is None:
+        if operation.interests:
+          operation.error = DatabaseWriteError('Domain disappeared before its saving attempt')
+        return
+      if servers is None or context is None:
+        raise DnsConfigurationReadError('Cannot read DNS configuration')
+      domain = DomainResult(id=candidate.id, name=candidate.name, list_id=candidate.list_id)
+      run = ResolutionRun('stored') if operation.stored else operation.source.run if operation.source else None
+      if run is not None:
+        if operation.stored:
+          run.select(1)
+        domain.observation = run.observe()
+      operation.receipt = domain.write_receipt = WriteReceipt()
+      operation.receipt.add_wakeup(self._outcomes)
+      self._receipts[operation.token] = operation
+      # This transition precedes real resolution with no await between them.
+      operation.attempted = True
+      self._release_capacity(operation)
+      if operation.priority:
+        self._priority_waiting -= 1
+      self._ready.set()
+      if self._ticket is not None:
+        self._ticket.attempted.add(operation.domain_id)
+      self._changed(operation.domain_id)
+      for interest in operation.interests:
+        interest.run.cover()
+      notify_observation(domain.observation, 'processing_started', perf_counter())
+      await operation.resolver.process_saving_domain(domain, servers, context)
+    except CancelledError:
+      operation.error = operation.error or CancelledError()
       raise
     except Exception as err:
-      normal = domain is not None
-      logger.error(f'Resolving domain ID={domain_id} failed: [{err.__class__.__name__}]: {err}', exc_info=True)
+      operation.error = err
+      if isinstance(err, DatabaseWriteError):
+        self._fail(err)
+      logger.error(
+        'Saving domain operation failed [%s]', type(err).__name__, exc_info=RuntimeError('Saving operation failed')
+      )
     finally:
-      if domain is not None:
-        self.__finish_domain_observation(domain)
-      run.finish(normal)
+      if run is not None and operation.stored:
+        run.finish(operation.error is None)
+      self._finish_operation(operation)
+
+  def _finish_operation(self, operation: _SavingOperation) -> None:
+    """Finalize a terminated physical task once, including cancellation before entry."""
+    if operation.processed:
+      return
+    if operation.task is not None and operation.task.cancelled():
+      operation.error = operation.error or CancelledError()
+    if operation.priority and not operation.attempted and not self._failure:
+      self._priority_waiting -= 1
+    operation.processed = True
+    self._release_capacity(operation)
+    self._active.pop(operation.token, None)
+    self._complete_interests(operation)
+    if operation.done is not None:
+      operation.done.set()
+    self._release_known(operation)
+    self._ready.set()
+    self._outcomes.set()
+    self._update_idle()
+
+  def _complete_interests(self, operation: _SavingOperation) -> None:
+    for interest in tuple(operation.interests):
+      if operation.error is not None:
+        interest.error = interest.error or operation.error
+      interest.remaining -= 1
+      self._finish_pass(interest)
+    operation.interests.clear()
+
+  def _release_capacity(self, operation: _SavingOperation) -> None:
+    if operation.capacity_reserved:
+      operation.capacity_reserved = False
+      self._explicit_count -= 1
+      self._capacity.set()
+
+  def _release_known(self, operation: _SavingOperation) -> None:
+    if not operation.processed:
+      return
+    receipt = operation.receipt
+    if (
+      receipt is not None
+      and receipt.admitted
+      and receipt.outcome not in {WriteOutcome.CONFIRMED, WriteOutcome.KNOWN_NOT_COMMITTED}
+    ):
+      return
+    self._finish_residence(operation, 'cancelled')
+    self._receipts.pop(operation.token, None)
+    if receipt is not None:
+      receipt.remove_wakeup(self._outcomes)
+    owners = self._owners.get(operation.domain_id)
+    if not owners or owners[0] is not operation:
+      return
+    owners.pop(0)
+    self._changed(operation.domain_id)
+    self._release_capacity(operation)
+    if owners:
+      if not self._stopping and self._failure is None:
+        self._queue(owners[0])
+    else:
+      del self._owners[operation.domain_id]
+    self._ready.set()
+
+  async def _scan_loop(self) -> None:
+    while not self._stopping and self._failure is None:
+      if not self._scans or (self._new_request is not None and self._current_new is not None):
+        self._scan_ready.clear()
+        await self._scan_ready.wait()
+        continue
+      # A pending NEW capture precedes any not-yet-started STALE capture.
+      operation = next((item for item in self._scans if item.mode == Jobs.DOMAINS_RESOLVE_NEW), self._scans[0])
+      self._scans.remove(operation)
+      if operation.cancelled:
+        continue
+      if self._new_request is operation:
+        self._new_request = None
+        self._current_new = operation
+      self._capturing = operation
+      self._capture_task = create_task(self._capture_scan(operation))
+      await gather(self._capture_task, return_exceptions=True)
+      self._capture_task = None
+      self._capturing = None
+
+  async def _capture_scan(self, operation: _SavingPass) -> None:
+    await job_registry.try_start(Jobs.DOMAINS_RESOLVE)
+    self._ticket = _SelectionTicket(
+      self._generation,
+      {domain_id for domain_id, owners in self._owners.items() if owners[0].attempted},
+    )
+    try:
+      candidates = await (
+        db.get_new_domains_for_resolve()
+        if operation.mode == Jobs.DOMAINS_RESOLVE_NEW
+        else db.get_stale_domains_for_resolve()
+      )
+      self._check_open()
+      operation.run.select(len(candidates))
+      if candidates:
+        operation.servers = await operation.resolver.saving_dns_snapshot()
+        operation.context = _DefaultDnsContext(settings.dns_timeout, settings.dns_lifetime)
+      for index, candidate in enumerate(candidates):
+        self._check_open()
+        if operation.cancelled:
+          break
+        self._adopt(operation, candidate)
+        if index % 128 == 127:
+          await sleep(0)
+    except CancelledError:
+      operation.error = operation.error or CancelledError()
+      raise
+    except Exception as err:
+      operation.error = err
+      logger.error(
+        'Domain membership selection or adoption failed [%s]',
+        type(err).__name__,
+        exc_info=RuntimeError('Domain membership selection or adoption failed'),
+      )
+    finally:
+      self._ticket = None
+      operation.adopted = True
+      self._finish_pass(operation)
+      self._ready.set()
+
+  def _adopt(self, scan: _SavingPass, candidate: DomainCandidate) -> None:
+    started = perf_counter()
+    ticket = self._ticket
+    if ticket is None:
+      raise RuntimeError('Missing domain membership ticket')
+    if candidate.id in ticket.attempted:
+      scan.run.cover()
+      return
+    owners = self._owners.get(candidate.id)
+    if owners:
+      operation = owners[0]
+      if scan not in operation.interests:
+        operation.interests.append(scan)
+        scan.remaining += 1
+      if scan.mode == Jobs.DOMAINS_RESOLVE_NEW and not operation.started and not operation.priority:
+        operation.priority = True
+        self._priority_waiting += 1
+        self._queue(operation)
+      return
+    if candidate.id in ticket.changed:
+      scan.error = DatabaseWriteError('Domain membership pass incomplete after an unattempted reservation changed')
+      return
+    self._token += 1
+    operation = _SavingOperation(
+      self._token,
+      candidate.id,
+      scan.resolver,
+      candidate=candidate,
+      source=scan,
+      interests=[scan],
+      priority=scan.mode == Jobs.DOMAINS_RESOLVE_NEW,
+    )
+    scan.remaining += 1
+    self._owners[candidate.id] = [operation]
+    self._priority_waiting += int(operation.priority)
+    self._changed(candidate.id)
+    self._queue(operation)
+    observe_duration(queue_duration, started, queue='resolve', phase='admission', outcome='admitted')
+
+  def _finish_pass(self, scan: _SavingPass) -> None:
+    if not scan.adopted or scan.remaining or scan.finished:
+      return
+    scan.finished = True
+    scan.run.finish(scan.error is None and not scan.cancelled)
+    scan.done.set()
+    self._passes.discard(scan)
+    if self._current_new is scan:
+      self._current_new = None
+    self._scan_ready.set()
+    self._outcomes.set()
+    self._update_idle()
+
+  async def _cancel_pass(self, scan: _SavingPass) -> None:
+    scan.cancelled = True
+    scan.error = CancelledError()
+    operations = [operation for owners in self._owners.values() for operation in owners if scan in operation.interests]
+    for operation in operations:
+      operation.interests.remove(scan)
+      scan.remaining -= 1
+    # Close every abandoned dispatch slot before awaiting any active cleanup.
+    for operation in operations:
+      if not operation.interests and not operation.explicit and not operation.detached:
+        receipt = operation.receipt
+        if receipt is None or not receipt.admitted:
+          operation.cancelled = True
+          if operation.task is not None and not operation.task.done():
+            operation.task.cancel()
+    for index, operation in enumerate(operations):
+      await self._cancel_unneeded(operation)
+      if index % 128 == 127:
+        await sleep(0)
+    if self._capturing is scan and self._capture_task is not None:
+      self._capture_task.cancel()
+      await gather(self._capture_task, return_exceptions=True)
+    if scan in self._scans:
+      self._scans.remove(scan)
+      scan.adopted = True
+    if self._new_request is scan:
+      self._new_request = None
+    self._finish_pass(scan)
+    self._ready.set()
+
+  async def _cancel_unneeded(self, operation: _SavingOperation) -> None:
+    if operation.interests or operation.explicit or operation.detached:
+      return
+    receipt = operation.receipt
+    if receipt is not None and receipt.admitted:
+      return
+    was_cancelled = operation.cancelled
+    operation.cancelled = True
+    if operation.task is not None and not operation.task.done():
+      if not was_cancelled:
+        operation.task.cancel()
+      await gather(operation.task, return_exceptions=True)
+    if operation.started:
+      self._finish_operation(operation)
+    elif not operation.processed:
+      if operation.priority:
+        self._priority_waiting -= 1
+      operation.processed = True
+      self._release_capacity(operation)
+      owners = self._owners.get(operation.domain_id)
+      if owners and owners[0] is not operation:
+        self._finish_residence(operation, 'cancelled')
+        owners.remove(operation)
+        self._changed(operation.domain_id)
+      else:
+        self._release_known(operation)
+
+  def _fail(self, failure: BaseException) -> None:
+    if self._failure is not None:
+      return
+    self._failure = failure
+    for scan in tuple(self._passes):
+      scan.error = failure
+      scan.cancelled = True
+      scan.done.set()
+    for scan in self._scans:
+      scan.adopted = True
+      self._finish_pass(scan)
+    self._scans.clear()
+    self._new_request = None
+    for owners in tuple(self._owners.values()):
+      for operation in tuple(owners):
+        operation.error = failure
+        operation.cancelled = True
+        if operation.done is not None:
+          operation.done.set()
+        if operation.task is not None and not operation.task.done():
+          if operation.task is not current_task():
+            operation.task.cancel()
+        elif not operation.started:
+          operation.processed = True
+          self._complete_interests(operation)
+      # Known unstarted successors must fail without waiting behind an unknown fence.
+      while len(owners) > 1:
+        successor = owners.pop()
+        self._finish_residence(successor, 'cancelled')
+        self._release_capacity(successor)
+      self._release_known(owners[0])
+    self._priority.clear()
+    self._stale.clear()
+    self._priority_waiting = 0
+    self._capacity.set()
+    self._ready.set()
+    self._scan_ready.set()
+    self._update_idle()
+
+  async def _bookkeep(self) -> None:
+    while True:
+      self._outcomes.clear()
+      if db.writer_failure is not None:
+        self._fail(db.writer_failure)
+      for operation in tuple(self._receipts.values()):
+        self._release_known(operation)
+      if not self._passes:
+        await self._finish_activity()
+      self._update_idle()
+      await self._outcomes.wait()
+
+  async def _finish_activity(self) -> None:
+    await job_registry.finish(Jobs.DOMAINS_RESOLVE)
+    # Registration may have occurred while an older finish awaited its lock.
+    if self._passes:
+      await job_registry.try_start(Jobs.DOMAINS_RESOLVE)
+
+  def _update_idle(self) -> None:
+    if (
+      not self._passes
+      and not self._active
+      and not any(not operation.processed for owners in self._owners.values() for operation in owners)
+    ):
+      self._idle.set()
+
+  async def wait_idle(self) -> None:
+    """Wait for selection and processing/admission, without waiting for commits."""
+    await self._idle.wait()
+    if self._failure is not None:
+      raise DatabaseWriteError('Saving coordinator failed') from self._failure
+
+  async def stop(self) -> None:
+    """Stop new work and retain all preadmission cleanup before database drain."""
+    if not self._running:
+      return
+    self._stopping = True
+    self._capacity.set()
+    self._ready.set()
+    self._scan_ready.set()
+    if self._scan_task is not None:
+      self._scan_task.cancel()
+    for scan in tuple(self._passes):
+      scan.cancelled = True
+      scan.error = DatabaseWriteError('Saving coordinator stopped before pass completion')
+    operations = [operation for owners in self._owners.values() for operation in owners]
+    for operation in operations:
+      operation.interests.clear()
+      if operation.done is not None:
+        operation.error = operation.error or DatabaseWriteError(
+          'Saving coordinator stopped before processing completed'
+        )
+        operation.done.set()
+      if operation.task is not None and not operation.task.done():
+        operation.task.cancel()
+      elif not operation.started:
+        operation.cancelled = True
+        operation.processed = True
+    tasks = [operation.task for operation in operations if operation.task is not None]
+    if self._scan_task is not None:
+      tasks.append(self._scan_task)
+    await _await_owned(self._finish_stop(tasks), cancel_on_cancel=False)
+
+  async def _finish_stop(self, tasks: list[Task[None]]) -> None:
+    await gather(*tasks, return_exceptions=True)
+    for worker in self._workers:
+      worker.cancel()
+    await gather(*self._workers, return_exceptions=True)
+    for scan in tuple(self._passes):
+      scan.remaining = 0
+      scan.adopted = True
+      self._finish_pass(scan)
+    self._scans.clear()
+    self._new_request = None
+    self._priority.clear()
+    self._stale.clear()
+    self._priority_waiting = 0
+    for owners in tuple(self._owners.values()):
+      while len(owners) > 1:
+        successor = owners.pop()
+        self._finish_residence(successor, 'cancelled')
+        self._release_capacity(successor)
+      self._release_known(owners[0])
+    await job_registry.finish(Jobs.DOMAINS_RESOLVE)
+    self._outcomes.set()
+    self._update_idle()
+
+  async def finish_close(self) -> None:
+    """Retire bookkeeping after database drain and retained native cleanup."""
+    try:
+      await db.wait_closed_cleanup()
+    finally:
+      for operation in tuple(self._receipts.values()):
+        self._release_known(operation)
+      await self._retire_bookkeeping()
+
+  async def _retire_bookkeeping(self) -> None:
+    if self._receipts:
+      logger.error('Saving coordinator retains unresolved database outcomes: %s', len(self._receipts))
+    db.unregister_writer_failure_wakeup(self._outcomes)
+    if self._bookkeeping_task is not None:
+      self._bookkeeping_task.cancel()
+      await gather(self._bookkeeping_task, return_exceptions=True)
+    self._running = False
+
+
+saving_coordinator = SavingCoordinator()

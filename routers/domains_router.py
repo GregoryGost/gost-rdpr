@@ -1,50 +1,48 @@
-from fastapi import APIRouter, status, BackgroundTasks, Query, Path, Body
-from fastapi.responses import JSONResponse
 from time import monotonic
-from typing import Annotated, Self, List, Dict
+from typing import Annotated, ClassVar, Self
 
-from logger.logger import logger
+from fastapi import APIRouter, BackgroundTasks, Body, Path, Query, status
+from fastapi.responses import JSONResponse
+
+from client.domains_resolving_client import DomainsResolver, saving_coordinator
 from database.db import db
-from client.domains_resolving_client import DomainsResolver
-
-from .base_router import BaseRouter
+from logger.logger import logger
 
 #
 from models.dto.domains_dto import CheckDomainResultDto
+
 # base
-from models.http.base import ErrorResp, NotFoundResp, NoDataResp, OkResp
-# request models
-from models.http.domains_req import DomainsQueryReq, DomainsSearchQueryReq, DomainsPostElementReq, DomainResolveReq
-# response models
-from models.http.domains_resp import (
-  DomainsPayloadResp,
-  DomainElementResp,
-  DomainResolveResp,
-  DnsServerResolveResultResp
-)
+from models.http.base import ErrorResp, NoDataResp, NotFoundResp, OkResp
 from models.http.dns_servers_resp import DnsElementResp
 
-class DomainsRouter(BaseRouter):
+# request models
+from models.http.domains_req import DomainResolveReq, DomainsPostElementReq, DomainsQueryReq, DomainsSearchQueryReq
 
-  __domains_post_body_examples: List[List[Dict[str, str]]] = [
+# response models
+from models.http.domains_resp import (
+  DnsServerResolveResultResp,
+  DomainElementResp,
+  DomainResolveResp,
+  DomainsPayloadResp,
+)
+
+from .base_router import BaseRouter
+
+
+class DomainsRouter(BaseRouter):
+  __domains_post_body_examples: ClassVar[list[list[dict[str, str]]]] = [
     [
       {
         'domain': 'google.com',
       },
-      {
-        'domain': 'rotterdam1192.discord.gg',
-        'ros_comment': 'discord domain'
-      }
+      {'domain': 'rotterdam1192.discord.gg', 'ros_comment': 'discord domain'},
     ]
   ]
 
   __domains_resolver: DomainsResolver = DomainsResolver()
 
   def __init__(self: Self) -> None:
-    self.router: APIRouter = APIRouter(
-      tags=[self.tags.domains_tag.name],
-      prefix='/domains'
-    )
+    self.router: APIRouter = APIRouter(tags=[self.tags.domains_tag.name], prefix='/domains')
     logger.info('DomainsRouter init')
 
   def get_router(self: Self) -> APIRouter:
@@ -55,37 +53,10 @@ class DomainsRouter(BaseRouter):
       name='Get all Domains records',
       description='Displays all available Domains records',
       response_model=DomainsPayloadResp,
-      responses={
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
-      }
+      responses={status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}},
     )
     async def get_all_domains(query: Annotated[DomainsQueryReq, Query()]) -> JSONResponse:
-      logger.debug(f'Call API route: GET /domains')
-      try:
-        before_time: float = monotonic()
-        return_data: DomainsPayloadResp = await db.get_all_domains(
-          before_time=before_time,
-          limit=query.limit,
-          offset=query.offset,
-          resolved=query.resolved,
-          start_date=query.start_date,
-          end_date=query.end_date
-        )
-        return JSONResponse(return_data.to_dict(), status.HTTP_200_OK)
-      except Exception as err:
-        return self.errorResp(err)
-
-    @router.get(
-      path='/search',
-      name='Find Domains by text',
-      description='Find a Domains by text. Using fields "name" or "url"',
-      response_model=DomainsPayloadResp,
-      responses={
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
-      }
-    )
-    async def search_domains(query: Annotated[DomainsSearchQueryReq, Query()]) -> JSONResponse:
-      logger.debug(f'Call API route: GET /domains/search')
+      logger.debug('Call API route: GET /domains')
       try:
         before_time: float = monotonic()
         return_data: DomainsPayloadResp = await db.get_all_domains(
@@ -95,10 +66,35 @@ class DomainsRouter(BaseRouter):
           resolved=query.resolved,
           start_date=query.start_date,
           end_date=query.end_date,
-          search_text=query.text
         )
         return JSONResponse(return_data.to_dict(), status.HTTP_200_OK)
       except Exception as err:
+        logger.error('Domain API request failed', exc_info=True)
+        return self.errorResp(err)
+
+    @router.get(
+      path='/search',
+      name='Find Domains by text',
+      description='Find a Domains by text. Using fields "name" or "url"',
+      response_model=DomainsPayloadResp,
+      responses={status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}},
+    )
+    async def search_domains(query: Annotated[DomainsSearchQueryReq, Query()]) -> JSONResponse:
+      logger.debug('Call API route: GET /domains/search')
+      try:
+        before_time: float = monotonic()
+        return_data: DomainsPayloadResp = await db.get_all_domains(
+          before_time=before_time,
+          limit=query.limit,
+          offset=query.offset,
+          resolved=query.resolved,
+          start_date=query.start_date,
+          end_date=query.end_date,
+          search_text=query.text,
+        )
+        return JSONResponse(return_data.to_dict(), status.HTTP_200_OK)
+      except Exception as err:
+        logger.error('Domain API request failed', exc_info=True)
         return self.errorResp(err)
 
     @router.get(
@@ -108,8 +104,8 @@ class DomainsRouter(BaseRouter):
       response_model=DomainElementResp,
       responses={
         status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp},
-        status.HTTP_404_NOT_FOUND: {'model': NotFoundResp}
-      }
+        status.HTTP_404_NOT_FOUND: {'model': NotFoundResp},
+      },
     )
     async def get_domain_on_id(id: Annotated[int, Path(ge=0, title='Domain record ID')]) -> JSONResponse:
       logger.debug(f'Call API route: GET /domains/{id}')
@@ -120,6 +116,7 @@ class DomainsRouter(BaseRouter):
           return JSONResponse(not_found_resp.to_dict(), status.HTTP_404_NOT_FOUND)
         return JSONResponse(domain_resp.to_dict(), status.HTTP_200_OK)
       except Exception as err:
+        logger.error('Domain API request failed', exc_info=True)
         return self.errorResp(err)
 
     @router.post(
@@ -129,20 +126,21 @@ class DomainsRouter(BaseRouter):
       response_model=OkResp,
       responses={
         status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp},
-        status.HTTP_400_BAD_REQUEST: {'model': NoDataResp}
-      }
+        status.HTTP_400_BAD_REQUEST: {'model': NoDataResp},
+      },
     )
     async def domains_add(
-      data: Annotated[List[DomainsPostElementReq], Body(examples=self.__domains_post_body_examples)],
-      background_tasks: BackgroundTasks
+      data: Annotated[list[DomainsPostElementReq], Body(examples=self.__domains_post_body_examples)],
+      background_tasks: BackgroundTasks,
     ) -> JSONResponse:
-      logger.debug(f'Call API route: POST /domains')
+      logger.debug('Call API route: POST /domains')
       try:
-        if (len(data) < 1):
+        if len(data) < 1:
           return JSONResponse(NoDataResp().to_dict(), status.HTTP_400_BAD_REQUEST)
         background_tasks.add_task(db.put_add_domains_to_queue, data)
         return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
       except Exception as err:
+        logger.error('Domain API request failed', exc_info=True)
         return self.errorResp(err)
 
     @router.delete(
@@ -150,19 +148,17 @@ class DomainsRouter(BaseRouter):
       name='Delete one Domain record',
       description='Background delete one Domain record',
       response_model=OkResp,
-      responses={
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
-      }
+      responses={status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}},
     )
     async def domain_delete(
-      id: Annotated[int, Path(ge=-1, title='Domain record ID')],
-      background_tasks: BackgroundTasks
+      id: Annotated[int, Path(ge=-1, title='Domain record ID')], background_tasks: BackgroundTasks
     ) -> JSONResponse:
       logger.debug(f'Call API route: DELETE /domains/{id}')
       try:
         background_tasks.add_task(db.put_delete_domains_to_queue, id)
         return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
       except Exception as err:
+        logger.error('Domain API request failed', exc_info=True)
         return self.errorResp(err)
 
     # delete all
@@ -171,16 +167,15 @@ class DomainsRouter(BaseRouter):
       name='Clear All Domains records (WARNING!!!)',
       description='Clear All Domains records. But not default record id=-1',
       response_model=OkResp,
-      responses={
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
-      }
+      responses={status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}},
     )
     async def domains_delete_all(background_tasks: BackgroundTasks) -> JSONResponse:
-      logger.debug(f'Call API route: DELETE /domains')
+      logger.debug('Call API route: DELETE /domains')
       try:
         background_tasks.add_task(db.put_delete_domains_to_queue)
         return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
       except Exception as err:
+        logger.error('Domain API request failed', exc_info=True)
         return self.errorResp(err)
 
     # single domain test resolver
@@ -189,9 +184,7 @@ class DomainsRouter(BaseRouter):
       name='Resolve domain once',
       description='Resolve a domain using configured DNS servers without saving the result to the database',
       response_model=DomainResolveResp,
-      responses={
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
-      }
+      responses={status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}},
     )
     async def resolve_domain_once(data: Annotated[DomainResolveReq, Body()]) -> JSONResponse:
       logger.debug('Call API route: POST /domains/resolve/check')
@@ -201,37 +194,28 @@ class DomainsRouter(BaseRouter):
         if data.id is not None:
           domain_record: DomainElementResp | None = await db.get_domain_on_id(id=data.id)
           if domain_record is None:
-            not_found_resp: NotFoundResp = NotFoundResp(
-              resolution=f"Domain with ID '{data.id}' not found in local db"
-            )
-            return JSONResponse(
-              content=not_found_resp.to_dict(),
-              status_code=status.HTTP_404_NOT_FOUND
-            )
+            not_found_resp: NotFoundResp = NotFoundResp(resolution=f"Domain with ID '{data.id}' not found in local db")
+            return JSONResponse(content=not_found_resp.to_dict(), status_code=status.HTTP_404_NOT_FOUND)
           logger.debug(f'Domain found on ID={data.id} for single resolve. Domain name={domain_record.name}')
           domain_name = domain_record.name
         if domain_name is None:
           raise ValueError('Domain name is not defined')
         # DNS server
-        selected_dns_servers: List[DnsElementResp] | None = None
+        selected_dns_servers: list[DnsElementResp] | None = None
         if data.dns_server_ids is not None:
           selected_dns_servers = []
           for dns_server_id in data.dns_server_ids:
-            dns_server: DnsElementResp | None =  await db.get_dns_server_on_id(id=dns_server_id)
+            dns_server: DnsElementResp | None = await db.get_dns_server_on_id(id=dns_server_id)
             if dns_server is None:
               not_found_resp: NotFoundResp = NotFoundResp(
                 resolution=f"DNS server ID '{dns_server_id}' not found in local db"
               )
-              return JSONResponse(
-                content=not_found_resp.to_dict(),
-                status_code=status.HTTP_404_NOT_FOUND
-              )
+              return JSONResponse(content=not_found_resp.to_dict(), status_code=status.HTTP_404_NOT_FOUND)
             selected_dns_servers.append(dns_server)
           logger.debug(f'DNS servers found on IDs={data.dns_server_ids} for single domain={domain_name} resolve')
         #
         result: CheckDomainResultDto = await self.__domains_resolver.resolve_once(
-          domain_name=domain_name,
-          selected_dns_servers=selected_dns_servers
+          domain_name=domain_name, selected_dns_servers=selected_dns_servers
         )
         return_data: DomainResolveResp = DomainResolveResp(
           domain=result.domain,
@@ -241,15 +225,16 @@ class DomainsRouter(BaseRouter):
               server_type=item.server_type,
               ips_v4=item.ips_v4,
               ips_v6=item.ips_v6,
-              cnames=item.cnames
+              cnames=item.cnames,
             )
             for item in result.results
-          ]
+          ],
         )
         return JSONResponse(content=return_data.to_dict(), status_code=status.HTTP_200_OK)
       except Exception as err:
+        logger.error('Domain API request failed', exc_info=True)
         return self.errorResp(err)
-      
+
     # resolve and save single domain
     @router.post(
       path='/{id}/resolve',
@@ -257,17 +242,15 @@ class DomainsRouter(BaseRouter):
       status_code=status.HTTP_202_ACCEPTED,
       responses={
         status.HTTP_404_NOT_FOUND: {'model': NotFoundResp},
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
-      }
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp},
+      },
     )
-    async def resolve_domain_now(id: Annotated[int, Path(gt=0)], background_tasks: BackgroundTasks) -> JSONResponse:
-      background_tasks.add_task(
-        self.__domains_resolver.resolve_stored_domain,
-        id
-      )
-      return JSONResponse(
-        OkResp(result='Domain resolving accepted').to_dict(),
-        status.HTTP_202_ACCEPTED
-      )
+    async def resolve_domain_now(id: Annotated[int, Path(gt=0)]) -> JSONResponse:
+      try:
+        await saving_coordinator.submit_stored(id, resolver=self.__domains_resolver)
+        return JSONResponse(OkResp(result='Domain resolving accepted').to_dict(), status.HTTP_202_ACCEPTED)
+      except Exception as err:
+        logger.error('Stored-domain resolution request failed', exc_info=True)
+        return self.errorResp(err)
 
     return router

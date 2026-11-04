@@ -481,9 +481,11 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
 - Dependency injection policy: existing class-owned collaborators and module globals;
   inspect actual callers before changing ownership. No new DI container is selected.
 - Schema/model policy: Pydantic HTTP models in `models/http/`; DTOs in `models/dto/`; ORM mappings in `models/db/`.
-- Lifespan owner: `AppServer.__lifespan` resets job state, sets up the database, and closes HTTP clients on shutdown.
-- Background task policy: current commands use `BackgroundTasks` and process-local `JobRegistry` reservations.
-  They provide no durable job execution guarantee. Do not introduce a worker framework implicitly.
+- Lifespan owner: `AppServer.__lifespan` resets job state, sets up the database, starts saving coordination,
+  and closes coordinator/writer resources before HTTP clients on shutdown.
+- Background task policy: domain-resolution requests register directly with the lifespan-owned saving coordinator;
+  list and RouterOS commands retain `BackgroundTasks` and process-local `JobRegistry` reservations.
+  Neither mechanism provides durable job execution. Do not introduce a worker framework implicitly.
 - DNS configuration: each nonempty new/stale resolution job reads one immutable task-local snapshot before queue work.
   Changes committed after that read apply to the next job; single-domain operations read fresh committed settings.
   Keep explicit DNS selection and default row `0` semantics. Failed configuration reads must not start queue work.
@@ -492,12 +494,19 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
   Ordinary DNS resolvers and their fixed timeout/lifetime settings belong to one job or single-domain operation;
   each endpoint's resolver is reused within that scope. DNS response caching remains disabled pending evidence of
   useful TTLs and repeated queries.
-- Bulk resolution: each job owns a bounded local queue and a fixed pool limited by
-  `domains_resolve_worker_limit` (default `4`). `domains_resolve_semaphore_limit` (default `20`) independently bounds
-  classic DNS/DoH A and CNAME operations across bulk, stored-domain and check entrypoints. Both limits and
-  `queue_max_size` must be positive. Producers wait for queue space and workers wait for writer admission.
-  Job and endpoint tasks are retained through failure/cancellation cleanup before releasing the job reservation;
-  abandoned local work cannot enter a later job. Writer-admitted commands remain owned by the database component.
+- Saving resolution: one lifespan-owned coordinator shares a fixed pool limited by
+  `domains_resolve_worker_limit` (default `4`) across automatic NEW/STALE and explicit stored-ID operations.
+  Accepted NEW demand pauses subsequent STALE dispatch; started STALE work finishes. Repeated NEW triggers coalesce
+  into one pending successor, captured after the current NEW list finishes processing/admission without commit drain.
+  Each accepted explicit request gets a fresh priority operation, serialized per ID through
+  known writer outcome. Automatic passes use full finite lightweight snapshots, not the legacy 500/2000 total caps.
+  `domains_resolve_semaphore_limit` (default `20`) independently bounds classic DNS/DoH A/CNAME operations across all
+  entrypoints. Checks without saving bypass saving coordination. Both limits and `queue_max_size` must be positive.
+  Explicit unstarted admission and writer queues apply backpressure. Heavy results/tasks are created lazily.
+  Token ownership and generation/actual-attempt evidence survive SELECT/adoption and cancellation cleanup;
+  mandatory DB receipts and sticky writer-failure wakeups are separate from optional metrics. Unknown outcomes retain
+  ownership without TTL/replay. Worker completion does not wait commit. Shutdown cleans coordinator preadmission work
+  before writer drain and retains outcome bookkeeping through native cleanup before closing HTTP clients.
 - Public API docs: runtime `/docs` and `/docs/openapi.json`; checked-in export `docs/OPENAPI.json`.
   Contract changes must reconcile models, route metadata, tests, and the export when applicable.
 - Active FastAPI rule/skill: `python_fastapi.md` + `python-fastapi-expert`.
@@ -577,7 +586,9 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
 - Deployment process/worker assumption: one Python application process per database.
   Verify again before any multi-worker/process change.
 - Writer lifecycle: `DataBase` owns its queue, pending batch and writer/cleanup tasks; setup starts one writer.
-  `AppServer.__lifespan` closes admission and awaits drain through `DataBase.close`; failures retain unresolved counts.
+  Every admitted command has a mandatory retained receipt independent of optional observations. Writer failure
+  publishes a sticky lifecycle wakeup. `AppServer.__lifespan` stops coordinator preadmission work, drains through
+  `DataBase.close`, and retains outcome bookkeeping through `wait_closed_cleanup`; failures retain unresolved counts.
   This profile records the current boundary, not a claim that all reusable skill recommendations are implemented.
 - Required DBA screening: schema/migration, transaction/integrity, writer semantics, retention/privacy,
   or material query/index/performance changes follow the specialist gate above.

@@ -3,7 +3,7 @@ from collections.abc import Iterable
 from contextlib import suppress
 from os import getpid
 from time import perf_counter
-from typing import ClassVar, Self, Tuple
+from typing import ClassVar, Self
 from uuid import uuid4
 
 from fastapi.routing import iter_route_contexts
@@ -115,6 +115,7 @@ class ResolutionRun:
   _count_fields = (
     'selected',
     'attempted',
+    'covered',
     'active',
     'success',
     'partial',
@@ -144,6 +145,12 @@ class ResolutionRun:
 
   def select(self, count: int) -> None:
     self.counts['selected'] = count
+    self.publish()
+
+  def cover(self) -> None:
+    """Record logical pass coverage separately from physical processing."""
+    self.counts['covered'] += 1
+    self.event('covered')
     self.publish()
 
   def observe(self) -> DomainObservation:
@@ -180,7 +187,8 @@ class ResolutionRun:
     )
     return {
       **self.counts,
-      'not_started': self.counts['selected'] - self.counts['attempted'],
+      'not_started': self.counts['selected'] - max(self.counts['attempted'], self.counts['covered']),
+      'logical_coverage_complete': self.processing_complete and self.counts['covered'] == self.counts['selected'],
       'processing_complete': self.processing_complete,
       'interrupted': self.interrupted,
       'processing_elapsed': elapsed,
@@ -330,7 +338,7 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
     self.app_info.labels(app_name=settings.app_title_metrics, app_version=settings.app_version, pid=getpid()).inc()
 
   @staticmethod
-  def get_path(request: Request) -> Tuple[str, bool]:
+  def get_path(request: Request) -> tuple[str, bool]:
     for route in iter_route_contexts(request.app.routes):
       match, _ = route.matches(request.scope)
       if match == Match.FULL:
@@ -348,30 +356,21 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
     self.requests.labels(method=method, path=path, app_name=settings.app_title_metrics).inc()
 
     before_time: float = perf_counter()
+    status_code: int = HTTP_500_INTERNAL_SERVER_ERROR
 
     try:
       response: Response = await call_next(request)
     except BaseException as err:
-      status_code: int = HTTP_500_INTERNAL_SERVER_ERROR
+      status_code = HTTP_500_INTERNAL_SERVER_ERROR
       self.exceptions.labels(
         method=method, path=path, exception_type=type(err).__name__, app_name=settings.app_title_metrics
       ).inc()
       raise err from None
     else:
-      status_code: int = response.status_code
+      status_code = response.status_code
       after_time: float = perf_counter()
-      """
-      trace пока не используем т.к. это новая фича prometheus:
-      https://prometheus.github.io/client_python/instrumenting/exemplars/
-      https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#exemplars
-      https://prometheus.io/docs/prometheus/latest/feature_flags/#exemplars-storage
-      для версии prometheus версии 3.5 нужен флаг: --enable-feature=exemplar-storage
-      """
-      # span: Span = trace.get_current_span()
-      # trace_id: str = trace.format_trace_id(span.get_span_context().trace_id)
       self.requests_processing_time.labels(method=method, path=path, app_name=settings.app_title_metrics).observe(
         amount=after_time - before_time
-        # exemplar={'TraceID': trace_id}
       )
     finally:
       self.responses.labels(

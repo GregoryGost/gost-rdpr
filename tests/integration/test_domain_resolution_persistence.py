@@ -1,6 +1,7 @@
 """SQLite integration and service E2E tests of startup, migrations, API flows, and shutdown."""
 
 import asyncio
+import dataclasses
 import importlib
 import importlib.metadata
 import json
@@ -15,11 +16,15 @@ from hashlib import sha256
 from pathlib import Path
 from time import perf_counter
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import aiosqlite
+import dns.asyncresolver
+import dns.message
 import dns.rdatatype
 import httpx
 import pytest
+from fastapi import FastAPI
 from prometheus_client import REGISTRY
 from prometheus_client.parser import text_string_to_metric_families
 from sqlalchemy import event, insert, select, text
@@ -497,7 +502,7 @@ async def test_complete_and_direct_domain_delete_roll_back_the_entire_batch(app,
 
 
 async def test_full_real_writer_queue_backpressures_pool_and_retains_admitted_command_on_cancel(
-  app, store, resolver, network, monkeypatch, job_queues
+  app, store, resolver, network, monkeypatch
 ):
   jobs = importlib.import_module('jobs.job_registry')
   monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 2)
@@ -522,16 +527,14 @@ async def test_full_real_writer_queue_backpressures_pool_and_retains_admitted_co
   task = asyncio.create_task(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW))
   try:
     await asyncio.wait_for(waiting.wait(), timeout=2)
-    await asyncio.wait_for(job_queues[0].put_waiting.wait(), timeout=2)
     assert store.writer_task is None
     assert store.db_save_queue.qsize() == 1
     assert len(requests) <= 3
-    assert job_queues[0].qsize() == 1
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
       await asyncio.wait_for(task, timeout=2)
     # Admission already transferred exactly one result to the database writer.
-    assert store.db_save_queue.qsize() == store.db_save_queue._unfinished_tasks == 1
+    assert store.db_save_queue.qsize() == vars(store.db_save_queue)['_unfinished_tasks'] == 1
     assert store.pending_count == 1
     assert await support_snapshot(store) == set()
     await store.start_writer()
@@ -1362,7 +1365,7 @@ async def test_inflight_commit_retains_ownership_until_cleanup(app, store, monke
   assert disposed == [write_engine]
 
 
-@pytest.mark.parametrize('failure_stage', [None, 'setup', 'body', 'close'])
+@pytest.mark.parametrize('failure_stage', [None, 'setup', 'start', 'body', 'stop', 'close', 'finish'])
 async def test_lifespan_always_attempts_database_and_http_cleanup(app, monkeypatch, failure_stage):
   server = importlib.import_module('server.server')
   events = []
@@ -1381,7 +1384,23 @@ async def test_lifespan_always_attempts_database_and_http_cleanup(app, monkeypat
   async def http_close():
     events.append('http_close')
 
+  async def start():
+    events.append('coordinator_start')
+    if failure_stage == 'start':
+      raise failure
+
+  async def stop():
+    events.append('coordinator_stop')
+    if failure_stage == 'stop':
+      raise failure
+
+  async def finish_close():
+    events.append('coordinator_finish')
+    if failure_stage == 'finish':
+      raise failure
+
   monkeypatch.setattr(server, 'db', SimpleNamespace(setup=setup, close=close))
+  monkeypatch.setattr(server, 'saving_coordinator', SimpleNamespace(start=start, stop=stop, finish_close=finish_close))
   monkeypatch.setattr(server.HttpClient, 'close', http_close)
   instance = server.AppServer()
 
@@ -1397,8 +1416,12 @@ async def test_lifespan_always_attempts_database_and_http_cleanup(app, monkeypat
     with pytest.raises(RuntimeError) as raised:
       await run_lifespan()
     assert raised.value is failure
-  expected = ['setup'] + ([] if failure_stage == 'setup' else ['body'])
-  assert events == [*expected, 'database_close', 'http_close']
+  expected = ['setup']
+  if failure_stage != 'setup':
+    expected.append('coordinator_start')
+    if failure_stage != 'start':
+      expected.append('body')
+  assert events == [*expected, 'coordinator_stop', 'database_close', 'coordinator_finish', 'http_close']
 
 
 async def test_waiting_producer_is_admitted_when_capacity_becomes_available(app, store, monkeypatch):
@@ -1757,6 +1780,11 @@ async def test_lifespan_database_error_keeps_priority_when_http_cleanup_also_fai
 
   with monkeypatch.context() as cleanup_patch:
     cleanup_patch.setattr(server, 'db', SimpleNamespace(setup=setup, close=close))
+    cleanup_patch.setattr(
+      server,
+      'saving_coordinator',
+      SimpleNamespace(start=AsyncMock(), stop=AsyncMock(), finish_close=AsyncMock()),
+    )
     cleanup_patch.setattr(server.HttpClient, 'close', http_close)
     instance = server.AppServer()
     with pytest.raises(app.database.DatabaseShutdownError) as raised:
@@ -1764,9 +1792,44 @@ async def test_lifespan_database_error_keeps_priority_when_http_cleanup_also_fai
         events.append('body')
   assert raised.value is database_failure
   assert events == ['setup', 'body', 'database_close', 'http_close']
-  assert 'HTTP client cleanup failed during database shutdown failure' in caplog.text
+  assert 'Additional application cleanup failed' in caplog.text
   assert 'synthetic private HTTP payload' not in caplog.text
   assert 'synthetic private HTTP payload' not in str(raised.value)
+
+
+@pytest.mark.parametrize('state', ['stopping', 'writer_failed'])
+@pytest.mark.parametrize(
+  'path', ['/commands/domains/resolve/new', '/commands/domains/resolve/stale', '/domains/1/resolve']
+)
+async def test_saving_request_rejection_preserves_error_json(app, store, monkeypatch, state, path):
+  """Exercise the real HTTP handlers, coordinator and writer failure boundary together."""
+  commands = importlib.import_module('routers.commands_router')
+  domains = importlib.import_module('routers.domains_router')
+  coordinator = app.resolver.saving_coordinator
+  await coordinator.start()
+  if state == 'stopping':
+    await coordinator.stop()
+    expected = 'Saving coordinator is stopping'
+  else:
+    monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+    await store.put_domain_after_resolve(
+      app.dto.DomainResult(id=999, name='missing-parent.example.test', resolution_complete=True)
+    )
+    await store.start_writer()
+    await asyncio.wait_for(asyncio.shield(store.writer_task), timeout=2)
+    assert store.writer_failure is not None
+    expected = 'Saving coordinator stopped after database writer failure'
+  api = FastAPI()
+  api.include_router(commands.CommandsRouter().get_router())
+  api.include_router(domains.DomainsRouter().get_router())
+  transport = httpx.ASGITransport(app=api, raise_app_exceptions=False)
+  async with httpx.AsyncClient(transport=transport, base_url='http://service.test', trust_env=False) as client:
+    response = await client.post(path)
+  assert response.status_code == 500
+  assert response.headers['content-type'].startswith('application/json')
+  assert response.json() == {'error': expected}
+  assert str(app.settings.db_path) not in response.text
+  assert store._DataBase__read_engine.pool.checkedout() == 0
 
 
 async def configure_public_domain(service, *, resolved=True):
@@ -2072,6 +2135,150 @@ async def test_public_queue_tail_is_persisted_by_real_lifespan_shutdown(e2e_serv
     assert connection.execute('SELECT name FROM rdpr_domains WHERE name=?', ('tail.example.test',)).fetchall() == [
       ('tail.example.test',),
     ]
+
+
+@pytest.mark.e2e
+async def test_public_new_acceptance_precedes_next_stale_worker(e2e_service):
+  """Exercise HTTP acceptance, real coordinator priority and durable writer effects together."""
+  service = e2e_service
+  first_id = await configure_public_domain(service)
+  names = ['www.example.test', 'stale-second.example.test', 'stale-third.example.test']
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    assert (await client.post('/domains', json=[{'domain': name} for name in names[1:]])).status_code == 200
+    async with asyncio.timeout(5):
+      while True:
+        records = (await client.get('/domains')).json()['payload']
+        ids = [record['id'] for record in records if record['name'] in names]
+        if len(ids) == 3:
+          break
+        await asyncio.sleep(0.01)
+  await service.stop()
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    connection.executemany(
+      "UPDATE rdpr_domains SET resolved=1,last_resolved_at='2000-01-01 00:00:00' WHERE id=?",
+      [(value,) for value in ids],
+    )
+  service.environment['DOMAINS_RESOLVE_WORKER_LIMIT'] = '1'
+  service.providers.hold_dns_names.add('www.example.test')
+  entered = service.providers.dns_entered_by_name['www.example.test'] = asyncio.Event()
+  release = service.providers.dns_release_by_name['www.example.test'] = asyncio.Event()
+  service.providers.requests.clear()
+  await service.start()
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    assert (await client.post('/commands/domains/resolve/stale')).status_code == 200
+    await asyncio.wait_for(entered.wait(), timeout=3)
+    repeated = await client.post('/commands/domains/resolve/stale')
+    assert repeated.status_code == 200
+    assert 'active' in repeated.json()['result']
+    assert (await client.post('/domains', json=[{'domain': 'new-priority.example.test'}])).status_code == 200
+    async with asyncio.timeout(3):
+      while True:
+        records = (await client.get('/domains')).json()['payload']
+        fresh = [record for record in records if record['name'] == 'new-priority.example.test']
+        if fresh:
+          break
+        await asyncio.sleep(0.01)
+    assert (await client.post('/commands/domains/resolve/new')).status_code == 200
+    assert {name for _, name, _ in service.providers.requests} == {'www.example.test.'}
+    release.set()
+    async with asyncio.timeout(5):
+      while True:
+        records = (await client.get('/domains')).json()['payload']
+        completed = [record for record in records if record['id'] in [*ids, fresh[0]['id']]]
+        if len(completed) == 4 and all(
+          record['last_resolved_at'] and record['last_resolved_at'] != '2000-01-01 00:00:00' for record in completed
+        ):
+          break
+        await asyncio.sleep(0.01)
+  await service.stop()
+  query_order = list(
+    dict.fromkeys(name.rstrip('.') for _, name, rdtype in service.providers.requests if rdtype == dns.rdatatype.A)
+  )
+  assert query_order == ['www.example.test', 'new-priority.example.test', *names[1:]]
+  assert first_id in ids
+  with closing(sqlite3.connect(service.db_path)) as connection:
+    supports = connection.execute(
+      'SELECT ip.ip_address,s.domain_id FROM rdpr_ip_supports AS s '
+      'JOIN rdpr_ip_records AS ip ON ip.id=s.ip_record_id WHERE ip.addr_type=4'
+    ).fetchall()
+    assert set(supports) == {(address, value) for value in [*ids, fresh[0]['id']] for address in ('8.8.8.8', '8.8.4.4')}
+    assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
+
+
+@pytest.mark.e2e
+async def test_public_repeated_saved_id_requests_are_distinct_fresh_operations(e2e_service):
+  service = e2e_service
+  domain_id = await configure_public_domain(service)
+  service.providers.hold_dns_names.add('www.example.test')
+  entered = service.providers.dns_entered_by_name['www.example.test'] = asyncio.Event()
+  release = service.providers.dns_release_by_name['www.example.test'] = asyncio.Event()
+  service.providers.requests.clear()
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    before = parse_samples((await client.get('/metrics')).text)
+    first = await client.post(f'/domains/{domain_id}/resolve')
+    assert first.status_code == 202
+    await asyncio.wait_for(entered.wait(), timeout=3)
+    for _ in range(2):
+      response = await client.post(f'/domains/{domain_id}/resolve')
+      assert response.status_code == 202
+      assert response.json()['result'] == 'Domain resolving accepted'
+    assert sum(kind == dns.rdatatype.A and transport == 'doh' for transport, _, kind in service.providers.requests) == 1
+    service.providers.classic_addresses = ('1.1.1.1',)
+    service.providers.doh_addresses = ('1.0.0.1',)
+    service.providers.hold_dns_names.clear()
+    release.set()
+    async with asyncio.timeout(5):
+      while True:
+        samples = parse_samples((await client.get('/metrics')).text)
+        if (
+          sample_total(samples, 'resolution_run_elapsed_seconds_count', mode='stored')
+          - sample_total(before, 'resolution_run_elapsed_seconds_count', mode='stored')
+          == 3
+          and sample_total(samples, 'resolution_run_events_total', event='confirmed', mode='stored')
+          - sample_total(before, 'resolution_run_events_total', event='confirmed', mode='stored')
+          == 3
+        ):
+          break
+        await asyncio.sleep(0.01)
+  await service.stop()
+  for transport in ('classic', 'doh'):
+    assert (
+      sum(
+        source == transport and name == 'www.example.test.' and kind == dns.rdatatype.A
+        for source, name, kind in service.providers.requests
+      )
+      == 3
+    )
+  domain, ips = public_flow_snapshot(service, domain_id)
+  assert domain[0] == 1
+  assert set(ips) == {'1.1.1.1', '1.0.0.1', '2001:4860:4860::8888'}
+
+
+@pytest.mark.e2e
+async def test_public_shutdown_cancels_unadmitted_dns_before_database_close(e2e_service):
+  service = e2e_service
+  domain_id = await configure_public_domain(service)
+  before = public_flow_snapshot(service, domain_id)
+  service.providers.hold_dns_names.add('www.example.test')
+  entered = service.providers.dns_entered_by_name['www.example.test'] = asyncio.Event()
+  release = service.providers.dns_release_by_name['www.example.test'] = asyncio.Event()
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    assert (await client.post(f'/domains/{domain_id}/resolve')).status_code == 202
+    await asyncio.wait_for(entered.wait(), timeout=3)
+  try:
+    await asyncio.wait_for(service.stop(), timeout=3)
+    assert public_flow_snapshot(service, domain_id) == before
+  finally:
+    service.providers.hold_dns_names.clear()
+    release.set()
+  await service.start()
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    assert (await client.post(f'/domains/{domain_id}/resolve')).status_code == 202
+    async with asyncio.timeout(5):
+      while public_flow_snapshot(service, domain_id)[0][1] == before[0][1]:
+        await asyncio.sleep(0.01)
+  await service.stop()
+  assert set(public_flow_snapshot(service, domain_id)[1]) == {'8.8.8.8', '8.8.4.4', '2001:4860:4860::8888'}
 
 
 @pytest.mark.e2e
@@ -3306,13 +3513,25 @@ async def test_dns_job_reads_once_and_activates_committed_changes_only_for_next_
     assert len(selections) == 1
     assert store.pending_count == 2
     requests.clear()
+    # A fresh scan may observe unchanged eligibility, but pending writes retain ID ownership.
+    await asyncio.wait_for(resolver.domains_resolve(mode_value), timeout=3)
+    assert requests == []
+    assert store.pending_count == 2
+    reads_before_next_attempt = len(selections)
+    await flush_queue(store)
+    # Restore eligibility only after the preceding commands have known committed outcomes.
+    async with store._DataBase__write_engine.begin() as connection:
+      await connection.execute(
+        text('UPDATE rdpr_domains SET last_resolved_at=:checkpoint'),
+        {'checkpoint': STALE_CHECKPOINT if mode == 'stale' else None},
+      )
     await asyncio.wait_for(resolver.domains_resolve(mode_value), timeout=3)
     assert set(requests) == {
       ('192.0.2.54', name, record_type) for name in expected_names for record_type in (dns.rdatatype.A,)
     }
     assert len(requests) == 2
-    assert len(selections) == 2
-    assert store.pending_count == 4
+    assert len(selections) == reads_before_next_attempt + 1
+    assert store.pending_count == 2
     await flush_queue(store)
     async with store._DataBase__read_engine.connect() as connection:
       rows = (await connection.execute(text('SELECT resolved, last_resolved_at FROM rdpr_domains ORDER BY id'))).all()
@@ -3348,7 +3567,7 @@ async def test_dns_configuration_ignores_enqueue_and_rollback_until_writer_commi
 
 @pytest.mark.parametrize('mode', ['new', 'stale'])
 async def test_dns_read_failure_is_typed_and_prevents_job_admission_and_persistence(
-  app, store, resolver, monkeypatch, job_queues, mode, caplog
+  app, store, resolver, monkeypatch, mode, caplog
 ):
   jobs = importlib.import_module('jobs.job_registry')
   await seed(app, store, resolved=mode == 'stale', checkpoint=STALE_CHECKPOINT if mode == 'stale' else None)
@@ -3365,7 +3584,6 @@ async def test_dns_read_failure_is_typed_and_prevents_job_admission_and_persiste
     await asyncio.wait_for(resolver.domains_resolve(getattr(jobs.Jobs, f'DOMAINS_RESOLVE_{mode.upper()}')), timeout=3)
   with pytest.raises(app.database.DnsConfigurationReadError):
     await resolver.resolve_stored_domain(1)
-  assert job_queues == []
   assert store.pending_count == store.unknown_count == 0
   assert await snapshot(app, store) == before
   assert store._DataBase__read_engine.pool.checkedout() == 0
@@ -3375,7 +3593,7 @@ async def test_dns_read_failure_is_typed_and_prevents_job_admission_and_persiste
 @pytest.mark.parametrize('mode', ['new', 'stale'])
 @pytest.mark.parametrize('configuration', ['empty', 'unknown-only'])
 async def test_successful_dns_selection_without_endpoints_rejects_nonempty_job_before_admission(
-  app, store, resolver, monkeypatch, job_queues, mode, configuration
+  app, store, resolver, monkeypatch, mode, configuration
 ):
   jobs = importlib.import_module('jobs.job_registry')
   network_calls, admissions, selections = [], [], []
@@ -3415,7 +3633,6 @@ async def test_successful_dns_selection_without_endpoints_rejects_nonempty_job_b
     assert str(app.settings.db_path) not in str(failure.value)
     assert 'rdpr_dns_servers' not in str(failure.value)
     assert network_calls == admissions == []
-    assert job_queues == []
     assert store.db_save_queue.qsize() == store.db_save_queue._unfinished_tasks == 0
     assert store.pending_count == store.unknown_count == 0
     assert await snapshot(app, store) == before
@@ -3494,7 +3711,7 @@ async def test_public_dns_change_during_job_activates_after_commit_for_next_oper
   await service.stop()
 
 
-@pytest.mark.parametrize('error_type', [RuntimeError, asyncio.CancelledError])
+@pytest.mark.parametrize('error_type', [None, RuntimeError, asyncio.CancelledError])
 async def test_receipt_observer_failure_cannot_cancel_real_commit(app, store, monkeypatch, error_type):
   await seed(app, store)
   monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
@@ -3503,12 +3720,20 @@ async def test_receipt_observer_failure_cannot_cancel_real_commit(app, store, mo
     def notify(self, event, at):
       raise error_type('Synthetic observer failure')
 
-  command = app.dto.DomainResult(id=1, name='www.example.test', resolution_complete=True, observation=BrokenObserver())
+  command = app.dto.DomainResult(
+    id=1,
+    name='www.example.test',
+    resolution_complete=True,
+    observation=BrokenObserver() if error_type is not None else None,
+  )
   await store.put_domain_after_resolve(command)
+  assert command.write_receipt.admitted is True
+  assert command.write_receipt.outcome == 'pending'
   await store.start_writer()
   await asyncio.wait_for(store.db_save_queue.join(), timeout=2)
   assert store.pending_count == 0
   assert store.writer_state == 'RUNNING'
+  assert command.write_receipt.outcome == 'confirmed'
   domain, _ips = await snapshot(app, store)
   assert domain[0] is True
   assert domain[1] is not None
@@ -3964,6 +4189,74 @@ async def test_reproducible_local_measurement_baseline(e2e_service, tmp_path):
     encoding='utf-8',
   )
   assert len(scenarios) == 12
+
+
+@pytest.mark.parametrize('mode', ['new', 'stale'])
+async def test_resolution_selection_is_complete_lightweight_ordered_and_detached(app, store, monkeypatch, mode):
+  """Legacy run limits cannot truncate a finite pass or allocate processing state eagerly."""
+  monkeypatch.setattr(app.settings, 'domains_resolve_new_batch_size', 1)
+  monkeypatch.setattr(app.settings, 'domains_resolve_stale_batch_size', 1)
+  expected_ids = list(range(1, 2106))
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.DomainsDbo),
+      [
+        {
+          'id': value,
+          'name': f'finite-{value}.example.test',
+          'resolved': mode == 'stale',
+          'last_resolved_at': STALE_CHECKPOINT if mode == 'stale' else None,
+        }
+        for value in expected_ids
+      ]
+      + [
+        {'id': 0, 'name': 'default', 'resolved': False, 'last_resolved_at': None},
+        {
+          'id': 3000,
+          'name': 'ineligible.example.test',
+          'resolved': True,
+          'last_resolved_at': datetime.now(UTC),
+        },
+      ],
+    )
+  tasks_before = asyncio.all_tasks()
+  selected = await getattr(store, f'get_{mode}_domains_for_resolve')()
+  assert [row.id for row in selected] == expected_ids
+  assert [(row.name, row.list_id) for row in selected] == [
+    (f'finite-{value}.example.test', None) for value in expected_ids
+  ]
+  assert all(not isinstance(row, app.dto.DomainResult) for row in selected)
+  assert all(not hasattr(row, 'observation') and not hasattr(row, 'result') for row in selected)
+  assert store._DataBase__read_engine.pool.checkedout() == 0
+  assert asyncio.all_tasks() == tasks_before
+  with pytest.raises((AttributeError, dataclasses.FrozenInstanceError)):
+    selected[0].name = 'mutated.example.test'
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(text('DELETE FROM rdpr_domains WHERE id=1'))
+    await connection.execute(
+      insert(app.database.DomainsDbo).values(
+        id=4000,
+        name='later.example.test',
+        resolved=mode == 'stale',
+        last_resolved_at=STALE_CHECKPOINT if mode == 'stale' else None,
+      )
+    )
+  assert [row.id for row in selected] == expected_ids
+  assert selected[0].name == 'finite-1.example.test'
+  later = await getattr(store, f'get_{mode}_domains_for_resolve')()
+  assert [row.id for row in later] == [*expected_ids[1:], 4000]
+
+
+@pytest.mark.parametrize('mode', ['new', 'stale'])
+async def test_resolution_selection_failure_is_explicit_and_releases_read_session(app, store, mode, caplog):
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(text('DROP TABLE rdpr_domains'))
+  with pytest.raises(app.database.DatabaseReadError) as failure:
+    await getattr(store, f'get_{mode}_domains_for_resolve')()
+  assert 'rdpr_domains' not in str(failure.value)
+  assert str(app.settings.db_path) not in str(failure.value)
+  assert store._DataBase__read_engine.pool.checkedout() == 0
+  assert 'no such table' not in caplog.text
 
 
 async def test_http_pool_enforces_capacity_and_cancelled_stream_releases_connection(app, monkeypatch):

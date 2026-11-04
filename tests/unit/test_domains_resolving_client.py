@@ -2,6 +2,7 @@
 
 import asyncio
 import dataclasses
+import gc
 import importlib
 import logging
 import math
@@ -11,6 +12,7 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import dns.asyncresolver
 import dns.exception
 import dns.message
 import dns.rdatatype
@@ -25,6 +27,571 @@ pytestmark = pytest.mark.unit
 ROS_RETRY_METHODS = frozenset({'GET', 'POST', 'PATCH', 'DELETE'})
 
 
+async def scheduling_turn():
+  """Allow scheduled owners to progress without a wall-clock delay."""
+  reached = asyncio.Event()
+  asyncio.get_running_loop().call_soon(reached.set)
+  await reached.wait()
+
+
+async def await_condition(predicate):
+  async with asyncio.timeout(3):
+    while not predicate():
+      await scheduling_turn()
+
+
+@pytest.fixture
+def saving_boundary(app, resolver, repository, monkeypatch, dns_message):
+  """Keep coordination and DNS classification real; control only repository and wire I/O."""
+  monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 1)
+  monkeypatch.setattr(app.settings, 'queue_max_size', 8)
+  repository.get_new_domains_for_resolve = AsyncMock(return_value=[])
+  repository.get_stale_domains_for_resolve = AsyncMock(return_value=[])
+  repository.get_dns_servers_for_resolve.return_value = ([app.Server(server='192.0.2.53')], [])
+  evidence = SimpleNamespace(queries=[], commands=[], gates={}, outcomes={}, active=0, peak=0)
+  queue_dto = importlib.import_module('models.dto.queue_dto')
+
+  async def classic(boundary, qname, rdtype, **kwargs):
+    evidence.queries.append((qname, boundary.nameservers[0], rdtype))
+    evidence.active += 1
+    evidence.peak = max(evidence.peak, evidence.active)
+    try:
+      gate = evidence.gates.get(qname)
+      if gate is not None:
+        await gate.wait()
+      return SimpleNamespace(
+        response=dns_message(evidence.outcomes.get(qname, 'nodata'), query=dns.message.make_query(qname, rdtype))
+      )
+    finally:
+      evidence.active -= 1
+
+  async def writer(domain):
+    evidence.commands.append(domain)
+    domain.write_receipt.mark_admitted()
+    domain.write_receipt.set_outcome(queue_dto.WriteOutcome.CONFIRMED)
+
+  monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
+  repository.put_domain_after_resolve.side_effect = writer
+  evidence.coordinator = app.resolver.saving_coordinator
+  evidence.resolver = resolver
+  evidence.repository = repository
+  evidence.candidate = lambda value: app.dto.DomainCandidate(
+    id=value, name=f'domain-{value}.example.test', list_id=None
+  )
+  return evidence
+
+
+async def test_new_acceptance_during_selection_stops_queued_stale_dispatch(app, saving_boundary):
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  boundary.repository.get_stale_domains_for_resolve.return_value = [boundary.candidate(value) for value in (1, 2, 3)]
+  first_release = boundary.gates['domain-1.example.test'] = asyncio.Event()
+  select_entered, select_release = asyncio.Event(), asyncio.Event()
+
+  async def select_new():
+    select_entered.set()
+    await select_release.wait()
+    return [boundary.candidate(9)]
+
+  boundary.repository.get_new_domains_for_resolve.side_effect = select_new
+  coordinator = boundary.coordinator
+  await coordinator.submit_scan(jobs.DOMAINS_RESOLVE_STALE, resolver=boundary.resolver)
+  await await_condition(lambda: len(boundary.queries) == 1)
+  await asyncio.wait_for(coordinator.submit_scan(jobs.DOMAINS_RESOLVE_NEW, resolver=boundary.resolver), timeout=1)
+  await asyncio.wait_for(select_entered.wait(), timeout=1)
+  first_release.set()
+  await await_condition(lambda: len(boundary.commands) == 1)
+  for _ in range(5):
+    await scheduling_turn()
+  assert [name for name, _, _ in boundary.queries] == ['domain-1.example.test']
+  select_release.set()
+  await asyncio.wait_for(coordinator.wait_idle(), timeout=3)
+  assert [name for name, _, _ in boundary.queries] == [
+    'domain-1.example.test',
+    'domain-9.example.test',
+    'domain-2.example.test',
+    'domain-3.example.test',
+  ]
+  assert [command.id for command in boundary.commands] == [1, 9, 2, 3]
+  assert boundary.peak == 1
+
+
+async def test_explicit_request_promotes_unstarted_stale_without_duplicate_attempt(app, saving_boundary):
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  boundary.repository.get_stale_domains_for_resolve.return_value = [boundary.candidate(value) for value in (1, 2, 3)]
+  boundary.repository.get_domain_candidate_for_resolve.side_effect = lambda id, **kwargs: boundary.candidate(id)
+  release = boundary.gates['domain-1.example.test'] = asyncio.Event()
+  await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_STALE, resolver=boundary.resolver)
+  await await_condition(lambda: len(boundary.queries) == 1)
+  await boundary.coordinator.submit_stored(2, resolver=boundary.resolver)
+  release.set()
+  await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+  assert [name for name, _, _ in boundary.queries] == [
+    'domain-1.example.test',
+    'domain-2.example.test',
+    'domain-3.example.test',
+  ]
+  assert [command.id for command in boundary.commands] == [1, 2, 3]
+  promoted = boundary.commands[1]
+  assert promoted.observation.run.snapshot()['selected'] == 1
+  assert promoted.observation.run is not boundary.commands[0].observation.run
+  assert boundary.repository.get_domain_candidate_for_resolve.await_count == 1
+
+
+async def test_active_new_blocks_stale_until_admission_without_waiting_for_commit(app, saving_boundary, monkeypatch):
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 2)
+  boundary.repository.get_stale_domains_for_resolve.return_value = [boundary.candidate(value) for value in (1, 2, 3)]
+  boundary.repository.get_new_domains_for_resolve.return_value = [boundary.candidate(9)]
+  first = boundary.gates['domain-1.example.test'] = asyncio.Event()
+  second = boundary.gates['domain-2.example.test'] = asyncio.Event()
+  priority = boundary.gates['domain-9.example.test'] = asyncio.Event()
+
+  async def writer(domain):
+    boundary.commands.append(domain)
+    domain.write_receipt.mark_admitted()
+
+  boundary.repository.put_domain_after_resolve.side_effect = writer
+  await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_STALE, resolver=boundary.resolver)
+  await await_condition(lambda: len(boundary.queries) == 2)
+  await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_NEW, resolver=boundary.resolver)
+  await await_condition(lambda: boundary.repository.get_new_domains_for_resolve.await_count == 1)
+  first.set()
+  await await_condition(lambda: any(name == 'domain-9.example.test' for name, _, _ in boundary.queries))
+  second.set()
+  await await_condition(lambda: len(boundary.commands) == 2)
+  for _ in range(5):
+    await scheduling_turn()
+  assert [name for name, _, _ in boundary.queries] == [
+    'domain-1.example.test',
+    'domain-2.example.test',
+    'domain-9.example.test',
+  ]
+  priority.set()
+  await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+  assert [name for name, _, _ in boundary.queries] == [
+    'domain-1.example.test',
+    'domain-2.example.test',
+    'domain-9.example.test',
+    'domain-3.example.test',
+  ]
+  assert [command.id for command in boundary.commands] == [1, 2, 9, 3]
+  assert all(command.write_receipt.admitted for command in boundary.commands)
+  assert all(command.write_receipt.outcome == 'pending' for command in boundary.commands)
+
+
+async def test_each_accepted_saved_id_waits_known_write_then_reads_fresh_context(app, saving_boundary):
+  boundary = saving_boundary
+  queue_dto = importlib.import_module('models.dto.queue_dto')
+  releases = []
+
+  async def candidate(id, **kwargs):
+    generation = len(releases) + 1
+    releases.append(generation)
+    return app.dto.DomainCandidate(id=id, name=f'fresh-{generation}.example.test', list_id=None)
+
+  async def writer(domain):
+    boundary.commands.append(domain)
+    domain.write_receipt.mark_admitted()
+
+  boundary.repository.get_domain_candidate_for_resolve.side_effect = candidate
+  boundary.repository.put_domain_after_resolve.side_effect = writer
+  first_release = boundary.gates['fresh-1.example.test'] = asyncio.Event()
+  await boundary.coordinator.submit_stored(7, resolver=boundary.resolver)
+  await await_condition(lambda: len(boundary.queries) == 1)
+  await boundary.coordinator.submit_stored(7, resolver=boundary.resolver)
+  await boundary.coordinator.submit_stored(7, resolver=boundary.resolver)
+  first_release.set()
+  await await_condition(lambda: len(boundary.commands) == 1)
+  for _ in range(5):
+    await scheduling_turn()
+  assert releases == [1]
+  assert [name for name, _, _ in boundary.queries] == ['fresh-1.example.test']
+  boundary.repository.get_dns_servers_for_resolve.return_value = ([app.Server(server='192.0.2.54')], [])
+  boundary.commands[0].write_receipt.set_outcome(queue_dto.WriteOutcome.CONFIRMED)
+  await await_condition(lambda: len(boundary.commands) == 2)
+  assert releases == [1, 2]
+  boundary.commands[1].write_receipt.set_outcome(queue_dto.WriteOutcome.KNOWN_NOT_COMMITTED)
+  await await_condition(lambda: len(boundary.commands) == 3)
+  boundary.commands[2].write_receipt.set_outcome(queue_dto.WriteOutcome.CONFIRMED)
+  await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+  assert [(name, server) for name, server, _ in boundary.queries] == [
+    ('fresh-1.example.test', '192.0.2.53'),
+    ('fresh-2.example.test', '192.0.2.54'),
+    ('fresh-3.example.test', '192.0.2.54'),
+  ]
+  assert len({id(command.write_receipt) for command in boundary.commands}) == 3
+  assert [command.id for command in boundary.commands] == [7, 7, 7]
+  assert boundary.peak == 1
+
+
+async def test_blocked_same_id_does_not_hide_other_new_but_keeps_stale_barrier(app, saving_boundary):
+  boundary = saving_boundary
+  queue_dto = importlib.import_module('models.dto.queue_dto')
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  boundary.repository.get_domain_candidate_for_resolve.side_effect = lambda id, **kwargs: boundary.candidate(id)
+
+  async def writer(domain):
+    boundary.commands.append(domain)
+    domain.write_receipt.mark_admitted()
+    if domain.id != 1:
+      domain.write_receipt.set_outcome(queue_dto.WriteOutcome.CONFIRMED)
+
+  boundary.repository.put_domain_after_resolve.side_effect = writer
+  await boundary.coordinator.submit_stored(1, resolver=boundary.resolver)
+  await await_condition(lambda: len(boundary.commands) == 1)
+  await boundary.coordinator.submit_stored(1, resolver=boundary.resolver)
+  boundary.repository.get_stale_domains_for_resolve.return_value = [boundary.candidate(3)]
+  await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_STALE, resolver=boundary.resolver)
+  await boundary.coordinator.submit_stored(2, resolver=boundary.resolver)
+  await await_condition(lambda: len(boundary.commands) == 2)
+  assert [command.id for command in boundary.commands] == [1, 2]
+  assert [name for name, _, _ in boundary.queries] == ['domain-1.example.test', 'domain-2.example.test']
+  boundary.commands[0].write_receipt.set_outcome(queue_dto.WriteOutcome.CONFIRMED)
+  await await_condition(lambda: len(boundary.commands) == 4)
+  assert [command.id for command in boundary.commands] == [1, 2, 1, 3]
+  boundary.commands[2].write_receipt.set_outcome(queue_dto.WriteOutcome.CONFIRMED)
+  await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+
+
+@pytest.mark.parametrize('final', [False, True], ids=['provisional-can-confirm', 'final-remains-fenced'])
+async def test_unknown_write_never_replays_same_id_or_expires_ownership(app, saving_boundary, final):
+  boundary = saving_boundary
+  queue_dto = importlib.import_module('models.dto.queue_dto')
+  boundary.repository.get_domain_candidate_for_resolve.side_effect = lambda id, **kwargs: boundary.candidate(id)
+
+  async def writer(domain):
+    boundary.commands.append(domain)
+    domain.write_receipt.mark_admitted()
+
+  boundary.repository.put_domain_after_resolve.side_effect = writer
+  await boundary.coordinator.submit_stored(1, resolver=boundary.resolver)
+  await await_condition(lambda: len(boundary.commands) == 1)
+  receipt = boundary.commands[0].write_receipt
+  receipt.set_outcome(queue_dto.WriteOutcome.FINAL_UNKNOWN if final else queue_dto.WriteOutcome.PROVISIONAL_UNKNOWN)
+  await boundary.coordinator.submit_stored(1, resolver=boundary.resolver)
+  await boundary.coordinator.submit_stored(2, resolver=boundary.resolver)
+  await await_condition(lambda: len(boundary.commands) == 2)
+  assert [command.id for command in boundary.commands] == [1, 2]
+  boundary.commands[1].write_receipt.set_outcome(queue_dto.WriteOutcome.CONFIRMED)
+  receipt.set_outcome(queue_dto.WriteOutcome.CONFIRMED)
+  if final:
+    for _ in range(5):
+      await scheduling_turn()
+    assert [command.id for command in boundary.commands] == [1, 2]
+    assert receipt.outcome == queue_dto.WriteOutcome.FINAL_UNKNOWN
+  else:
+    await await_condition(lambda: len(boundary.commands) == 3)
+    assert [command.id for command in boundary.commands] == [1, 2, 1]
+    boundary.commands[2].write_receipt.set_outcome(queue_dto.WriteOutcome.CONFIRMED)
+    await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+
+
+async def test_failed_real_attempt_crossing_select_covers_old_eligible_row(app, saving_boundary):
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  selected, release = asyncio.Event(), asyncio.Event()
+
+  async def stale_selection():
+    selected.set()
+    await release.wait()
+    return [boundary.candidate(1), boundary.candidate(2)]
+
+  boundary.repository.get_stale_domains_for_resolve.side_effect = stale_selection
+  boundary.repository.get_domain_candidate_for_resolve.side_effect = lambda id, **kwargs: boundary.candidate(id)
+  boundary.outcomes['domain-1.example.test'] = 'servfail'
+  await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_STALE, resolver=boundary.resolver)
+  await asyncio.wait_for(selected.wait(), timeout=1)
+  await boundary.resolver.resolve_stored_domain(1)
+  assert [name for name, _, _ in boundary.queries] == ['domain-1.example.test', 'domain-1.example.test']
+  assert boundary.commands == []
+  release.set()
+  await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+  assert [name for name, _, _ in boundary.queries] == [
+    'domain-1.example.test',
+    'domain-1.example.test',
+    'domain-2.example.test',
+  ]
+  assert [command.id for command in boundary.commands] == [2]
+
+
+async def test_cancelled_reservation_without_attempt_cannot_revive_late_snapshot_row(app, saving_boundary):
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  select_entered, select_release, preparing, cleaned = (asyncio.Event() for _ in range(4))
+
+  async def selection():
+    select_entered.set()
+    await select_release.wait()
+    return [boundary.candidate(1), boundary.candidate(2)]
+
+  async def candidate(id, *, new=None):
+    if new is not None:
+      return None
+    preparing.set()
+    try:
+      await asyncio.Future()
+    finally:
+      cleaned.set()
+
+  boundary.repository.get_stale_domains_for_resolve.side_effect = selection
+  boundary.repository.get_domain_candidate_for_resolve.side_effect = candidate
+  scan = asyncio.create_task(boundary.resolver.domains_resolve(jobs.DOMAINS_RESOLVE_STALE))
+  await asyncio.wait_for(select_entered.wait(), timeout=1)
+  explicit = asyncio.create_task(boundary.resolver.resolve_stored_domain(1))
+  try:
+    await asyncio.wait_for(preparing.wait(), timeout=1)
+    explicit.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await asyncio.wait_for(explicit, timeout=2)
+    assert cleaned.is_set()
+    assert boundary.queries == []
+    select_release.set()
+    result = (await asyncio.wait_for(asyncio.gather(scan, return_exceptions=True), timeout=2))[0]
+    assert [name for name, _, _ in boundary.queries] == ['domain-2.example.test']
+    assert [command.id for command in boundary.commands] == [2]
+    revalidations = [
+      call
+      for call in boundary.repository.get_domain_candidate_for_resolve.await_args_list
+      if call.kwargs.get('new') is False
+    ]
+    if not revalidations:
+      assert isinstance(result, app.database.DatabaseWriteError)
+      assert metric_total('resolution_run_snapshot', mode='stale', field='processing_complete') == 0
+    else:
+      assert result is None
+  finally:
+    select_release.set()
+    explicit.cancel()
+    scan.cancel()
+    await asyncio.gather(explicit, scan, return_exceptions=True)
+
+
+async def test_cancelled_automatic_pass_keeps_accepted_promoted_explicit_interest(app, saving_boundary):
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  boundary.repository.get_stale_domains_for_resolve.return_value = [boundary.candidate(1), boundary.candidate(2)]
+  boundary.repository.get_domain_candidate_for_resolve.side_effect = lambda id, **kwargs: boundary.candidate(id)
+  first_release = boundary.gates['domain-1.example.test'] = asyncio.Event()
+  scan = asyncio.create_task(boundary.resolver.domains_resolve(jobs.DOMAINS_RESOLVE_STALE))
+  try:
+    await await_condition(lambda: len(boundary.queries) == 1)
+    await boundary.coordinator.submit_stored(2, resolver=boundary.resolver)
+    scan.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await asyncio.wait_for(scan, timeout=2)
+    await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=2)
+    assert [name for name, _, _ in boundary.queries] == ['domain-1.example.test', 'domain-2.example.test']
+    assert [command.id for command in boundary.commands] == [2]
+    assert boundary.active == 0
+  finally:
+    first_release.set()
+    scan.cancel()
+    await asyncio.gather(scan, return_exceptions=True)
+
+
+async def test_no_save_check_bypasses_saving_worker_and_same_id_fence(app, saving_boundary):
+  boundary = saving_boundary
+  boundary.repository.get_domain_candidate_for_resolve.side_effect = lambda id, **kwargs: boundary.candidate(id)
+  release = boundary.gates['domain-1.example.test'] = asyncio.Event()
+  await boundary.coordinator.submit_stored(1, resolver=boundary.resolver)
+  await await_condition(lambda: len(boundary.queries) == 1)
+  boundary.gates.pop('domain-1.example.test')
+  result = await asyncio.wait_for(boundary.resolver.resolve_once('domain-1.example.test'), timeout=1)
+  assert result.domain == 'domain-1.example.test'
+  assert [(item.server, item.ips_v4) for item in result.results] == [('192.0.2.53', [])]
+  assert boundary.commands == []
+  assert [name for name, _, _ in boundary.queries] == ['domain-1.example.test', 'domain-1.example.test']
+  assert boundary.active == 1
+  release.set()
+  await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+  assert [command.id for command in boundary.commands] == [1]
+
+
+async def test_repeated_new_triggers_during_selection_coalesce_one_fresh_successor(app, saving_boundary):
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  entered, release = asyncio.Event(), asyncio.Event()
+  captures = []
+
+  async def selection():
+    captures.append(len(captures) + 1)
+    if len(captures) == 1:
+      entered.set()
+      await release.wait()
+      return [boundary.candidate(1)]
+    return [boundary.candidate(1), boundary.candidate(2)]
+
+  async def writer(domain):
+    # A pending write keeps the old row NEW-eligible when the successor captures its membership.
+    boundary.commands.append(domain)
+    domain.write_receipt.mark_admitted()
+
+  boundary.repository.get_new_domains_for_resolve.side_effect = selection
+  boundary.repository.put_domain_after_resolve.side_effect = writer
+  await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_NEW, resolver=boundary.resolver)
+  await asyncio.wait_for(entered.wait(), timeout=1)
+  for _ in range(3):
+    assert await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_NEW, resolver=boundary.resolver) is True
+  release.set()
+  await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+  assert captures == [1, 2]
+  assert [name for name, _, _ in boundary.queries] == ['domain-1.example.test', 'domain-2.example.test']
+  assert [command.id for command in boundary.commands] == [1, 2]
+  assert all(command.write_receipt.outcome == 'pending' for command in boundary.commands)
+
+
+async def test_repeated_new_waits_current_list_processing_then_scans_once_without_commit_drain(app, saving_boundary):
+  """Repeated demand remembers one follow-up scan after the current list has been processed."""
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  captures = []
+  release = boundary.gates['domain-1.example.test'] = asyncio.Event()
+
+  async def select_new():
+    captures.append(tuple(command.id for command in boundary.commands))
+    values = (1, 2) if len(captures) == 1 else (1, 2, 3)
+    return [boundary.candidate(value) for value in values]
+
+  async def writer(domain):
+    boundary.commands.append(domain)
+    domain.write_receipt.mark_admitted()
+
+  boundary.repository.get_new_domains_for_resolve.side_effect = select_new
+  boundary.repository.put_domain_after_resolve.side_effect = writer
+  await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_NEW, resolver=boundary.resolver)
+  try:
+    await await_condition(lambda: len(boundary.queries) == 1)
+    for _ in range(3):
+      assert await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_NEW, resolver=boundary.resolver) is True
+    for _ in range(5):
+      await scheduling_turn()
+    assert captures == [()]
+    assert boundary.commands == []
+    release.set()
+    await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+    assert captures == [(), (1, 2)]
+    assert [name for name, _, _ in boundary.queries] == [
+      'domain-1.example.test',
+      'domain-2.example.test',
+      'domain-3.example.test',
+    ]
+    assert [command.id for command in boundary.commands] == [1, 2, 3]
+    assert all(command.write_receipt.admitted for command in boundary.commands)
+    assert all(command.write_receipt.outcome == 'pending' for command in boundary.commands)
+  finally:
+    release.set()
+
+
+async def test_full_finite_pass_attempts_every_failed_member_once_with_bounded_heavy_state(
+  app, saving_boundary, monkeypatch, dns_message
+):
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 4)
+  monkeypatch.setattr(app.settings, 'domains_resolve_new_batch_size', 500)
+  candidates = [
+    app.dto.DomainCandidate(id=value, name=f'finite-failure-{value}.example.test') for value in range(1, 2106)
+  ]
+  boundary.repository.get_new_domains_for_resolve.return_value = candidates
+  heavy_counts = []
+
+  async def failed(boundary_resolver, qname, rdtype, **kwargs):
+    boundary.queries.append((qname, boundary_resolver.nameservers[0], rdtype))
+    if len(boundary.queries) in {1, 4209}:
+      gc.collect()
+      heavy_counts.append(
+        sum(
+          isinstance(value, app.dto.DomainResult) and value.name.startswith('finite-failure-')
+          for value in gc.get_objects()
+        )
+      )
+    return SimpleNamespace(response=dns_message('servfail', query=dns.message.make_query(qname, rdtype)))
+
+  monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', failed)
+  await asyncio.wait_for(boundary.resolver.domains_resolve(jobs.DOMAINS_RESOLVE_NEW), timeout=10)
+  assert sorted(boundary.queries) == sorted(
+    (candidate.name, '192.0.2.53', rdtype)
+    for candidate in candidates
+    for rdtype in (dns.rdatatype.A, dns.rdatatype.CNAME)
+  )
+  assert boundary.repository.get_new_domains_for_resolve.await_count == 1
+  assert boundary.repository.get_dns_servers_for_resolve.await_count == 1
+  assert boundary.commands == []
+  assert len(heavy_counts) == 2
+  assert all(0 < count <= 4 for count in heavy_counts), heavy_counts
+  assert metric_total('resolution_run_snapshot', mode='new', field='selected') == 2105
+  assert metric_total('resolution_run_snapshot', mode='new', field='attempted') == 2105
+  assert metric_total('resolution_run_snapshot', mode='new', field='failure') == 2105
+
+
+async def test_sticky_writer_failure_wakes_pending_obligations_without_another_enqueue(app, saving_boundary):
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  queue_dto = importlib.import_module('models.dto.queue_dto')
+  boundary.repository.get_domain_candidate_for_resolve.side_effect = lambda id, **kwargs: boundary.candidate(id)
+
+  async def writer(domain):
+    boundary.commands.append(domain)
+    domain.write_receipt.mark_admitted()
+
+  boundary.repository.put_domain_after_resolve.side_effect = writer
+  await boundary.coordinator.submit_stored(1, resolver=boundary.resolver)
+  await await_condition(lambda: len(boundary.commands) == 1)
+  receipt = boundary.commands[0].write_receipt
+  receipt.set_outcome(queue_dto.WriteOutcome.PROVISIONAL_UNKNOWN)
+  blocked = asyncio.create_task(boundary.resolver.resolve_stored_domain(1))
+  await await_condition(lambda: len(boundary.repository.writer_wakeups) > 0)
+  for _ in range(3):
+    await scheduling_turn()
+  assert not blocked.done()
+  boundary.repository.writer_failure = app.database.WriterFailedError('Synthetic terminal writer failure')
+  for wakeup in tuple(boundary.repository.writer_wakeups):
+    wakeup.set()
+  try:
+    with pytest.raises(app.database.DatabaseWriteError):
+      await asyncio.wait_for(blocked, timeout=2)
+    with pytest.raises(app.database.DatabaseWriteError):
+      await boundary.coordinator.submit_stored(2, resolver=boundary.resolver)
+    with pytest.raises(app.database.DatabaseWriteError):
+      await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_NEW, resolver=boundary.resolver)
+    receipt.set_outcome(queue_dto.WriteOutcome.CONFIRMED)
+    for _ in range(5):
+      await scheduling_turn()
+    assert [command.id for command in boundary.commands] == [1]
+    assert [name for name, _, _ in boundary.queries] == ['domain-1.example.test']
+  finally:
+    blocked.cancel()
+    await asyncio.gather(blocked, return_exceptions=True)
+
+
+async def test_same_id_successors_count_against_acceptance_capacity(app, saving_boundary, monkeypatch):
+  boundary = saving_boundary
+  monkeypatch.setattr(app.settings, 'queue_max_size', 1)
+  boundary.repository.get_domain_candidate_for_resolve.side_effect = lambda id, **kwargs: boundary.candidate(id)
+  release = boundary.gates['domain-1.example.test'] = asyncio.Event()
+  await boundary.coordinator.submit_stored(1, resolver=boundary.resolver)
+  await await_condition(lambda: len(boundary.queries) == 1)
+  # Capacity follows accepted, unstarted demand even while its predecessor owns the ID.
+  await asyncio.wait_for(boundary.coordinator.submit_stored(1, resolver=boundary.resolver), timeout=1)
+  third = asyncio.create_task(boundary.coordinator.submit_stored(1, resolver=boundary.resolver))
+  try:
+    for _ in range(5):
+      await scheduling_turn()
+    assert not third.done()
+    release.set()
+    await asyncio.wait_for(third, timeout=3)
+    await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+    assert [name for name, _, _ in boundary.queries] == ['domain-1.example.test'] * 3
+    assert [command.id for command in boundary.commands] == [1, 1, 1]
+  finally:
+    release.set()
+    third.cancel()
+    await asyncio.gather(third, return_exceptions=True)
+
+
 @pytest.mark.parametrize('field', ['domains_resolve_worker_limit', 'domains_resolve_semaphore_limit', 'queue_max_size'])
 @pytest.mark.parametrize('value', [0, -1])
 async def test_resolution_resource_limits_reject_deadlock_configuration(app, field, value):
@@ -36,13 +603,13 @@ async def test_resolution_resource_limits_reject_deadlock_configuration(app, fie
 
 
 async def test_fixed_domain_workers_overlap_and_writer_pressure_bounds_production(
-  app, resolver, repository, monkeypatch, dns_message, job_queues
+  app, resolver, repository, monkeypatch, dns_message
 ):
   """A full writer boundary must bound work before all selected domains start."""
   jobs = importlib.import_module('jobs.job_registry')
   monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 2)
   monkeypatch.setattr(app.settings, 'queue_max_size', 1)
-  domains = [app.dto.DomainResult(id=index, name=f'domain-{index}.example.test') for index in range(1, 65)]
+  domains = [app.dto.DomainCandidate(id=index, name=f'domain-{index}.example.test') for index in range(1, 65)]
   repository.get_new_domains_for_resolve = AsyncMock(return_value=domains)
   repository.get_dns_servers_for_resolve.return_value = ([app.Server(server='192.0.2.53')], [])
   release, blocked = asyncio.Event(), asyncio.Event()
@@ -60,23 +627,20 @@ async def test_fixed_domain_workers_overlap_and_writer_pressure_bounds_productio
 
   monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
   repository.put_domain_after_resolve.side_effect = writer
+  await app.resolver.saving_coordinator.start()
   original = asyncio.all_tasks()
   task = asyncio.create_task(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW))
   try:
     await asyncio.wait_for(blocked.wait(), timeout=2)
-    await asyncio.wait_for(job_queues[0].put_waiting.wait(), timeout=2)
     assert len(admitted) == len(queries) == 2
-    assert len(job_queues[0].admissions) == 3
-    assert job_queues[0].qsize() == job_queues[0].peak_size == 1
     assert not task.done()
     # Selected-but-unstarted domains must not each allocate a task.
-    assert len(asyncio.all_tasks() - original) <= 8
+    assert len(asyncio.all_tasks() - original) <= 10
     release.set()
     await asyncio.wait_for(task, timeout=3)
     assert sorted(queries) == sorted(domain.name for domain in domains)
     assert {domain.id for domain in admitted} == set(range(1, 65))
     assert all(domain.storage_ips == ('8.8.8.8',) for domain in admitted)
-    assert job_queues[0]._unfinished_tasks == job_queues[0].qsize() == 0
     repository.get_dns_servers_for_resolve.assert_awaited_once_with()
     assert asyncio.all_tasks() - original == set()
   finally:
@@ -133,6 +697,7 @@ async def test_bulk_stored_and_check_share_the_same_dns_admission_limit(
 
   monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
   resolver._DomainsResolver__http_client = app.make_http(doh)
+  await app.resolver.saving_coordinator.start()
   original = asyncio.all_tasks()
   tasks = [
     asyncio.create_task(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW)),
@@ -157,7 +722,7 @@ async def test_bulk_stored_and_check_share_the_same_dns_admission_limit(
 
 
 async def test_repeated_bulk_cancellation_awaits_nested_cleanup_before_job_release(
-  app, resolver, repository, monkeypatch, dns_message, job_queues
+  app, resolver, repository, monkeypatch, dns_message
 ):
   jobs = importlib.import_module('jobs.job_registry')
   registry = jobs.JobRegistry()
@@ -190,6 +755,7 @@ async def test_repeated_bulk_cancellation_awaits_nested_cleanup_before_job_relea
 
   monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
   assert await registry.try_start(jobs.Jobs.DOMAINS_RESOLVE)
+  await app.resolver.saving_coordinator.start()
   original = asyncio.all_tasks()
   task = asyncio.create_task(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW))
   try:
@@ -208,9 +774,7 @@ async def test_repeated_bulk_cancellation_awaits_nested_cleanup_before_job_relea
     assert sum(domain.processing_outcome is None for domain in first) >= 30
     assert await registry.try_start(jobs.Jobs.DOMAINS_RESOLVE)
     await asyncio.wait_for(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW), timeout=2)
-    assert len(job_queues) == 2
-    assert job_queues[0] is not job_queues[1]
-    assert [domain.id for domain in job_queues[1].admissions] == [99]
+    assert asyncio.all_tasks() == original
     assert len(names) == 3
     assert [call.kwargs['domain'].id for call in repository.put_domain_after_resolve.await_args_list] == [99]
     assert not await registry.is_active(jobs.Jobs.DOMAINS_RESOLVE)
@@ -264,6 +828,8 @@ async def test_unexpected_endpoint_failure_awaits_sibling_cleanup_before_public_
       cleanup_finished.set()
 
   monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
+  if entrypoint == 'stored':
+    await app.resolver.saving_coordinator.start()
   original = asyncio.all_tasks()
   operation = (
     resolver.resolve_stored_domain(7) if entrypoint == 'stored' else resolver.resolve_once('cleanup.example.test')
@@ -303,57 +869,111 @@ async def test_unexpected_endpoint_failure_awaits_sibling_cleanup_before_public_
     await asyncio.gather(task, *endpoint_tasks, return_exceptions=True)
 
 
-async def test_repeated_cancellation_during_registry_finish_retains_reservation_until_cleanup(
-  app, resolver, repository, monkeypatch
-):
-  """Cancellation cannot release the reservation before mandatory finish completes."""
-  jobs = importlib.import_module('jobs.job_registry')
-  finish_entered, release_finish, finish_completed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+async def test_repeated_shutdown_cancellation_waits_for_nested_worker_cleanup(app, resolver, repository, monkeypatch):
+  """The lifespan owner must retain cleanup even when its stop waiter is cancelled repeatedly."""
+  entered, cleanup, release, finished = (asyncio.Event() for _ in range(4))
+  repository.get_domain_on_id = AsyncMock(
+    return_value=SimpleNamespace(id=1, name='shutdown.example.test', domains_list_id=None)
+  )
+  repository.get_dns_servers_for_resolve.return_value = ([app.Server(server='192.0.2.53')], [])
 
-  class GatedRegistry(jobs.JobRegistry):
-    async def finish(self, job):
-      finish_entered.set()
-      await release_finish.wait()
-      await super().finish(job)
-      finish_completed.set()
+  async def classic(*args, **kwargs):
+    entered.set()
+    try:
+      await asyncio.Future()
+    finally:
+      cleanup.set()
+      await release.wait()
+      finished.set()
 
-  registry = GatedRegistry()
-  monkeypatch.setattr(app.resolver, 'job_registry', registry)
-  repository.get_new_domains_for_resolve = AsyncMock(return_value=[])
-  assert await registry.try_start(jobs.Jobs.DOMAINS_RESOLVE)
+  monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
   original = asyncio.all_tasks()
-  task = asyncio.create_task(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW))
+  await app.resolver.saving_coordinator.submit_stored(1, resolver=resolver)
+  await asyncio.wait_for(entered.wait(), timeout=2)
+  task = asyncio.create_task(app.resolver.saving_coordinator.stop())
   try:
-    await asyncio.wait_for(finish_entered.wait(), timeout=2)
+    await asyncio.wait_for(cleanup.wait(), timeout=2)
     for _ in range(3):
       task.cancel()
-      # A scheduler event lets each cancellation reach the real ownership helper.
-      delivered = asyncio.Event()
-      asyncio.get_running_loop().call_soon(delivered.set)
-      await delivered.wait()
+      await scheduling_turn()
       assert not task.done()
-      assert not finish_completed.is_set()
-      assert await registry.is_active(jobs.Jobs.DOMAINS_RESOLVE)
-      assert not await registry.try_start(jobs.Jobs.DOMAINS_RESOLVE)
+      assert not finished.is_set()
+      with pytest.raises(app.database.DatabaseWriteError):
+        await app.resolver.saving_coordinator.submit_stored(2, resolver=resolver)
     assert task.cancelling() == 3
-    release_finish.set()
+    release.set()
     with pytest.raises(asyncio.CancelledError):
       await asyncio.wait_for(task, timeout=2)
-    assert finish_completed.is_set()
-    assert not await registry.is_active(jobs.Jobs.DOMAINS_RESOLVE)
+    assert finished.is_set()
+    await app.resolver.saving_coordinator.finish_close()
     assert asyncio.all_tasks() - original == set()
-    repository.get_dns_servers_for_resolve.assert_not_awaited()
     repository.put_domain_after_resolve.assert_not_awaited()
     repository.put_add_domains_to_queue.assert_not_awaited()
   finally:
-    release_finish.set()
+    release.set()
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 
 
+async def test_shutdown_retrieves_cancelled_dns_aggregate_after_immediate_cleanup(app, saving_boundary, monkeypatch):
+  """Every aggregate future remains owned even when cancelled DNS children finish immediately."""
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 4)
+  boundary.repository.get_new_domains_for_resolve.return_value = [boundary.candidate(value) for value in range(1, 5)]
+  releases = [asyncio.Event() for _ in range(4)]
+  boundary.gates.update({f'domain-{value}.example.test': releases[value - 1] for value in range(1, 5)})
+  loop = asyncio.get_running_loop()
+  previous_handler = loop.get_exception_handler()
+  unhandled = []
+
+  def record_exception(loop, context):
+    unhandled.append(context)
+    loop.default_exception_handler(context)
+
+  original_tasks = asyncio.all_tasks()
+  loop.set_exception_handler(record_exception)
+  try:
+    await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_NEW, resolver=boundary.resolver)
+    await await_condition(lambda: len(boundary.queries) == 4)
+    await asyncio.wait_for(boundary.coordinator.stop(), timeout=2)
+    await asyncio.wait_for(boundary.coordinator.finish_close(), timeout=2)
+    await scheduling_turn()
+    gc.collect()
+    await scheduling_turn()
+    assert boundary.active == 0
+    assert boundary.commands == []
+    assert asyncio.all_tasks() == original_tasks
+    assert unhandled == [], [context.get('message') for context in unhandled]
+  finally:
+    for release in releases:
+      release.set()
+    loop.set_exception_handler(previous_handler)
+
+
+async def test_immediate_stop_releases_operation_cancelled_before_its_first_step(app, saving_boundary):
+  """A cancelled task that never entered its coroutine cannot run that coroutine's finally."""
+  boundary = saving_boundary
+  original_tasks = asyncio.all_tasks()
+  await boundary.coordinator.submit_stored(1, resolver=boundary.resolver)
+  stopping = asyncio.create_task(boundary.coordinator.stop())
+  await asyncio.wait_for(stopping, timeout=2)
+  await boundary.coordinator.finish_close()
+  assert boundary.queries == []
+  assert boundary.commands == []
+  assert boundary.coordinator._owners == {}
+  assert boundary.coordinator._active == {}
+  assert boundary.coordinator._explicit_count == 0
+  await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=1)
+  await boundary.coordinator.start()
+  await boundary.coordinator.stop()
+  await boundary.coordinator.finish_close()
+  assert asyncio.all_tasks() == original_tasks
+
+
 @pytest.mark.parametrize('write_stage', ['resolution', 'cname'])
 async def test_typed_writer_failure_stops_bulk_admission_and_releases_job(
-  app, resolver, repository, network, monkeypatch, job_queues, write_stage
+  app, resolver, repository, network, monkeypatch, write_stage
 ):
   jobs = importlib.import_module('jobs.job_registry')
   registry = jobs.JobRegistry()
@@ -368,6 +988,7 @@ async def test_typed_writer_failure_stops_bulk_admission_and_releases_job(
   boundary = repository.put_domain_after_resolve if write_stage == 'resolution' else repository.put_add_domains_to_queue
   boundary.side_effect = app.database.WriterClosedError('Synthetic closed writer')
   assert await registry.try_start(jobs.Jobs.DOMAINS_RESOLVE)
+  await app.resolver.saving_coordinator.start()
   original = asyncio.all_tasks()
   with pytest.raises((app.database.DatabaseWriteError, ExceptionGroup)) as failure:
     await asyncio.wait_for(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW), timeout=2)
@@ -379,7 +1000,6 @@ async def test_typed_writer_failure_stops_bulk_admission_and_releases_job(
 
   assert contains_writer_error(failure.value)
   assert len(requests) == 1
-  assert len(job_queues[0].admissions) <= 2
   assert not await registry.is_active(jobs.Jobs.DOMAINS_RESOLVE)
   assert asyncio.all_tasks() - original == set()
   if write_stage == 'resolution':
@@ -670,6 +1290,7 @@ async def test_router_creation_put_is_never_automatically_replayed(http_factory,
   def upstream(request):
     if error is not None:
       raise error
+    assert isinstance(failure, int)
     return httpx.Response(failure)
 
   client = http_factory.install(upstream, name='ros', retry_methods=ROS_RETRY_METHODS)
@@ -691,6 +1312,7 @@ async def test_retry_count_is_additional_attempts_and_final_outcome_is_preserved
   def upstream(request):
     if error is not None:
       raise error
+    assert isinstance(failure, int)
     return httpx.Response(failure, content=b'final provider response')
 
   client = http_factory.install(upstream)
@@ -1151,6 +1773,7 @@ async def test_http_measurement_preserves_stream_and_exactly_one_terminal(app, m
       touches.append('close')
       clock.value = 113.0
       if terminal == 'close_error':
+        assert error is not None
         raise error
 
   async def upstream(request):
@@ -1172,6 +1795,7 @@ async def test_http_measurement_preserves_stream_and_exactly_one_terminal(app, m
       if terminal == 'closed':
         await response.aclose()
       else:
+        assert error is not None
         with pytest.raises(type(error)) as failure:
           await response.aclose()
         assert failure.value is error
@@ -2216,48 +2840,45 @@ async def test_overlapping_stored_operations_keep_their_own_observations(
   assert metric_total('resolution_run_snapshot', mode='stored', field='attempted') == 1
 
 
-async def test_resolve_queue_measures_admission_and_residence_from_successful_put(
-  app, resolver, repository, network, monkeypatch
-):
+async def test_resolve_queue_measures_backpressure_and_residence_from_acceptance(app, saving_boundary, monkeypatch):
   metrics = importlib.import_module('metrics.metrics')
-  jobs = importlib.import_module('jobs.job_registry')
+  boundary = saving_boundary
   clock = SimpleNamespace(value=10.0)
   monkeypatch.setattr(metrics, 'perf_counter', lambda: clock.value)
   monkeypatch.setattr(app.resolver, 'perf_counter', lambda: clock.value)
-  domain = app.dto.DomainResult(id=1, name='www.example.test')
-  queues = []
-
-  class TimedQueue(asyncio.Queue):
-    def __init__(self, *args, **kwargs):
-      super().__init__(*args, **kwargs)
-      queues.append(self)
-
-    async def put(self, item):
-      clock.value = 100.0
-      await super().put(item)
-
-    async def get(self):
-      item = await super().get()
-      clock.value = 125.0
-      return item
-
-  monkeypatch.setattr(app.resolver, 'Queue', TimedQueue)
-  repository.get_new_domains_for_resolve = AsyncMock(return_value=[domain])
-  network({'192.0.2.53': 'nodata'})
-  repository.get_dns_servers_for_resolve.return_value = ([app.Server(server='192.0.2.53')], [])
+  monkeypatch.setattr(app.settings, 'queue_max_size', 1)
+  boundary.repository.get_domain_candidate_for_resolve.side_effect = lambda id, **kwargs: boundary.candidate(id)
+  first_release = boundary.gates['domain-1.example.test'] = asyncio.Event()
+  second_release = boundary.gates['domain-2.example.test'] = asyncio.Event()
   before_admission = metric_total('resolution_queue_duration_seconds_sum', queue='resolve', phase='admission')
   before_residence = metric_total('resolution_queue_duration_seconds_sum', queue='resolve', phase='residence')
-  await asyncio.wait_for(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW), timeout=2)
-  assert len(queues) == 1
-  assert queues[0]._unfinished_tasks == queues[0].qsize() == 0
-  assert (
-    metric_total('resolution_queue_duration_seconds_sum', queue='resolve', phase='admission') - before_admission == 90
-  )
-  assert (
-    metric_total('resolution_queue_duration_seconds_sum', queue='resolve', phase='residence') - before_residence == 25
-  )
-  assert domain.admitted_at is None
-  assert domain.processing_outcome == 'success'
+  await boundary.coordinator.submit_stored(1, resolver=boundary.resolver)
+  await await_condition(lambda: len(boundary.queries) == 1)
+  await boundary.coordinator.submit_stored(2, resolver=boundary.resolver)
+  admission = asyncio.create_task(boundary.coordinator.submit_stored(3, resolver=boundary.resolver))
+  try:
+    await scheduling_turn()
+    assert not admission.done()
+    clock.value = 100.0
+    first_release.set()
+    await asyncio.wait_for(admission, timeout=2)
+    await await_condition(lambda: len(boundary.queries) == 2)
+    clock.value = 125.0
+    second_release.set()
+    await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=2)
+    assert [command.id for command in boundary.commands] == [1, 2, 3]
+    assert (
+      metric_total('resolution_queue_duration_seconds_sum', queue='resolve', phase='admission') - before_admission == 90
+    )
+    assert (
+      metric_total('resolution_queue_duration_seconds_sum', queue='resolve', phase='residence') - before_residence
+      == 115
+    )
+  finally:
+    first_release.set()
+    second_release.set()
+    admission.cancel()
+    await asyncio.gather(admission, return_exceptions=True)
 
 
 async def test_dns_snapshot_elements_reject_mutation(app):
@@ -2293,7 +2914,7 @@ async def test_single_checks_reload_dns_and_explicit_selection_bypasses_configur
 
 
 @pytest.mark.parametrize('mode', ['new', 'stale'])
-async def test_empty_job_does_not_read_dns_or_admit_work(app, resolver, repository, job_queues, mode):
+async def test_empty_job_does_not_read_dns_or_admit_work(app, resolver, repository, mode):
   jobs = importlib.import_module('jobs.job_registry')
   repository.get_new_domains_for_resolve = AsyncMock(return_value=[])
   repository.get_stale_domains_for_resolve = AsyncMock(return_value=[])
@@ -2301,12 +2922,11 @@ async def test_empty_job_does_not_read_dns_or_admit_work(app, resolver, reposito
   await asyncio.wait_for(resolver.domains_resolve(getattr(jobs.Jobs, f'DOMAINS_RESOLVE_{mode.upper()}')), timeout=2)
   repository.get_dns_servers_for_resolve.assert_not_awaited()
   repository.put_domain_after_resolve.assert_not_awaited()
-  assert job_queues == []
 
 
 @pytest.mark.parametrize('mode', ['new', 'stale'])
 async def test_job_copies_dns_collections_before_network_work(
-  app, resolver, repository, monkeypatch, dns_message, job_queues, mode
+  app, resolver, repository, monkeypatch, dns_message, mode
 ):
   jobs = importlib.import_module('jobs.job_registry')
   domains = [app.dto.DomainResult(id=index, name=f'domain-{index}.example.test') for index in (1, 2)]
@@ -2328,9 +2948,7 @@ async def test_job_copies_dns_collections_before_network_work(
   }
   repository.get_dns_servers_for_resolve.assert_awaited_once_with()
   assert repository.put_domain_after_resolve.await_count == 2
-  assert all(domain.resolution_complete for domain in domains)
-  assert len(job_queues) == 1
-  assert job_queues[0]._unfinished_tasks == job_queues[0].qsize() == 0
+  assert all(call.kwargs['domain'].resolution_complete for call in repository.put_domain_after_resolve.await_args_list)
 
 
 @pytest.mark.parametrize(

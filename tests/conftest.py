@@ -43,12 +43,12 @@ def observe_child_tasks():
   original = asyncio.BaseEventLoop.create_task
   evidence = {'peak_active_tasks': 0, 'created_by_coroutine': {}}
 
-  def create_task(loop, coroutine, *args, **kwargs):
-    task = original(loop, coroutine, *args, **kwargs)
-    name = getattr(coroutine, '__qualname__', type(coroutine).__name__)
+  def create_task(self, coro, *args, **kwargs):
+    task = original(self, coro, *args, **kwargs)
+    name = getattr(coro, '__qualname__', type(coro).__name__)
     counts = evidence['created_by_coroutine']
     counts[name] = counts.get(name, 0) + 1
-    evidence['peak_active_tasks'] = max(evidence['peak_active_tasks'], len(asyncio.all_tasks(loop)))
+    evidence['peak_active_tasks'] = max(evidence['peak_active_tasks'], len(asyncio.all_tasks(self)))
     return task
 
   asyncio.BaseEventLoop.create_task = create_task
@@ -153,6 +153,10 @@ async def app(tmp_path, monkeypatch):
   monkeypatch.setattr(config.settings, 'ip_not_allowed', '127.0.0.0/8')
   database = importlib.import_module('database.db')
   resolver = importlib.import_module('client.domains_resolving_client')
+  monkeypatch.setattr(resolver, 'saving_coordinator', resolver.SavingCoordinator())
+  for name in ('server.server', 'routers.commands_router', 'routers.domains_router'):
+    if name in sys.modules:
+      monkeypatch.setattr(sys.modules[name], 'saving_coordinator', resolver.saving_coordinator)
   dto = importlib.import_module('models.dto.domains_dto')
   server_dto = importlib.import_module('models.dto.dns_server_dto')
   ip_dto = importlib.import_module('models.dto.ip_record_dto')
@@ -180,6 +184,12 @@ async def app(tmp_path, monkeypatch):
   try:
     yield value
   finally:
+    await resolver.saving_coordinator.stop()
+    try:
+      await resolver.saving_coordinator.finish_close()
+    except database.DatabaseWriteError:
+      # Persistence fault tests already assert the retained failure; bookkeeping still retires in finally.
+      pass
     for client in clients:
       await client.aclose()
     await cache.clear()
@@ -204,38 +214,41 @@ def resolver(app):
 
 @pytest.fixture
 def repository(app, monkeypatch):
+  queue_dto = importlib.import_module('models.dto.queue_dto')
+
+  async def confirmed(domain):
+    if domain.write_receipt is None:
+      domain.write_receipt = queue_dto.WriteReceipt()
+    domain.write_receipt.mark_admitted()
+    domain.write_receipt.set_outcome(queue_dto.WriteOutcome.CONFIRMED)
+
   boundary = SimpleNamespace(
     get_all_ips_for_domain=AsyncMock(return_value=[]),
-    put_domain_after_resolve=AsyncMock(),
+    put_domain_after_resolve=AsyncMock(side_effect=confirmed),
     put_add_domains_to_queue=AsyncMock(),
     get_dns_servers_for_resolve=AsyncMock(return_value=([], [])),
+    writer_failure=None,
+    writer_wakeups=set(),
+    wait_closed_cleanup=AsyncMock(),
   )
+
+  async def current_candidate(id, *, new=None):
+    del new
+    getter = getattr(boundary, 'get_domain_on_id', None)
+    if getter is None:
+      return None
+    record = await getter(id=id)
+    return (
+      None
+      if record is None
+      else app.dto.DomainCandidate(id=record.id, name=record.name, list_id=record.domains_list_id)
+    )
+
+  boundary.get_domain_candidate_for_resolve = AsyncMock(side_effect=current_candidate)
+  boundary.register_writer_failure_wakeup = boundary.writer_wakeups.add
+  boundary.unregister_writer_failure_wakeup = boundary.writer_wakeups.discard
   monkeypatch.setattr(app.resolver, 'db', boundary)
   return boundary
-
-
-@pytest.fixture
-def job_queues(app, monkeypatch):
-  """Observe the actual per-job queue rather than inject a shared legacy queue."""
-  queues = []
-
-  class ObservedQueue(asyncio.Queue):
-    def __init__(self, *args, **kwargs):
-      super().__init__(*args, **kwargs)
-      self.admissions = []
-      self.peak_size = 0
-      self.put_waiting = asyncio.Event()
-      queues.append(self)
-
-    async def put(self, item):
-      if self.full():
-        self.put_waiting.set()
-      await super().put(item)
-      self.admissions.append(item)
-      self.peak_size = max(self.peak_size, self.qsize())
-
-  monkeypatch.setattr(app.resolver, 'Queue', ObservedQueue)
-  return queues
 
 
 @pytest.fixture
@@ -368,6 +381,11 @@ def network(app, resolver, dns_message, monkeypatch):
 
 class ServiceProcess:
   """Run the real entrypoint with disposable settings and graceful shutdown."""
+
+  db_path: Path
+  providers: SimpleNamespace
+  dns_host: str
+  doh_url: str
 
   def __init__(self, root, directory, environment):
     self.root = root
@@ -540,6 +558,7 @@ class ServiceProcess:
         return
       if process.returncode is None:
         try:
+          assert process.stdin is not None
           process.stdin.write(b'\n')
           await process.stdin.drain()
         except BrokenPipeError, ConnectionResetError:
@@ -588,6 +607,9 @@ async def e2e_service(tmp_path, dns_message, request):
     delay=0.0,
     unavailable=False,
     hold_dns=False,
+    hold_dns_names=set(),
+    dns_entered_by_name={},
+    dns_release_by_name={},
     drop_classic=False,
     dns_entered=asyncio.Event(),
     dns_release=asyncio.Event(),
@@ -619,7 +641,7 @@ async def e2e_service(tmp_path, dns_message, request):
     def connection_made(self, transport):
       self.transport = transport
 
-    def datagram_received(self, data, address):
+    def datagram_received(self, data, addr):
       query = dns.message.from_wire(data)
       wire = response_wire(query, 'classic')
       if providers.drop_classic:
@@ -629,7 +651,7 @@ async def e2e_service(tmp_path, dns_message, request):
 
       def respond():
         try:
-          self.transport.sendto(wire, address)
+          self.transport.sendto(wire, addr)
         finally:
           providers.dns_active -= 1
 
@@ -638,8 +660,8 @@ async def e2e_service(tmp_path, dns_message, request):
       else:
         respond()
 
-    def error_received(self, error):
-      providers.errors.append(str(error))
+    def error_received(self, exc):
+      providers.errors.append(str(exc))
 
   connections = set()
 
@@ -680,6 +702,10 @@ async def e2e_service(tmp_path, dns_message, request):
           encoded = params['dns'][0]
           query = dns.message.from_wire(urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)))
           body = response_wire(query, 'doh')
+          name = query.question[0].name.to_text().rstrip('.')
+          if name in providers.hold_dns_names:
+            providers.dns_entered_by_name.setdefault(name, asyncio.Event()).set()
+            await providers.dns_release_by_name.setdefault(name, asyncio.Event()).wait()
           if providers.hold_dns:
             providers.dns_entered.set()
             await providers.dns_release.wait()
@@ -764,7 +790,9 @@ async def e2e_service(tmp_path, dns_message, request):
     coverage = Coverage.current()
     if coverage is not None:
       environment['COVERAGE_PROCESS_START'] = str(root / 'pyproject.toml')
-      environment['COVERAGE_FILE'] = str(Path(coverage.get_option('run:data_file')).resolve())
+      coverage_file = coverage.get_option('run:data_file')
+      assert isinstance(coverage_file, str)
+      environment['COVERAGE_FILE'] = str(Path(coverage_file).resolve())
     elif os.environ.get('COVERAGE_PROCESS_START'):
       environment['COVERAGE_PROCESS_START'] = os.environ['COVERAGE_PROCESS_START']
       if os.environ.get('COVERAGE_FILE'):
@@ -779,6 +807,8 @@ async def e2e_service(tmp_path, dns_message, request):
     yield service
   finally:
     providers.dns_release.set()
+    for release in providers.dns_release_by_name.values():
+      release.set()
     providers.ripe_release.set()
     try:
       if service is not None:
