@@ -2,7 +2,7 @@
 
 ## Execution Contract
 
-This repository consumes `agent-projects-tools` v1.14.0 in target project mode.
+This repository consumes `agent-projects-tools` v1.16.2 in target project mode.
 `AGENTS.md` defines bootstrap order; `.codex/rules/request_routing.md` is mandatory for every request.
 This profile declares capabilities and constraints; it grants no permission for side effects.
 Only exact active entries below and enabled specialized sections activate materials.
@@ -78,6 +78,11 @@ The full source catalog and template are not active profiles.
   rules/skills, selected model/effort, file ownership, safe commands and expected result. When architects are selected,
   downstream assignments additionally require the current approved Architecture Handoff. No role file or subagent
   delegation can widen request_routing.md permissions.
+- The PRIMARY distinguishes requested behavior, necessary safeguards for verified requirements/contracts/invariants, and
+  optional enhancements. Trace material requested behavior to the user's request; require a credible failure and
+  examination of the smallest sufficient alternative only for additional behavior claimed necessary. Do not turn risk
+  analysis or a subagent recommendation into an authorized feature. This check applies with Architecture Gate
+  NOT_REQUIRED as well as APPROVED.
 - Read-only codebase/docs research and neutral diagnosis may support architects while the gate is closed. No downstream
   implementation plan, test scenario matrix, prototype, code/test change or acceptance can be initiated before APPROVED
   for the affected scope.
@@ -164,6 +169,10 @@ primary agent owns authoritative scope-specific state and its transitions.
    silence or the deep_debugger's opinion cannot substitute for both approvals.
 1. Before that approval, when a mandatory DBA assessment applies, verify CLEAR refers to the identical canonical final
    candidate and still-matching data baseline; an initial assessment or DBA CLEAR for another revision is insufficient.
+   Before marking APPROVED, the primary also checks the canonical candidate for material new behavior without
+   requirement/contract provenance or a justified necessary safeguard. If any addition is ungrounded, withhold approval:
+   obtain an explicit user scope decision, or remove the addition and obtain BOTH architects' endorsements of the NEW
+   canonical revision (and a matching DBA CLEAR where mandatory).
    Only then may the primary independently verify scope, evidence, user request and active policies, mark APPROVED, and
    issue an Architecture Handoff with task_scope_id; unique decision_version for the scoped task; relevant requirement
    and repository baseline; immutable final design and both endorsements; primary approval; contracts, ownership
