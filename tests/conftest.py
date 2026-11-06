@@ -399,6 +399,26 @@ class ServiceProcess:
     self.log_path = directory / 'application.log'
     self.log = None
 
+  def select_source(self, root):
+    """Bind entrypoint, imports and startup migrations to one generated source snapshot."""
+    if self.process is not None:
+      raise RuntimeError('Cannot replace source while the application is running')
+    root = Path(root).resolve()
+    artifact_root = Path(__file__).resolve().parents[1] / '.pytest_cache'
+    if not root.is_relative_to(artifact_root.resolve()) or not (root / 'main.py').is_file():
+      raise ValueError('Comparison source must be a generated snapshot inside .pytest_cache')
+    migration_source = root / 'migrations'
+    if not migration_source.is_dir() or not (root / 'config/config.py').is_file():
+      raise ValueError('Comparison source is missing configuration or migrations')
+    target = self.directory / 'migrations'
+    for path in target.glob('*.py'):
+      path.unlink()
+    for path in migration_source.glob('*.py'):
+      shutil.copy2(path, target / path.name)
+    self.root = root
+    self.environment['PYTHONPATH'] = str(root)
+    self.environment['TEST_SOURCE_EVIDENCE'] = str(self.directory / 'executed-source.json')
+
   def diagnostics(self):
     return self.log_path.read_text(encoding='utf-8', errors='replace') if self.log_path.exists() else ''
 
@@ -520,6 +540,13 @@ class ServiceProcess:
       'except KeyboardInterrupt:\n'
       '  pass\n'
       'finally:\n'
+      '  if os.environ.get("TEST_SOURCE_EVIDENCE"):\n'
+      '    evidence = {"main": str(Path(sys.argv[1]).resolve()), "pythonpath": os.environ.get("PYTHONPATH"), '
+      '"modules": {name: str(Path(module.__file__).resolve()) for name, module in tuple(sys.modules.items()) '
+      'if name in ("config.config", "database.db", "metrics.metrics", "server.server") and '
+      'getattr(module, "__file__", None)}, "migrations": {path.name: sha256(path.read_bytes()).hexdigest() '
+      'for path in sorted((Path.cwd() / "migrations").glob("*.py"))}}\n'
+      '    Path(os.environ["TEST_SOURCE_EVIDENCE"]).write_text(json.dumps(evidence), encoding="utf-8")\n'
       '  if task_evidence is not None:\n'
       '    Path(os.environ["TEST_TASK_MEASUREMENTS"]).write_text(json.dumps(task_evidence), encoding="utf-8")\n'
       '  if coverage is not None:\n'

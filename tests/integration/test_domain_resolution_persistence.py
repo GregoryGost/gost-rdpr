@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from ipaddress import IPv4Address
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from time import perf_counter
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -33,7 +34,7 @@ from fastapi import FastAPI
 from prometheus_client import REGISTRY
 from prometheus_client.parser import text_string_to_metric_families
 from sqlalchemy import event, insert, select, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 pytestmark = pytest.mark.integration
@@ -363,6 +364,158 @@ async def test_same_domain_full_payload_is_fifo_and_frozen_at_admission(app, sto
   assert [(row[0], row[1], row[2] is not None) for row in rows] == [(0, 0, False), (1, 1, True), (2, 0, False)]
 
 
+@contextmanager
+def writer_variable_limit(store, limit):
+  """Lower each disposable physical writer connection on its owning aiosqlite thread."""
+  engine = store._DataBase__write_engine.sync_engine
+  actual = []
+
+  def connected(connection, record):
+    async def configure(driver):
+      await driver._execute(driver._conn.setlimit, sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, limit)
+      actual.append(await driver._execute(driver._conn.getlimit, sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+
+    connection.run_async(configure)
+
+  event.listen(engine, 'connect', connected)
+  try:
+    yield actual
+  finally:
+    event.remove(engine, 'connect', connected)
+
+
+@pytest.mark.parametrize('limit', [41, 900])
+async def test_dns_reconciliation_uses_bounded_explicit_multivalues_not_row_dispatch(app, store, limit):
+  """The approved SQL contract requires bounded statements, not an ORM executemany disguise."""
+  await add_support_domains(app, store)
+  addresses = [str(IPv4Address('12.0.0.0') + index) for index in range(241)]
+  first = await queue_resolution(app, store, 2, [*addresses[:161], addresses[0]])
+  second = await queue_resolution(app, store, 1, addresses[80:])
+  engine = store._DataBase__write_engine.sync_engine
+  dispatched = []
+
+  def observed(connection, cursor, statement, parameters, context, executemany):
+    dispatched.append((statement, parameters, executemany))
+
+  event.listen(engine, 'before_cursor_execute', observed)
+  try:
+    with writer_variable_limit(store, limit) as native_limits:
+      await flush_queue(store)
+  finally:
+    event.remove(engine, 'before_cursor_execute', observed)
+  assert native_limits == [limit]
+  assert await support_snapshot(store) == {
+    *((address, 2, None) for address in addresses[:161]),
+    *((address, 1, None) for address in addresses[80:]),
+  }
+  assert first.write_receipt.outcome.value == second.write_receipt.outcome.value == 'confirmed'
+  for table in ('rdpr_ip_records', 'rdpr_ip_supports'):
+    statements = [row for row in dispatched if row[0].upper().startswith(f'INSERT OR IGNORE INTO {table}'.upper())]
+    assert statements, table
+    assert all(not many for _, _, many in statements), (table, 'Per-row executemany dispatch is forbidden')
+    assert any('), (' in statement.partition('VALUES')[2] for statement, _, _ in statements), table
+  for statement, parameters, many in dispatched:
+    parameter_sets = parameters if many else [parameters]
+    assert all(len(values) <= min(limit, 900) for values in parameter_sets), statement
+  if limit == 900:
+    # 241 distinct globals and 322 supports must not require one dispatch per address.
+    assert len(dispatched) < 30, len(dispatched)
+  async with store._DataBase__read_engine.connect() as connection:
+    owners = dict((await connection.execute(text('SELECT ip_address, domain_id FROM rdpr_ip_records'))).all())
+  assert all(owners[address] == 2 for address in addresses[:161])
+  assert all(owners[address] == 1 for address in addresses[161:])
+
+
+async def test_large_complete_set_withdraws_all_obsolete_list_contexts_without_chunk_loss(app, store):
+  """The full desired set, all list contexts and IPv6 define the independent withdrawal oracle."""
+  await add_support_domains(app, store)
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.IpsListsDbo),
+      [{'id': value, 'name': f'list-{value}', 'url': f'https://lists.example.test/{value}'} for value in (7, 8)],
+    )
+    old = [str(IPv4Address('13.0.0.0') + index) for index in range(1103)]
+    await connection.execute(
+      insert(app.database.IpRecordsDbo),
+      [{'id': index + 1, 'domain_id': 1, 'addr_type': 4, 'ip_address': address} for index, address in enumerate(old)]
+      + [{'id': 2000, 'domain_id': 1, 'addr_type': 6, 'ip_address': '2001:4860::8888'}],
+    )
+    await connection.execute(
+      insert(app.database.IpSupportDbo),
+      [
+        {'ip_record_id': index + 1, 'domain_id': 1, 'ip_list_id': owner}
+        for index in range(len(old))
+        for owner in (7, 8)
+      ]
+      + [
+        {'ip_record_id': 1, 'domain_id': 2, 'ip_list_id': 7},
+        {'ip_record_id': 2000, 'domain_id': 1, 'ip_list_id': 8},
+      ],
+    )
+  desired = old[60:1063]
+  await queue_resolution(app, store, 1, desired)
+  with writer_variable_limit(store, 41):
+    await flush_queue(store)
+  assert await support_snapshot(store) == {
+    *((address, 1, owner) for address in desired for owner in (None, 7, 8)),
+    (old[0], 2, 7),
+    ('2001:4860::8888', 1, 8),
+  }
+  async with store._DataBase__read_engine.connect() as connection:
+    rows = dict((await connection.execute(text('SELECT ip_address,id FROM rdpr_ip_records'))).all())
+    assert (await connection.execute(text('PRAGMA foreign_key_check'))).all() == []
+  assert rows == {**{address: old.index(address) + 1 for address in desired}, old[0]: 1, '2001:4860::8888': 2000}
+
+
+async def test_insufficient_native_variable_budget_fails_before_begin_without_confirmation(app, store, monkeypatch):
+  await add_support_domains(app, store)
+  before = await support_snapshot(store)
+  result = await queue_resolution(app, store, 1, ['8.8.8.8'])
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+  statements = []
+  engine = store._DataBase__write_engine.sync_engine
+
+  def observed(connection, cursor, statement, parameters, context, executemany):
+    statements.append(statement)
+
+  event.listen(engine, 'before_cursor_execute', observed)
+  try:
+    with writer_variable_limit(store, 3):
+      await store.start_writer()
+      await asyncio.wait_for(asyncio.shield(store.writer_task), timeout=3)
+  finally:
+    event.remove(engine, 'before_cursor_execute', observed)
+  assert store.writer_state == 'FAILED'
+  assert isinstance(store.writer_failure, app.database.DatabaseWriteError)
+  assert store.writer_failure.committed is False
+  assert result.write_receipt.outcome.value == 'known_not_committed'
+  assert not any(statement.upper().startswith('BEGIN') for statement in statements)
+  assert await support_snapshot(store) == before
+
+
+@pytest.mark.parametrize('complete_tail', [True, False])
+async def test_repeated_domains_split_groups_without_reassigning_first_shared_owner(app, store, complete_tail):
+  await add_support_domains(app, store)
+  receipts = [
+    await queue_resolution(app, store, 2, ['8.8.8.8', '9.9.9.9']),
+    await queue_resolution(app, store, 1, ['8.8.8.8']),
+    await queue_resolution(app, store, 2, []),
+    await queue_resolution(app, store, 1, ['1.1.1.1'], complete=complete_tail),
+    await queue_resolution(app, store, 2, ['8.8.8.8'], complete=False),
+  ]
+  await flush_queue(store)
+  expected = {('1.1.1.1', 1, None), ('8.8.8.8', 2, None)}
+  if not complete_tail:
+    expected.add(('8.8.8.8', 1, None))
+  assert await support_snapshot(store) == expected
+  assert all(result.write_receipt.outcome.value == 'confirmed' for result in receipts)
+  async with store._DataBase__read_engine.connect() as connection:
+    owner = (
+      await connection.execute(text("SELECT domain_id FROM rdpr_ip_records WHERE ip_address='8.8.8.8'"))
+    ).scalar_one()
+  assert owner == 2
+
+
 @pytest.mark.parametrize('selector', ['domain', 'domain_list'])
 async def test_parent_deletion_removes_only_its_supports(app, store, selector):
   await add_support_domains(app, store)
@@ -580,9 +733,12 @@ async def flush_queue(store):
   while not store.db_save_queue.empty():
     elements.append(store.db_save_queue.get_nowait())
   if elements:
-    await store._DataBase__batch_items_commit(elements)
-    for _ in elements:
-      store.db_save_queue.task_done()
+    try:
+      await store._DataBase__batch_items_commit(elements)
+    finally:
+      # This manual test consumer owns queue accounting even when the batch rolls back.
+      for _ in elements:
+        store.db_save_queue.task_done()
   return elements
 
 
@@ -3895,6 +4051,133 @@ def sample_total(samples, name, **labels):
   )
 
 
+def registry_samples():
+  return {
+    (sample.name, tuple(sorted(sample.labels.items()))): sample.value
+    for family in REGISTRY.collect()
+    for sample in family.samples
+  }
+
+
+async def test_writer_sql_metrics_count_actual_dispatch_methods_and_failed_submitted_sets(app, store):
+  """A logical insertmanyvalues executemany flag is not the DBAPI method; failed sets remain attempts."""
+  engine = store._DataBase__write_engine
+  async with engine.begin() as connection:
+    await connection.execute(text('CREATE TABLE dispatch_probe (id INTEGER PRIMARY KEY, value TEXT UNIQUE)'))
+  before = registry_samples()
+  observed = []
+
+  def execute(cursor, statement, parameters, context):
+    observed.append(('execute', 1))
+
+  def many(cursor, statement, parameters, context):
+    observed.append(('executemany', len(parameters)))
+
+  def no_params(cursor, statement, context):
+    observed.append(('execute_no_params', 1))
+
+  listeners = (('do_execute', execute), ('do_executemany', many), ('do_execute_no_params', no_params))
+  for name, callback in listeners:
+    event.listen(engine.sync_engine, name, callback)
+  try:
+    async with engine.begin() as connection:
+      assert (await connection.execute(text('SELECT 7'))).scalar_one() == 7
+      assert (await connection.execute(text('SELECT 8').execution_options(no_parameters=True))).scalar_one() == 8
+      await connection.execute(
+        text('INSERT INTO dispatch_probe (id,value) VALUES (:id,:value)'),
+        [{'id': 1, 'value': 'a'}, {'id': 2, 'value': 'b'}],
+      )
+      await connection.execute(
+        insert(app.database.DomainsDbo).returning(app.database.DomainsDbo.id),
+        [{'name': 'dispatch-a.example.test'}, {'name': 'dispatch-b.example.test'}],
+      )
+    with pytest.raises(IntegrityError):
+      async with engine.begin() as connection:
+        await connection.execute(
+          text('INSERT INTO dispatch_probe (id,value) VALUES (:id,:value)'),
+          [{'id': 3, 'value': 'c'}, {'id': 4, 'value': 'a'}],
+        )
+  finally:
+    for name, callback in listeners:
+      event.remove(engine.sync_engine, name, callback)
+  after = registry_samples()
+  for method in ('execute', 'executemany', 'execute_no_params'):
+    dispatches = sum(name == method for name, _ in observed)
+    sets = sum(count for name, count in observed if name == method)
+    assert dispatches > 0
+    assert (
+      sample_total(after, 'resolution_writer_sql_dispatches_total', method=method)
+      - sample_total(before, 'resolution_writer_sql_dispatches_total', method=method)
+      == dispatches
+    )
+    assert (
+      sample_total(after, 'resolution_writer_sql_parameter_sets_total', method=method)
+      - sample_total(before, 'resolution_writer_sql_parameter_sets_total', method=method)
+      == sets
+    )
+  assert [count for method, count in observed if method == 'executemany'] == [2, 2]
+  async with engine.connect() as connection:
+    assert (await connection.execute(text('SELECT id,value FROM dispatch_probe ORDER BY id'))).all() == [
+      (1, 'a'),
+      (2, 'b'),
+    ]
+
+
+@pytest.mark.parametrize('error_type', [RuntimeError, asyncio.CancelledError])
+@pytest.mark.parametrize('boundary', ['callback', 'collector'])
+async def test_optional_writer_observation_failures_never_change_commit_receipts(
+  app, store, monkeypatch, error_type, boundary
+):
+  await add_support_domains(app, store)
+  metrics = importlib.import_module('metrics.metrics')
+
+  def unavailable(*args, **kwargs):
+    raise error_type('Synthetic optional observer failure')
+
+  if boundary == 'callback':
+    monkeypatch.setattr(app.database, 'observe_writer_sql_dispatch', unavailable)
+    monkeypatch.setattr(app.database, 'observe_writer_batch_size', unavailable)
+  else:
+    for collector in (
+      metrics.writer_sql_dispatches,
+      metrics.writer_sql_parameter_sets,
+      metrics.writer_batch_size,
+      metrics.writer_duration,
+    ):
+      monkeypatch.setattr(collector, 'labels', unavailable)
+  result = await queue_resolution(app, store, 1, ['8.8.8.8'])
+  await flush_queue(store)
+  assert result.write_receipt.outcome.value == 'confirmed'
+  assert await support_snapshot(store) == {('8.8.8.8', 1, None)}
+
+
+async def test_writer_phase_and_input_size_metrics_include_repeated_intents(app, store):
+  await add_support_domains(app, store)
+  before = registry_samples()
+  await queue_resolution(app, store, 1, ['8.8.8.8', '8.8.8.8'])
+  await queue_resolution(app, store, 1, ['9.9.9.9'], complete=False)
+  await queue_resolution(app, store, 2, [])
+  await flush_queue(store)
+  after = registry_samples()
+  for kind, expected in (('commands', 3), ('intents', 3), ('addresses', 3)):
+    assert (
+      sample_total(after, 'resolution_writer_batch_size_sum', kind=kind)
+      - sample_total(before, 'resolution_writer_batch_size_sum', kind=kind)
+      == expected
+    )
+    assert (
+      sample_total(after, 'resolution_writer_batch_size_count', kind=kind)
+      - sample_total(before, 'resolution_writer_batch_size_count', kind=kind)
+      == 1
+    )
+  for phase in ('prepare', 'reconcile', 'finish'):
+    assert (
+      sample_total(after, 'resolution_writer_duration_seconds_count', phase=phase, outcome='complete')
+      - sample_total(before, 'resolution_writer_duration_seconds_count', phase=phase, outcome='complete')
+      == 1
+    )
+
+
 def run_fields(samples, mode):
   return {
     dict(labels)['field']: value
@@ -4992,10 +5275,16 @@ async def load_api_round(client, dataset, observations, *, timeout, job_mode='st
     ('stats', 'GET', '/stats'),
     ('job', 'POST', f'/commands/domains/resolve/{job_mode}'),
   )
+  if getattr(dataset, 'probe_ip_lists', False):
+    operations += (('ip_lists', 'GET', '/ips/lists?limit=10'), ('ip_list', 'GET', '/ips/lists/1'))
   for label, method, path in operations:
     response = await load_api_request(client, observations, label, method, path, timeout=timeout)
     if label == 'read':
       assert response.json()['name'] == 'api-probe.load.example.test'
+    elif label == 'ip_lists':
+      assert [row['name'] for row in response.json()['payload']] == ['probe-addresses']
+    elif label == 'ip_list':
+      assert response.json()['name'] == 'probe-addresses'
 
 
 async def load_probe_canaries(client, observations, finished, configuration, *, job_mode, request_timeout=5):
@@ -5999,6 +6288,476 @@ def load_campaign_summary(cases):
     }
     for key, values in grouped.items()
   ]
+
+
+def batch_comparison_snapshot(source, destination):
+  """Copy an explicit source whitelist into a new generated artifact; never copy local state."""
+  source, destination = Path(source).resolve(), Path(destination).resolve()
+  repository = Path(__file__).resolve().parents[2]
+  assert destination.is_relative_to(repository / '.pytest_cache')
+  assert not destination.exists(), 'A frozen source snapshot must never be overwritten'
+  manifest = load_source_evidence(source)
+  for relative in manifest:
+    path = source / relative
+    assert not any(part.startswith('.') for part in Path(relative).parts)
+    assert not path.is_symlink()
+    assert path.resolve().is_relative_to(source)
+  destination.mkdir(parents=True)
+  for relative in manifest:
+    target = destination / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source / relative, target)
+  assert load_source_evidence(destination) == manifest
+  load_write_artifact(destination / 'source-manifest.json', {'source_sha256': manifest})
+  return manifest
+
+
+def batch_comparison_configuration():
+  """Keep this finite comparison independent of the full campaign and require explicit source selection."""
+  supplied = json.loads(os.environ.get('GOST_BATCH_COMPARE_CONFIG', '{}'))
+  assert isinstance(supplied, dict)
+  defaults = {
+    'variant': None,
+    'source_root': None,
+    'bounds_path': None,
+    'smoke': False,
+    'n': 10000,
+    'repetitions': 3,
+    'warmup_size': 128,
+    'seed': 20261106,
+    'unique_ip_ratio': 0.7,
+    'alias_every': 10,
+    'provider_delay': 0.001,
+    'pass_timeout': 1800,
+    'verify_timeout': 600,
+    'rss_limit_mb': 2048,
+    'cpu_percent_limit': 200,
+    'probe_interval': 0.25,
+    'baseline_samples': 20,
+    'latency_factor': 10,
+    'latency_slack': 0.1,
+  }
+  assert set(supplied) <= set(defaults), 'Unknown comparison configuration field'
+  configuration = defaults | supplied
+  assert configuration['variant'] in {'before', 'after', 'smoke'}
+  assert type(configuration['smoke']) is bool
+  assert configuration['smoke'] == (configuration['variant'] == 'smoke')
+  for key in ('n', 'repetitions', 'warmup_size', 'seed', 'alias_every', 'baseline_samples'):
+    assert type(configuration[key]) is int, key
+    assert configuration[key] > 0, key
+  if configuration['smoke']:
+    assert configuration['n'] <= 64
+    assert configuration['repetitions'] == 1
+  else:
+    assert configuration['n'] == 10000
+    assert 3 <= configuration['repetitions'] <= 5
+  assert configuration['warmup_size'] <= configuration['n']
+  for key in (
+    'unique_ip_ratio',
+    'pass_timeout',
+    'verify_timeout',
+    'rss_limit_mb',
+    'cpu_percent_limit',
+    'probe_interval',
+    'latency_factor',
+    'latency_slack',
+  ):
+    assert isinstance(configuration[key], int | float)
+    assert math.isfinite(configuration[key])
+    assert configuration[key] > 0, key
+  assert 0 < configuration['unique_ip_ratio'] <= 1
+  assert 0 <= configuration['provider_delay'] <= 1
+  assert configuration['pass_timeout'] <= 3600
+  assert configuration['verify_timeout'] <= 1200
+  assert configuration['baseline_samples'] <= 100
+  assert configuration['warmup_size'] <= 10000
+  repository = Path(__file__).resolve().parents[2]
+  for key in ('source_root', 'bounds_path'):
+    assert isinstance(configuration[key], str), key
+    assert configuration[key], key
+    path = Path(configuration[key]).resolve()
+    assert path.is_relative_to(repository / '.pytest_cache'), key
+    configuration[key] = str(path)
+  return configuration
+
+
+def batch_comparison_metric_delta(before, after):
+  """Retain all bounded writer series, separating attempted dispatches and parameter sets."""
+  prefixes = ('resolution_writer_duration_seconds', 'resolution_writer_batch_size', 'resolution_writer_sql_')
+  return [
+    {
+      'name': name,
+      'labels': dict(labels),
+      'before': before.get((name, labels), 0),
+      'after': value,
+      'delta': value - before.get((name, labels), 0),
+    }
+    for (name, labels), value in after.items()
+    if name.startswith(prefixes) and not name.endswith('_created')
+  ]
+
+
+def batch_comparison_executed_source(service, manifest):
+  """Check child-reported imports and physical startup migrations after graceful process exit."""
+  evidence = json.loads((service.directory / 'executed-source.json').read_text(encoding='utf-8'))
+  assert Path(evidence['main']) == service.root / 'main.py'
+  assert Path(evidence['pythonpath']) == service.root
+  for module in ('config.config', 'database.db', 'metrics.metrics', 'server.server'):
+    assert Path(evidence['modules'][module]) == service.root / (module.replace('.', '/') + '.py')
+  expected = {Path(name).name: value for name, value in manifest.items() if name.startswith('migrations/')}
+  assert evidence['migrations'] == expected
+  assert load_source_evidence(service.root) == manifest, 'Measured source snapshot changed'
+  return evidence
+
+
+def batch_comparison_seed(service, dataset):
+  elapsed = load_prepare_offline(service, dataset, stale=True, reset=True)
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    connection.execute('PRAGMA foreign_keys=ON')
+    # Startup clocks differ between revisions; retain the standalone row with a fixed checkpoint.
+    connection.execute("UPDATE rdpr_domains SET last_resolved_at='2000-01-01 00:00:00' WHERE id=0")
+    connection.execute(
+      'INSERT INTO rdpr_ips_lists (id,name,url,attempts) '
+      "VALUES (1,'probe-addresses','https://lists.example.test/probe',0) ON CONFLICT(id) DO NOTHING"
+    )
+    connection.execute('INSERT INTO rdpr_ip_supports (ip_record_id,domain_id,ip_list_id) VALUES (2,1,1)')
+    assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
+    # Hash the full seeded domain checkpoints and ownership data.
+    seed_rows = [
+      connection.execute(query).fetchall()
+      for query in (
+        'SELECT id,name,resolved,last_resolved_at FROM rdpr_domains ORDER BY id',
+        'SELECT id,domain_id,addr_type,ip_address FROM rdpr_ip_records ORDER BY id',
+        'SELECT ip_record_id,domain_id,ip_list_id FROM rdpr_ip_supports ORDER BY id',
+      )
+    ]
+  return elapsed, sha256(json.dumps(seed_rows).encode()).hexdigest()
+
+
+async def test_batch_comparison_seed_converges_startup_checkpoints_without_omitting_standalone_domain(
+  app, store, tmp_path
+):
+  """Different startup clocks must yield identical initial data without weakening its hash guard."""
+  service = SimpleNamespace(
+    process=None,
+    db_path=tmp_path / app.settings.db_file_name,
+    directory=tmp_path,
+    root=Path(__file__).resolve().parents[2],
+  )
+  configuration = {'seed': 20261106, 'unique_ip_ratio': 0.7, 'alias_every': 10, 'provider_delay': 0.001}
+  dataset = ResolutionLoadDataset(3, configuration)
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.DomainsDbo).values(
+        id=0,
+        name='default',
+        resolved=True,
+        ros_comment='Default Domain',
+        last_resolved_at=STALE_CHECKPOINT,
+      )
+    )
+  seeded_rows, hashes = [], []
+  for checkpoint in ('2026-11-05 23:26:32', '2026-11-05 23:34:38'):
+    with closing(sqlite3.connect(service.db_path)) as connection, connection:
+      connection.execute('UPDATE rdpr_domains SET last_resolved_at=? WHERE id=0', (checkpoint,))
+      assert connection.execute('SELECT last_resolved_at FROM rdpr_domains WHERE id=0').fetchone() == (checkpoint,)
+      standalone_before = connection.execute(
+        'SELECT id,name,resolved,ros_comment,created_at,updated_at FROM rdpr_domains WHERE id=0'
+      ).fetchone()
+    _, initial_hash = batch_comparison_seed(service, dataset)
+    hashes.append(initial_hash)
+    with closing(sqlite3.connect(service.db_path)) as connection:
+      assert (
+        connection.execute(
+          'SELECT id,name,resolved,ros_comment,created_at,updated_at FROM rdpr_domains WHERE id=0'
+        ).fetchone()
+        == standalone_before
+      )
+      domains = connection.execute('SELECT id,name,resolved,last_resolved_at FROM rdpr_domains ORDER BY id').fetchall()
+      assert domains[0] == (0, 'default', 1, '2000-01-01 00:00:00')
+      assert len(domains) == dataset.count + 2
+      seeded_rows.append(
+        (
+          domains,
+          connection.execute('SELECT id,domain_id,addr_type,ip_address FROM rdpr_ip_records ORDER BY id').fetchall(),
+          connection.execute('SELECT ip_record_id,domain_id,ip_list_id FROM rdpr_ip_supports ORDER BY id').fetchall(),
+        )
+      )
+  assert seeded_rows[0] == seeded_rows[1]
+  assert hashes[0] == hashes[1]
+  # A real change to the retained standalone row must still invalidate the initial-data guard.
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    connection.execute("UPDATE rdpr_domains SET name='standalone' WHERE id=0")
+  _, changed_hash = batch_comparison_seed(service, dataset)
+  assert changed_hash != hashes[0]
+
+
+@pytest.mark.parametrize(
+  'configuration', [{}, {'variant': 'before', 'n': 156298}, {'variant': 'before', 'repetitions': 1}]
+)
+def test_batch_comparison_requires_explicit_bounded_selection(monkeypatch, configuration):
+  monkeypatch.setenv('GOST_BATCH_COMPARE_CONFIG', json.dumps(configuration))
+  with pytest.raises(AssertionError):
+    batch_comparison_configuration()
+
+
+def test_batch_comparison_snapshot_copies_only_whitelisted_source_and_is_immutable(tmp_path):
+  root = Path(__file__).resolve().parents[2]
+  source = tmp_path / 'source'
+  for relative in (
+    'main.py',
+    'pyproject.toml',
+    'poetry.lock',
+    'tests/conftest.py',
+    f'tests/integration/{Path(__file__).name}',
+    'config/config.py',
+    'migrations/example.py',
+  ):
+    path = source / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('# synthetic source\n', encoding='utf-8')
+  (source / '.env').write_text('NOT_A_REAL_SECRET=excluded\n', encoding='utf-8')
+  (source / 'user.sqlite').write_bytes(b'excluded')
+  with TemporaryDirectory(prefix='source-copy-', dir=root / '.pytest_cache') as directory:
+    destination = Path(directory) / 'frozen-source'
+    manifest = batch_comparison_snapshot(source, destination)
+    assert set(manifest) == {
+      'main.py',
+      'pyproject.toml',
+      'poetry.lock',
+      'tests/conftest.py',
+      f'tests/integration/{Path(__file__).name}',
+      'config/config.py',
+      'migrations/example.py',
+    }
+    assert {path.relative_to(destination).as_posix() for path in destination.rglob('*') if path.is_file()} == {
+      *manifest,
+      'source-manifest.json',
+    }
+    with pytest.raises(AssertionError, match='never be overwritten'):
+      batch_comparison_snapshot(source, destination)
+
+
+@pytest.mark.e2e
+@pytest.mark.e2e_load
+@pytest.mark.skipif(
+  'GOST_BATCH_COMPARE_CONFIG' not in os.environ,
+  reason='The revision comparison requires an explicitly selected configuration',
+)
+@pytest.mark.parametrize('e2e_service', [{'start': False, 'load': True, 'request_sample_limit': 128}], indirect=True)
+async def test_ip_persistence_revision_comparison(e2e_service, tmp_path):
+  """Run one explicitly selected frozen revision with shared guards and no full-campaign defaults."""
+  configuration = batch_comparison_configuration()
+  service = e2e_service
+  source_root = Path(configuration['source_root'])
+  manifest = load_source_evidence(source_root)
+  assert json.loads((source_root / 'source-manifest.json').read_text(encoding='utf-8'))['source_sha256'] == manifest
+  service.select_source(source_root)
+  # Fixed test resource settings apply identically to both revisions; no algorithm selector exists.
+  service.environment.update({'DB_SAVE_BATCH_SIZE': '256', 'DB_SAVE_BATCH_TIMEOUT': '0.25'})
+  bounds_path = Path(configuration['bounds_path'])
+  artifact_path = tmp_path / 'ip-persistence-comparison.json'
+  workload = {
+    key: value for key, value in configuration.items() if key not in {'variant', 'source_root', 'bounds_path'}
+  }
+  evidence = {
+    'configuration': configuration,
+    'workload': workload,
+    'source_sha256': manifest,
+    'harness_sha256': {
+      name: sha256((Path(__file__).resolve().parents[2] / name).read_bytes()).hexdigest()
+      for name in ('tests/conftest.py', f'tests/integration/{Path(__file__).name}')
+    },
+    'environment': {
+      'python': sys.version,
+      'executable_sha256': sha256(Path(sys.executable).read_bytes()).hexdigest(),
+      'sqlite': sqlite3.sqlite_version,
+      'platform': platform.platform(),
+      'processor': platform.processor(),
+      'logical_cpu_count': os.cpu_count(),
+      'versions': {
+        name: importlib.metadata.version(name)
+        for name in ('sqlalchemy', 'aiosqlite', 'httpx', 'fastapi', 'cashews', 'uvicorn', 'pytest')
+      },
+    },
+    'executed_paths': {
+      'main': str(source_root / 'main.py'),
+      'pythonpath': service.environment['PYTHONPATH'],
+      'config': str(source_root / 'config/config.py'),
+      'migrations': str(service.directory / 'migrations'),
+    },
+    'measurement_scope': 'attempted application writer DBAPI dispatch and phase metrics include auxiliary API writes',
+    'cache_precondition': 'cold process-local cache on every warmup and measured pass',
+    'status': 'in_progress',
+    'cases': [],
+  }
+  assert {name: manifest[name] for name in evidence['harness_sha256']} == evidence['harness_sha256'], (
+    'Executed harness differs from the frozen source manifest'
+  )
+  load_write_artifact(artifact_path, evidence)
+  try:
+    await service.start()
+    await load_public_setup(service, 30)
+    await service.stop()
+    evidence['startup_source'] = batch_comparison_executed_source(service, manifest)
+    effective = load_effective_settings(service)
+    evidence['effective_settings'] = effective
+    comparable_settings = {
+      key: value for key, value in effective.items() if key not in {'DB_BASE_DIR', 'DB_FILE_NAME', 'RIPE_STAT_BASE_URL'}
+    }
+    compatibility = {
+      'workload': workload,
+      'effective_settings': comparable_settings,
+      'harness_sha256': evidence['harness_sha256'],
+      'runtime': evidence['environment'],
+      'common_source_sha256': {name: value for name, value in manifest.items() if name != 'database/db.py'},
+    }
+    if configuration['variant'] == 'after':
+      shared = json.loads(bounds_path.read_text(encoding='utf-8'))
+      assert shared['compatibility'] == compatibility, 'Settings, harness or workload changed between revisions'
+      assert shared['dataset'] == ResolutionLoadDataset(configuration['n'], configuration).manifest()
+    else:
+      assert not bounds_path.exists(), 'Frozen bounds cannot be overwritten'
+      idle = ResolutionLoadDataset(configuration['n'], configuration)
+      idle.probe_ip_lists = True
+      _, initial_sha = batch_comparison_seed(service, idle)
+      # No source domain is stale during the idle baseline; only explicit canaries resolve.
+      with closing(sqlite3.connect(service.db_path)) as connection, connection:
+        connection.execute("UPDATE rdpr_domains SET last_resolved_at='2100-01-01 00:00:00' WHERE id>0")
+      service.providers.response_factory = idle.response
+      await service.start()
+      baseline = await load_freeze_api_bounds(service, idle, configuration)
+      await service.stop()
+      assert {
+        'ip_lists',
+        'ip_list',
+        'read',
+        'list',
+        'stats',
+        'job',
+        'write',
+        'search',
+        'delete',
+        'stored_resolve',
+      } <= set(baseline['bounds_seconds'])
+      shared = {
+        'compatibility': compatibility,
+        'baseline': baseline,
+        'baseline_source_sha256': manifest,
+        'dataset': idle.manifest(),
+        'measured_initial_data_sha256': initial_sha,
+      }
+      bounds_path.parent.mkdir(parents=True, exist_ok=True)
+      load_write_artifact(bounds_path, shared)
+    evidence['shared_bounds_sha256'] = sha256(bounds_path.read_bytes()).hexdigest()
+    evidence['shared_bounds'] = shared
+    for repetition in range(configuration['repetitions'] + 1):
+      warmup = repetition == 0
+      dataset = ResolutionLoadDataset(configuration['warmup_size'] if warmup else configuration['n'], configuration)
+      dataset.probe_ip_lists = True
+      service.providers.response_factory = dataset.response
+      await load_begin_provider_cycle(service.providers, f'comparison-{repetition}')
+      service.providers.reset_evidence()
+      seed_seconds, initial_sha = batch_comparison_seed(service, dataset)
+      if not warmup:
+        assert initial_sha == shared['measured_initial_data_sha256'], 'Initial data differs from frozen fixture'
+      entry = {
+        'repetition': repetition,
+        'warmup': warmup,
+        'measured': not warmup,
+        'status': 'in_progress',
+        'dataset': dataset.manifest(),
+        'initial_data_sha256': initial_sha,
+        'seed_seconds_excluded': seed_seconds,
+        'measurement': {},
+      }
+      evidence['cases'].append(entry)
+      load_write_artifact(artifact_path, evidence)
+      try:
+        await service.start()
+        async with httpx.AsyncClient(base_url=service.url, timeout=5, trust_env=False) as client:
+          raw_before = (await client.get('/metrics')).text
+        entry['raw_metrics_before'] = raw_before
+        await load_measure_pass(
+          service,
+          dataset,
+          configuration,
+          shared['baseline']['bounds_seconds'],
+          mode='stale',
+          p99_bounds=shared['baseline']['p99_bounds_seconds'],
+          measurement=entry['measurement'],
+          on_progress=lambda progress, entry=entry: (
+            entry.update(progress=progress),
+            load_write_artifact(artifact_path, evidence),
+          ),
+        )
+        async with httpx.AsyncClient(base_url=service.url, timeout=5, trust_env=False) as client:
+          raw_after = (await client.get('/metrics')).text
+          entry['verification'] = await load_verify_public(client, dataset, configuration['verify_timeout'])
+        entry['writer_metric_deltas'] = batch_comparison_metric_delta(
+          parse_samples(raw_before), parse_samples(raw_after)
+        )
+        entry['raw_metrics_before'] = raw_before
+        entry['raw_metrics_after'] = raw_after
+        phases = {
+          row['labels'].get('phase')
+          for row in entry['writer_metric_deltas']
+          if row['name'] == 'resolution_writer_duration_seconds_count' and row['delta'] > 0
+        }
+        assert {'prepare', 'reconcile', 'finish', 'transaction', 'commit'} <= phases
+        assert any(
+          row['name'] == 'resolution_writer_sql_dispatches_total' and row['delta'] > 0
+          for row in entry['writer_metric_deltas']
+        )
+        await service.stop()
+        entry['executed_source'] = batch_comparison_executed_source(service, manifest)
+        await service.start()
+        async with httpx.AsyncClient(base_url=service.url, timeout=5, trust_env=False) as client:
+          entry['restart_verification'] = await load_verify_public(client, dataset, configuration['verify_timeout'])
+        await service.stop()
+        entry['restart_source'] = batch_comparison_executed_source(service, manifest)
+        entry['status'] = 'passed'
+      except BaseException as error:
+        entry['status'] = 'failed'
+        entry['failure'] = {'type': type(error).__name__, 'message': str(error)[:4000]}
+        raise
+      finally:
+        entry['providers'] = service.providers.evidence()
+        if service.process is not None:
+          try:
+            async with httpx.AsyncClient(base_url=service.url, timeout=5, trust_env=False) as client:
+              entry['raw_metrics_at_cleanup'] = (await client.get('/metrics')).text
+          except httpx.HTTPError, TimeoutError:
+            entry['cleanup_metrics_unavailable'] = True
+          await service.stop(allow_failure=True)
+        load_write_artifact(artifact_path, evidence)
+    measured = [case for case in evidence['cases'] if case['measured'] and case['status'] == 'passed']
+    assert len(measured) == configuration['repetitions']
+    assert len({case['initial_data_sha256'] for case in measured}) == 1
+    elapsed = [case['measurement']['wall_seconds_to_known_writer_outcomes'] for case in measured]
+    evidence['summary'] = {
+      'complete_measured_passes': len(elapsed),
+      'median_seconds': statistics.median(elapsed),
+      'min_seconds': min(elapsed),
+      'max_seconds': max(elapsed),
+      'spread_seconds': max(elapsed) - min(elapsed),
+      'acceptance_scale': not configuration['smoke'],
+    }
+    evidence['status'] = 'passed'
+  except BaseException as error:
+    evidence['status'] = 'failed'
+    evidence['failure'] = {'type': type(error).__name__, 'message': str(error)[:4000]}
+    raise
+  finally:
+    triggering_failure = sys.exception()
+    evidence['final_source_sha256'] = load_source_evidence(service.root)
+    evidence['source_stable'] = evidence['final_source_sha256'] == manifest
+    if not evidence['source_stable']:
+      evidence['status'] = 'failed'
+      evidence['source_failure'] = 'Source snapshot changed during measurement'
+    load_write_artifact(artifact_path, evidence)
+    if not evidence['source_stable'] and triggering_failure is None:
+      raise AssertionError('Source snapshot changed during measurement')
 
 
 @pytest.mark.e2e

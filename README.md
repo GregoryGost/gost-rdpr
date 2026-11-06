@@ -203,6 +203,17 @@ shutdown without waiting for that timeout. Each successful queue receive restart
 can extend collection until `DB_SAVE_BATCH_SIZE` is reached. The timeout does not limit the oldest command's age
 or its wait for commit.
 
+DNS results are prepared before the write transaction and reconciled in ordered groups. Repeated results for one
+domain keep their admission order. Global IP records and independent support relationships use explicit multi-row
+inserts, with IDs matched by the exact address string. Complete results withdraw obsolete IPv4 supports by their
+support IDs; partial results only add evidence. Global orphan cleanup and representative repair still run once after
+all command categories, preserving shared IP identity during transfers between domains.
+
+SQL portions are independent of `DB_SAVE_BATCH_SIZE`. They use the physical connection's native parameter limit,
+capped at 900 parameters, including client defaults and query predicates. Large results remain in one transaction.
+The native limit bridge is verified for aiosqlite 0.22.1 and fails closed for unsupported versions or insufficient
+limits; revalidate that driver boundary before upgrades. This change does not require a schema migration.
+
 Only SQLite busy/locked failures before commit are retried, after the failed transaction has been rolled back and
 released. The same batch stays ahead of later commands, with at most three attempts and delays of 0.1 and 0.2 seconds.
 Commit errors and cancellation are not automatically replayed because their persistence outcome can be unknown.
@@ -326,7 +337,10 @@ All durations use monotonic clocks and seconds. Nested phase durations overlap a
 | `resolution_dns_duration_seconds`, `resolution_dns_semaphore_wait_seconds` | DNS query/validation and semaphore wait by server ID, transport, record type and outcome |
 | `resolution_ripe_duration_seconds` | RIPEstat cache, lock, network and logical lookup phases |
 | `resolution_queue_duration_seconds` | Queue admission, residence and pending-batch waits |
-| `resolution_writer_duration_seconds` | Write attempts, transactions, commit and cleanup phases |
+| `resolution_writer_duration_seconds` | Write attempts, preparation, IP reconciliation, final support cleanup, transactions, commit and session cleanup |
+| `resolution_writer_batch_size` | Commands, resolution intents and input address entries per prepared attempt; retries count again |
+| `resolution_writer_sql_dispatches_total` | Attempted write-engine DBAPI calls by actual execute, executemany or execute_no_params method |
+| `resolution_writer_sql_parameter_sets_total` | Submitted parameter sets by actual DBAPI method; a multi-VALUES execute counts one set |
 | `resolution_run_events_total`, `resolution_run_elapsed_seconds` | Cumulative run events and processing duration |
 | `resolution_run_snapshot` | Fields of the latest started run for each `new`, `stale` or `stored` mode |
 
@@ -361,6 +375,12 @@ through processing and known persistence completion. Final rates have explicit `
 interrupted or zero-duration measurements are invalid and use `NaN`, rather than a fabricated zero. A completed run
 with no required writes can have a valid saved rate of zero. Late receipts from an older run cannot replace a newer
 run's snapshot for the same mode. All observations are process-local and do not provide crash durability.
+
+Writer SQL counters observe actual dialect dispatch, including failed attempts and startup statements. They do not
+count successful SQLite virtual-machine statements, trigger work, native commit/rollback or raw connection PRAGMAs.
+An `executemany` call submits several parameter sets; an explicit multi-VALUES `execute` submits one. Compare metric
+deltas over the same workload boundary. Mixed workload measurements include auxiliary API writes. The callback,
+counter updates and phase observations remain inside the measured work; observations do not own commit receipts.
 
 ### Local load campaigns and API responsiveness
 
@@ -454,6 +474,102 @@ restart verification, calibrated provider capacity, generator overhead, actual c
 repetition summaries. `resolution-load-resilience.json` records bounded priority/failure/recovery/soak/shutdown
 scenarios. Retain the artifact directory when inspecting a failure; partial and failed cases must not be treated as
 successful comparisons. Ordinary unit/integration/E2E regressions and configured quality/coverage checks run separately.
+
+### IP persistence revision comparison
+
+The separate revision comparison uses 10000 source domains and at least three measured passes after excluded warmup.
+It keeps one cold process-local cache per pass, identical settings and provider schedules, and shared frozen API guards.
+It verifies every source domain through the API and after restart. This bounded comparison does not establish the
+full-population 15-30 minute target and does not select production defaults.
+
+Preserve the instrumented original source before changing the persistence algorithm. Each immutable snapshot includes
+the explicit application source whitelist, the shared test harness and `source-manifest.json`. The child entrypoint,
+imports, configuration and migrations must all use that snapshot. Before/after compatibility checks require every
+common input, including instrumentation and the harness, to match; only `database/db.py` may differ.
+
+The recorded local snapshots are under `.pytest_cache/ip_batch_20261106/before-source-v3` and `after-source-v3`.
+With those snapshots and the matching repository harness, run a new pair with fresh output and guard paths:
+
+```powershell
+$comparisonRoot = (Resolve-Path '.pytest_cache/ip_batch_20261106').Path
+$comparisonBounds = Join-Path $comparisonRoot ('bounds-' + [guid]::NewGuid().ToString('N') + '.json')
+$previousComparisonConfig = $env:GOST_BATCH_COMPARE_CONFIG
+try {
+  foreach ($comparisonVariant in @('before', 'after')) {
+    $comparisonTemp = Join-Path $comparisonRoot ($comparisonVariant + '-' + [guid]::NewGuid().ToString('N'))
+    $env:GOST_BATCH_COMPARE_CONFIG = @{
+      variant = $comparisonVariant
+      source_root = (Join-Path $comparisonRoot ($comparisonVariant + '-source-v3'))
+      bounds_path = $comparisonBounds
+      n = 10000
+      repetitions = 3
+      warmup_size = 128
+      pass_timeout = 1800
+      verify_timeout = 600
+    } | ConvertTo-Json -Compress
+    .\.venv\Scripts\python.exe -B -m pytest -n 0 -m e2e_load `
+      tests/integration/test_domain_resolution_persistence.py::test_ip_persistence_revision_comparison `
+      -p no:cacheprovider --basetemp $comparisonTemp
+    if ($LASTEXITCODE -ne 0) { throw 'IP persistence comparison failed' }
+  }
+} finally {
+  $env:GOST_BATCH_COMPARE_CONFIG = $previousComparisonConfig
+}
+```
+
+The new comparison is skipped by the ordinary load selection unless `GOST_BATCH_COMPARE_CONFIG` is supplied.
+An explicitly supplied invalid configuration fails. Smoke mode is limited to 64 domains and one measured pass;
+its artifacts cannot satisfy comparison acceptance. Retain raw JSON, logs and failed attempts, and use fresh paths
+instead of overwriting a recorded source, guard file or result directory.
+
+The completed local comparison on 2026-11-06 used Python 3.15.2, SQLite 3.53.4, SQLAlchemy 2.1.6,
+aiosqlite 0.22.1, Windows 11, an i5-13600KF and 64 GiB RAM. Both revisions used batch size 256,
+flush timeout 0.25s, four resolution workers and the same deterministic providers and seeded ownership/checkpoints.
+Every measured pass verified all 10000 source results through the API and after restart. The three source timings
+were 152.672/146.545/144.659s before and 82.975/82.246/82.442s after: median speedup **1.778x**,
+or **43.74% less time**.
+
+| Measurement | Before | Batched |
+| --- | ---: | ---: |
+| Median confirmed source-pass time, s | 146.545 | 82.442 |
+| Timing spread, max minus min, s | 8.013 | 0.729 |
+| Median attempted writer DBAPI dispatches | 110249 | 847 |
+| Median aggregate preparation, s | 0.0111 | 0.0723 |
+| Median aggregate IP/support reconciliation, s | 141.580 | 4.827 |
+| Median aggregate global finish, s | 0.450 | 0.932 |
+| Median aggregate transaction, s | 142.460 | 6.690 |
+| Median aggregate commit, s | 0.141 | 0.364 |
+| Median application CPU time, s | 162.938 | 82.594 |
+| Median CPU, percent of one core | 111.19 | 100.18 |
+| Median per-pass peak RSS, MiB | 141.16 | 138.47 |
+| Maximum sampled HTTP latency, ms | 141.43 | 170.43 |
+| Maximum per-pass route p99, ms | 128.17 | 158.69 |
+
+Phase totals are nested and include auxiliary API writes; do not add them or equate them with source wall time.
+Actual prepared attempts numbered 44-45 before and 45-46 after, averaging 240-250 commands per attempt.
+The global finish algorithm was preserved and its cost was measured separately. Its aggregate time and commit time
+increased in this workload; reconciliation and end-to-end elapsed time improved. Nine routes were sampled under load:
+domain detail/list, search, statistics, job status, IP-list detail/list, additions and deletions. `stored_resolve` was
+an additional idle-baseline route only. Every measured route met its frozen 5s maximum and 1s p99 limits, with no HTTP
+failures. Per-pass CPU remained below 200% of one core and peak RSS below 2048 MiB. These bounds describe this local
+comparison; they do not establish full-population acceptance or unchanged individual API percentiles.
+
+Raw passes, exact hashes, settings, resources, route samples and guards are retained in
+`.pytest_cache/ip_batch_20261106/{before,after}-run-03/test_ip_persistence_revision_c0/ip-persistence-comparison.json`.
+The combined `comparison-summary.json` in the same comparison root links both raw files and their SHA256 values.
+An earlier pair failed before the first measured batched pass because startup assigned domain 0 a different current
+checkpoint. Those artifacts were retained; the offline fixture now assigns that checkpoint deterministically, keeps
+the complete selected-data hash guard, and the final pair was repeated in full. Generated metadata timestamps are
+outside that hash. An isolated observer benchmark measured a median 1.659 microseconds per callback across three
+100000-call repetitions after warmup; SQLAlchemy event-framework overhead is outside that isolated measurement and
+all observation overhead remains inside the application timings.
+
+Functional validation passed 784 serial non-load tests before the final fixture-only correction; nine focused fixture
+checks passed afterwards. Independent production and fixture reviews found no actionable issues. P1-14 was accepted
+on 2026-11-06 after the user explicitly confirmed that repository-wide Ruff/format/Pyright failures and the coverage
+threshold do not block this task. Recorded results remain: coverage 71.23% against 85%, Ruff 696 errors, 50 files
+requiring formatting, and Pyright 60 errors/0 warnings. The changed Python paths pass Ruff and format checks.
+Tool settings and historical validation verdicts were preserved; this acceptance exception applies only to P1-14.
 
 ### Bounded parameter screening outcome
 

@@ -13,14 +13,16 @@ from asyncio import (
   wait_for,
 )
 from collections.abc import Sequence
+from contextlib import suppress
 from datetime import UTC, datetime
 from enum import StrEnum
 from importlib.machinery import ModuleSpec
 from importlib.util import module_from_spec, spec_from_file_location
+from itertools import batched
 from json import loads
 from pathlib import Path
 from re import findall
-from sqlite3 import SQLITE_BUSY, SQLITE_LOCKED
+from sqlite3 import SQLITE_BUSY, SQLITE_LIMIT_VARIABLE_NUMBER, SQLITE_LOCKED
 from sqlite3 import Error as SQLiteError
 from time import monotonic, perf_counter
 from types import ModuleType
@@ -40,6 +42,9 @@ from logger.logger import Logger, logger
 from metrics.metrics import (
   log_persistence_summaries,
   observe_duration,
+  observe_writer_batch_size,
+  observe_writer_phase,
+  observe_writer_sql_dispatch,
   persistence_summaries,
   queue_duration,
   writer_duration,
@@ -109,6 +114,11 @@ from utils.utils import calculate_checksum, check_ip_allow, get_ip_version
 LEGACY_IMPORT_MIGRATION = 'migration_202511031501.py'
 GATEWAY_MIGRATION = 'migration_202618042122.py'
 IP_SUPPORT_MIGRATION = 'migration_202618042123.py'
+DNS_SQL_PARAMETER_CAP = 900
+DNS_GLOBAL_ROW_BINDS = 4
+DNS_SUPPORT_ROW_BINDS = 3
+DNS_SUPPORT_PAGE_FIXED_BINDS = 4
+DNS_SUPPORT_PAGE_SIZE = 256
 STARTUP_MIGRATION_CHECKSUMS = {
   LEGACY_IMPORT_MIGRATION: '293ddda35db4553c0174d8ecb07902add5bb664a7137e0ce6f36a05899b83fa7',
   GATEWAY_MIGRATION: '563a6f0d402a11b7e044b60ec29a64cf81f3216f00f3aacc5da2da82cf72e80c',
@@ -236,6 +246,9 @@ class DataBase:
     )
     event.listen(self.__read_engine.sync_engine, 'connect', self.__configure_connection)
     event.listen(self.__write_engine.sync_engine, 'connect', self.__configure_connection)
+    event.listen(self.__write_engine.sync_engine, 'do_execute', self.__observe_execute)
+    event.listen(self.__write_engine.sync_engine, 'do_executemany', self.__observe_executemany)
+    event.listen(self.__write_engine.sync_engine, 'do_execute_no_params', self.__observe_execute_no_params)
     self.__read_engine.dialect.identifier_preparer.initial_quote = ''
     self.__read_engine.dialect.identifier_preparer.final_quote = ''
     self.__write_engine.dialect.identifier_preparer.initial_quote = ''
@@ -365,6 +378,22 @@ class DataBase:
         cursor.close()
     except Exception as err:
       raise DatabaseConfigurationError('Cannot configure SQLite connection') from err
+
+  @staticmethod
+  def __observe_execute(cursor: Any, statement: str, parameters: Any, context: Any) -> None:
+    # Returning None leaves dialect execution untouched, including insertmanyvalues.
+    with suppress(Exception, CancelledError):
+      observe_writer_sql_dispatch('execute', 1)
+
+  @staticmethod
+  def __observe_executemany(cursor: Any, statement: str, parameters: Sequence[Any], context: Any) -> None:
+    with suppress(Exception, CancelledError):
+      observe_writer_sql_dispatch('executemany', len(parameters))
+
+  @staticmethod
+  def __observe_execute_no_params(cursor: Any, statement: str, context: Any) -> None:
+    with suppress(Exception, CancelledError):
+      observe_writer_sql_dispatch('execute_no_params', 1)
 
   async def __create_tables(self: Self) -> None:
     """Initialize schema, migrations, imported data and defaults atomically."""
@@ -2476,31 +2505,112 @@ class DataBase:
           insert(IpSupportDbo).values(ip_record_id=created, domain_id=item['domain_id'], ip_list_id=item['ip_list_id'])
         )
 
-  async def __reconcile_domain(self, session: AsyncSession, intent: DomainResolutionIntent) -> None:
-    """Apply a complete prepared set or additive partial evidence in writer order."""
-    if intent.id <= 0 or not (await session.execute(select(DomainsDbo.id).where(DomainsDbo.id == intent.id))).first():
-      raise DatabaseWriteError('Resolved domain is unavailable')
-    addresses = tuple(dict.fromkeys(intent.storage_ips))
-    for address in addresses:
-      addr_type = get_ip_version(address)
-      if addr_type != 4:
+  @staticmethod
+  def __prepare_domain_groups(intents: list[DomainResolutionIntent]) -> list[tuple[DomainResolutionIntent, ...]]:
+    """Freeze validated address sets and preserve repeated-domain admission order."""
+    groups: list[tuple[DomainResolutionIntent, ...]] = []
+    group: list[DomainResolutionIntent] = []
+    domain_ids: set[int] = set()
+    for intent in intents:
+      addresses = tuple(dict.fromkeys(intent.storage_ips))
+      if any(get_ip_version(address) != 4 for address in addresses):
         raise DatabaseWriteError('Resolved storage payload must contain IPv4 addresses')
+      if intent.id in domain_ids:
+        groups.append(tuple(group))
+        group = []
+        domain_ids.clear()
+      group.append(DomainResolutionIntent(intent.id, intent.resolution_complete, addresses))
+      domain_ids.add(intent.id)
+    if group:
+      groups.append(tuple(group))
+    return groups
+
+  @staticmethod
+  async def __writer_parameter_budget(connection: AsyncConnection, minimum: int) -> int:
+    """Read this physical connection's native limit on its owning driver thread."""
+    try:
+      if aiosqlite_version != '0.22.1':
+        raise DatabaseConfigurationError('SQLite parameter limit driver is unsupported')
+      raw_connection = await connection.get_raw_connection()
+      driver = raw_connection.driver_connection
+      if driver is None:
+        raise DatabaseConfigurationError('SQLite parameter limit driver is unavailable')
+      actual_limit = await driver._execute(driver._conn.getlimit, SQLITE_LIMIT_VARIABLE_NUMBER)
+    except Exception as err:
+      raise DatabaseConfigurationError('Cannot determine SQLite statement parameter budget') from err
+    if type(actual_limit) is not int or actual_limit < minimum:
+      raise DatabaseConfigurationError('SQLite statement parameter budget is insufficient')
+    return min(actual_limit, DNS_SQL_PARAMETER_CAP)
+
+  async def __reconcile_domain_group(
+    self, session: AsyncSession, group: tuple[DomainResolutionIntent, ...], budget: int
+  ) -> None:
+    """Reconcile distinct domains together without changing shared-address ownership."""
+    domain_ids = tuple(intent.id for intent in group)
+    if any(domain_id <= 0 for domain_id in domain_ids):
+      raise DatabaseWriteError('Resolved domain is unavailable')
+    for portion in batched(domain_ids, budget, strict=False):
+      parents = (await session.execute(select(DomainsDbo.id).where(DomainsDbo.id.in_(portion)))).scalars().all()
+      if set(parents) != set(portion):
+        raise DatabaseWriteError('Resolved domain is unavailable')
+
+    owners: dict[str, int] = {}
+    for intent in group:
+      for address in intent.storage_ips:
+        owners.setdefault(address, intent.id)
+    # The mapped use_default_gw client default adds a fourth bind to each row.
+    for portion in batched(owners.items(), budget // DNS_GLOBAL_ROW_BINDS, strict=False):
       await session.execute(
         insert(IpRecordsDbo)
-        .values(ip_address=address, domain_id=intent.id, addr_type=addr_type)
+        .values([{'ip_address': address, 'domain_id': domain_id, 'addr_type': 4} for address, domain_id in portion])
         .prefix_with('OR IGNORE')
       )
-      ip_id = (await session.execute(select(IpRecordsDbo.id).where(IpRecordsDbo.ip_address == address))).scalar_one()
-      await session.execute(
-        insert(IpSupportDbo).values(ip_record_id=ip_id, domain_id=intent.id, ip_list_id=None).prefix_with('OR IGNORE')
-      )
-    if intent.resolution_complete:
-      obsolete = select(IpRecordsDbo.id).where(IpRecordsDbo.addr_type == 4)
-      if addresses:
-        obsolete = obsolete.where(IpRecordsDbo.ip_address.not_in(addresses))
-      await session.execute(
-        delete(IpSupportDbo).where(IpSupportDbo.domain_id == intent.id, IpSupportDbo.ip_record_id.in_(obsolete))
-      )
+
+    address_ids: dict[str, int] = {}
+    for portion in batched(owners, budget, strict=False):
+      rows = (
+        await session.execute(
+          select(IpRecordsDbo.ip_address, IpRecordsDbo.id).where(IpRecordsDbo.ip_address.in_(portion))
+        )
+      ).all()
+      for address, ip_id in rows:
+        if address in address_ids:
+          raise DatabaseWriteError('Resolved IP identity mapping is inconsistent')
+        address_ids[address] = ip_id
+    if address_ids.keys() != owners.keys():
+      raise DatabaseWriteError('Resolved IP identity mapping is incomplete')
+
+    supports = (
+      {'ip_record_id': address_ids[address], 'domain_id': intent.id, 'ip_list_id': None}
+      for intent in group
+      for address in intent.storage_ips
+    )
+    for portion in batched(supports, budget // DNS_SUPPORT_ROW_BINDS, strict=False):
+      await session.execute(insert(IpSupportDbo).values(list(portion)).prefix_with('OR IGNORE'))
+
+    complete = {intent.id: set(intent.storage_ips) for intent in group if intent.resolution_complete}
+    if not complete:
+      return
+    # SQLite LIMIT also binds OFFSET; reserve both, IPv4, and the keyset cursor.
+    for portion in batched(complete, budget - DNS_SUPPORT_PAGE_FIXED_BINDS, strict=False):
+      last_support_id: int | None = None
+      while True:
+        page = (
+          select(IpSupportDbo.id, IpSupportDbo.domain_id, IpRecordsDbo.ip_address)
+          .join(IpRecordsDbo, IpRecordsDbo.id == IpSupportDbo.ip_record_id)
+          .where(IpSupportDbo.domain_id.in_(portion), IpRecordsDbo.addr_type == 4)
+          .order_by(IpSupportDbo.id)
+          .limit(DNS_SUPPORT_PAGE_SIZE)
+        )
+        if last_support_id is not None:
+          page = page.where(IpSupportDbo.id > last_support_id)
+        rows = (await session.execute(page)).all()
+        if not rows:
+          break
+        last_support_id = rows[-1][0]
+        obsolete = (support_id for support_id, domain_id, address in rows if address not in complete[domain_id])
+        for obsolete_portion in batched(obsolete, budget, strict=False):
+          await session.execute(delete(IpSupportDbo).where(IpSupportDbo.id.in_(obsolete_portion)))
 
   async def __finish_ip_supports(self, session: AsyncSession) -> None:
     """Delete final orphans and repair only vanished incumbent projections."""
@@ -2532,6 +2642,7 @@ class DataBase:
     """Persist one atomic batch and translate all persistence failures."""
     logger.debug(f'Try prepare elements count={len(queue_elements)} ...')
     attempt_started = perf_counter()
+    preparation_finished = False
     transaction_started: float | None = None
     transaction_outcome = 'failure'
     db_session: AsyncSession | None = None
@@ -2681,6 +2792,7 @@ class DataBase:
         if element.target == TargetAction.DOMAINS_RESOLVED
         for intent in element.elements
       ]
+      resolution_groups = self.__prepare_domain_groups(resolution_intents)
       list_withdrawals: list[IpListWithdrawal] = [
         withdrawal
         for element in queue_elements
@@ -2724,11 +2836,23 @@ class DataBase:
       ros_configs_delete_all: list[QueueElementDto] = [
         queue_element for queue_element in queue_elements if queue_element.target == TargetAction.ROS_CONFIG_DELETE_ALL
       ]
+      preparation_finished = True
+      observe_duration(writer_duration, attempt_started, phase='prepare', outcome='complete')
+      with suppress(Exception, CancelledError):
+        observe_writer_batch_size(
+          len(queue_elements), len(resolution_intents), sum(len(intent.storage_ips) for intent in resolution_intents)
+        )
       #
       #
       db_session = await self.__write_connect()
       # Connection setup precedes the timed explicit write transaction.
-      await db_session.connection()
+      connection = await db_session.connection()
+      # The unchanged final projection uses two LIMIT/OFFSET pairs even without DNS work.
+      minimum_budget = max(
+        DNS_GLOBAL_ROW_BINDS,
+        DNS_SUPPORT_PAGE_FIXED_BINDS + 1 if any(intent.resolution_complete for intent in resolution_intents) else 0,
+      )
+      parameter_budget = await self.__writer_parameter_budget(connection, minimum_budget)
       # Recording with immediate write lock
       transaction_started = perf_counter()
       await db_session.execute(text('BEGIN IMMEDIATE'))
@@ -2760,8 +2884,9 @@ class DataBase:
       # IPS
       if ips_add:
         await self.__add_explicit_ips(db_session, ips_add)
-      for intent in resolution_intents:
-        await self.__reconcile_domain(db_session, intent)
+      with observe_writer_phase('reconcile'):
+        for group in resolution_groups:
+          await self.__reconcile_domain_group(db_session, group, parameter_budget)
       for withdrawal in list_withdrawals:
         await db_session.execute(
           delete(IpSupportDbo).where(
@@ -2792,7 +2917,8 @@ class DataBase:
       if len(ros_configs_delete_all) > 0:
         await db_session.execute(delete(RosConfigsDbo).where(RosConfigsDbo.id > 0))
       #
-      await self.__finish_ip_supports(db_session)
+      with observe_writer_phase('finish'):
+        await self.__finish_ip_supports(db_session)
       # Any failure from commit itself has an ambiguous physical outcome.
       commit_started = True
       commit_timer = perf_counter()
@@ -2809,6 +2935,13 @@ class DataBase:
       self.__notify_batch(queue_elements, 'confirmed', final=True)
     except (Exception, CancelledError) as err:
       failure = err
+      if not preparation_finished:
+        observe_duration(
+          writer_duration,
+          attempt_started,
+          phase='prepare',
+          outcome='cancelled' if isinstance(err, CancelledError) else 'failure',
+        )
       logger.error('Database batch attempt failed', exc_info=DatabaseWriteError('Database batch attempt failed'))
       if transaction_started is not None:
         transaction_outcome = (

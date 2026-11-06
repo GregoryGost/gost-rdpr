@@ -1,9 +1,9 @@
 from asyncio import CancelledError
-from collections.abc import Iterable
-from contextlib import suppress
+from collections.abc import Generator, Iterable
+from contextlib import contextmanager, suppress
 from os import getpid
 from time import perf_counter
-from typing import ClassVar, Self
+from typing import ClassVar, Literal, Self
 from uuid import uuid4
 
 from fastapi.routing import iter_route_contexts
@@ -42,6 +42,22 @@ writer_duration = Histogram(
   'resolution_writer_duration_seconds',
   'Writer nested phase duration',
   ['phase', 'outcome'],
+)
+writer_batch_size = Histogram(
+  'resolution_writer_batch_size',
+  'Prepared writer attempt size; addresses include repeated input entries and retries count again',
+  ['kind'],
+  buckets=(0, 1, 10, 50, 100, 500, 1000, 5000, 10000, 50000),
+)
+writer_sql_dispatches = Counter(
+  'resolution_writer_sql_dispatches_total',
+  'Attempted application DBAPI dispatches on the write engine, not successful SQLite VM statements',
+  ['method'],
+)
+writer_sql_parameter_sets = Counter(
+  'resolution_writer_sql_parameter_sets_total',
+  'Submitted DBAPI parameter sets; execute counts one set including an empty or omitted set',
+  ['method'],
 )
 run_events = Counter(
   'resolution_run_events_total',
@@ -85,6 +101,43 @@ def observe_duration(collector: Histogram, started: float, **labels: str) -> Non
   """Observe a nested duration without affecting the operation being measured."""
   with suppress(Exception, CancelledError):
     collector.labels(**labels).observe(max(0.0, perf_counter() - started))
+
+
+@contextmanager
+def observe_writer_phase(phase: Literal['reconcile', 'finish']) -> Generator[None]:
+  """Time a whole writer phase while preserving exceptions and cancellation."""
+  started = perf_counter()
+  outcome = 'failure'
+  try:
+    yield
+    outcome = 'complete'
+  except CancelledError:
+    outcome = 'cancelled'
+    raise
+  finally:
+    with suppress(Exception, CancelledError):
+      observe_duration(writer_duration, started, phase=phase, outcome=outcome)
+
+
+def observe_writer_batch_size(commands: int, intents: int, addresses: int) -> None:
+  """Record input sizes per prepared attempt, independently of commit receipts."""
+  with suppress(Exception, CancelledError):
+    for kind, size in (('commands', commands), ('intents', intents), ('addresses', addresses)):
+      writer_batch_size.labels(kind=kind).observe(size)
+
+
+def observe_writer_sql_dispatch(
+  method: Literal['execute', 'executemany', 'execute_no_params'], parameter_sets: int
+) -> None:
+  """Count attempted dispatch, including failures, without retaining SQL or values.
+
+  Native commits, rollbacks, triggers and raw connection-setup PRAGMAs are outside
+  this boundary. Multi-VALUES execute submits one parameter set. Each dispatch
+  adds one callback and two counter updates; that overhead remains in timings.
+  """
+  with suppress(Exception, CancelledError):
+    writer_sql_dispatches.labels(method=method).inc()
+    writer_sql_parameter_sets.labels(method=method).inc(parameter_sets)
 
 
 def dns_labels(
