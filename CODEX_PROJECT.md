@@ -556,7 +556,10 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
   Domain and IP-list reads traverse distinct supported global records. Explicit IP administration still deletes
   the global entity; IP-list refresh withdraws only that list's support. Domain `0` is a real standalone context.
 - Shared IP migration: `migration_202618042123.py` preserves global IDs/metadata and backfills only known old contexts.
-  Startup validates completed migration effects before `create_all`. Unknown/incompatible schema fails atomically.
+  Ordinary starts trust completed history without auditing completed effects, exact indexes, managed FKs or support
+  consistency. Pending migrations retain their input/output checks; when any new migration is processed, final managed
+  FK and support-state checks run after migrations/default seeding and before commit. Failed upgrades roll back
+  atomically. Completed legacy import skips its preflight; pending historical imports retain their full validation.
   Previously discarded secondary owners can be learned only from later DNS evidence. An old app on the upgraded
   database and automatic downgrade are unsupported; rollback requires restoring the paired prior app and database.
 - Active database toolkit skill: `python-sqlalchemy-core`.

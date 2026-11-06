@@ -191,8 +191,10 @@ The configured journal mode is requested and checked before a transaction starts
 another mode. `MEMORY` supports ordinary rollback but does not provide a journal that survives a process crash.
 
 Schema initialization temporarily disables foreign-key enforcement on its dedicated write connection before
-`BEGIN IMMEDIATE`, then validates managed foreign keys before committing. That connection is physically closed;
-runtime connections start with foreign-key enforcement enabled.
+`BEGIN IMMEDIATE`. When new migrations are processed, their input checks and the final managed foreign-key and
+IP-support checks must pass before commit. Ordinary starts with no pending migrations do not audit completed
+migration effects, exact index definitions, existing foreign keys or IP-support consistency. The dedicated connection
+is physically closed; runtime connections start with foreign-key enforcement enabled.
 
 ## Database writes and shutdown
 
@@ -250,9 +252,11 @@ cleanup remove the global record and all its support; a later permitted positive
 
 Migration `migration_202618042123.py` upgrades existing ownership without rewriting previous migration sources or
 history. It preserves existing IP IDs and metadata and records the previously known owner/list relationship.
-Previously discarded secondary owners can only be learned through subsequent DNS observations. Startup validates
-the upgraded schema and support relationships before starting the writer. Running an older application against
-the upgraded database is unsupported; reverting requires the matching previous database and application version.
+Previously discarded secondary owners can only be learned through subsequent DNS observations. The migration
+validates its input schema and upgraded support relationships. Ordinary restarts trust completed migration history
+and do not repeat those audits; externally introduced inconsistencies are not proactively checked at startup.
+Running an older application against the upgraded database is unsupported; reverting requires the matching previous
+database and application version.
 
 ## Concurrent domain processing
 

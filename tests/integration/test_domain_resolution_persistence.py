@@ -364,6 +364,61 @@ async def test_same_domain_full_payload_is_fifo_and_frozen_at_admission(app, sto
   assert [(row[0], row[1], row[2] is not None) for row in rows] == [(0, 0, False), (1, 1, True), (2, 0, False)]
 
 
+@pytest.mark.parametrize('incumbent_list', [None, 8], ids=['without-list', 'with-list'])
+async def test_valid_incumbent_survives_lower_support_then_falls_back_without_metadata_changes(
+  app, store, incumbent_list
+):
+  """An earlier representative is eligible only after the incumbent context disappears."""
+  await add_support_domains(app, store)
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.IpsListsDbo),
+      [{'id': value, 'name': f'list-{value}', 'url': f'https://lists.example.test/{value}'} for value in (7, 8)],
+    )
+    await connection.execute(
+      insert(app.database.IpRecordsDbo).values(
+        id=17,
+        domain_id=2,
+        ip_list_id=incumbent_list,
+        addr_type=4,
+        ip_address='8.8.8.8',
+        ros_comment='retained metadata',
+        use_default_gw=True,
+        created_at=datetime(2001, 2, 3, tzinfo=UTC),
+        updated_at=datetime(2002, 3, 4, tzinfo=UTC),
+      )
+    )
+    contexts = {(1, None), (2, 7), (2, incumbent_list)}
+    await connection.execute(
+      insert(app.database.IpSupportDbo),
+      [{'ip_record_id': 17, 'domain_id': domain, 'ip_list_id': source} for domain, source in contexts],
+    )
+  async with store._DataBase__read_engine.connect() as connection:
+    before = (await connection.execute(text('SELECT * FROM rdpr_ip_records'))).one()
+  receipt = await queue_resolution(app, store, 1, [], complete=False)
+  await flush_queue(store)
+  assert receipt.write_receipt.outcome.value == 'confirmed'
+  async with store._DataBase__read_engine.connect() as connection:
+    assert (await connection.execute(text('SELECT * FROM rdpr_ip_records'))).one() == before
+  if incumbent_list is None:
+    await queue_resolution(app, store, 2, [])
+  else:
+    await store.put_withdraw_ip_list_records_to_queue(incumbent_list, [17])
+  await flush_queue(store)
+  async with store._DataBase__read_engine.connect() as connection:
+    after = (await connection.execute(text('SELECT * FROM rdpr_ip_records'))).one()
+  assert after[0] == before[0]
+  assert after[1:3] == (None, 1)
+  assert after[3:] == before[3:]
+  if incumbent_list is not None:
+    await store.put_withdraw_ip_list_records_to_queue(7, [17])
+  await queue_resolution(app, store, 1, [])
+  await flush_queue(store)
+  assert await support_snapshot(store) == set()
+  async with store._DataBase__read_engine.connect() as connection:
+    assert (await connection.execute(text('SELECT * FROM rdpr_ip_records'))).all() == []
+
+
 @contextmanager
 def writer_variable_limit(store, limit):
   """Lower each disposable physical writer connection on its owning aiosqlite thread."""
@@ -2832,27 +2887,42 @@ async def test_startup_refuses_incompatible_existing_gateway_without_repair(
   assert sqlite_snapshot(path) == before
 
 
-@pytest.mark.parametrize('missing_effect', ['table', 'column'])
-async def test_completed_gateway_history_cannot_mask_missing_original_effect(app, startup_store, missing_effect):
+async def test_completed_startup_does_not_repeat_schema_index_fk_or_support_audits(app, startup_store, monkeypatch):
+  """A normal restart trusts completed history while preserving connection constraints."""
+  await startup_store.setup()
+  await startup_store.close(timeout=2)
   path = Path(app.settings.db_path)
-  with closing(sqlite3.connect(path)) as connection, connection:
-    create_history(connection)
-    connection.execute(
-      'INSERT INTO rdpr_migrations VALUES (31, ?, ?, ?, ?)',
-      ('migration_202618042122.py', 'preserved-checksum', '2001-02-03 04:05:06', '2001-02-04 04:05:06'),
-    )
-    if missing_effect == 'column':
-      connection.execute('CREATE TABLE rdpr_ip_records (id INTEGER PRIMARY KEY)')
   before = sqlite_snapshot(path)
-  with pytest.raises(app.database.DatabaseWriteError):
-    await startup_store.setup()
-  assert sqlite_snapshot(path) == before
+  fresh = app.database.DataBase()
+  statements = []
+
+  def submitted(conn, cursor, statement, parameters, context, executemany):
+    statements.append(statement.lower())
+
+  async def unexpected(*args, **kwargs):
+    raise AssertionError('Ordinary startup must not execute a completed migration audit')
+
+  for name in ('validate_support_state', 'ip_schema_kind'):
+    monkeypatch.setattr(app.database, name, unexpected)
+  monkeypatch.setattr(fresh, '_DataBase__gateway_effect', unexpected)
+  monkeypatch.setattr(fresh, '_DataBase__check_startup_foreign_keys', unexpected)
+  event.listen(fresh._DataBase__write_engine.sync_engine, 'before_cursor_execute', submitted)
+  try:
+    await fresh.setup()
+    assert fresh.writer_state == 'RUNNING'
+    async with fresh._DataBase__read_engine.connect() as connection:
+      assert (await connection.execute(text('PRAGMA foreign_keys'))).scalar_one() == 1
+    await fresh.close(timeout=2)
+    assert sqlite_snapshot(path) == before
+    assert not any('foreign_key_check' in sql or 'pragma_index_' in sql for sql in statements)
+  finally:
+    await fresh.close(timeout=2)
+    await fresh._DataBase__read_engine.dispose()
+    await fresh._DataBase__write_engine.dispose()
 
 
 @pytest.mark.parametrize('missing_effect', ['support_table', 'owner_fk', 'support_row', 'unique_index'])
-async def test_completed_support_migration_refuses_missing_effects_before_schema_repair(
-  app, startup_store, missing_effect
-):
+async def test_completed_support_history_is_not_a_startup_integrity_audit(app, startup_store, missing_effect):
   await startup_store.setup()
   await startup_store.close(timeout=2)
   path = Path(app.settings.db_path)
@@ -2882,9 +2952,46 @@ async def test_completed_support_migration_refuses_missing_effects_before_schema
   before = sqlite_snapshot(path)
   fresh = app.database.DataBase()
   try:
-    with pytest.raises(app.database.DatabaseWriteError):
+    await fresh.setup()
+    assert fresh.writer_state == 'RUNNING'
+    await fresh.close(timeout=2)
+    if missing_effect != 'support_table':
+      assert sqlite_snapshot(path) == before
+    else:
+      with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute('SELECT * FROM rdpr_ip_supports').fetchall() == []
+        assert connection.execute('SELECT id,domain_id FROM rdpr_ip_records').fetchall() == [(17, 7)]
+  finally:
+    await fresh.close(timeout=2)
+    await fresh._DataBase__read_engine.dispose()
+    await fresh._DataBase__write_engine.dispose()
+
+
+@pytest.mark.parametrize('corruption', ['foreign_key', 'unsupported_ip'])
+async def test_late_new_migration_cannot_commit_invalid_final_state(app, startup_store, tmp_path, corruption):
+  """Final checks cover effects introduced after the ownership migration already completed."""
+  await startup_store.setup()
+  await startup_store.close(timeout=2)
+  path = Path(app.settings.db_path)
+  before = sqlite_snapshot(path)
+  migration = tmp_path / 'migrations' / 'migration_999999999999.py'
+  mutation = (
+    "INSERT INTO rdpr_domains (id,name,domain_list_id,resolved) VALUES (77,'invalid.example.test',999,0)"
+    if corruption == 'foreign_key'
+    else "INSERT INTO rdpr_ip_records (id,domain_id,addr_type,ip_address) VALUES (77,0,4,'8.8.8.8')"
+  )
+  migration.write_text(
+    'from sqlalchemy import text\nasync def upgrade(conn):\n'
+    '  await conn.execute(text("CREATE TABLE late_migration_probe (value TEXT)"))\n'
+    f'  await conn.execute(text({mutation!r}))\n',
+    encoding='utf-8',
+  )
+  fresh = app.database.DataBase()
+  try:
+    with pytest.raises(app.database.DatabaseWriteError, match='Database initialization failed'):
       await fresh.setup()
     assert fresh.writer_task is None
+    assert fresh.writer_state == 'FAILED'
     assert sqlite_snapshot(path) == before
   finally:
     await fresh._DataBase__read_engine.dispose()
@@ -2962,7 +3069,6 @@ async def test_modified_known_migration_never_receives_checksum_compatibility_by
     'populated_target',
     'incompatible_empty_target',
     'copy_changing_trigger',
-    'completed_import_history',
     'duplicate_source_value',
   ],
 )
@@ -2994,17 +3100,6 @@ async def test_legacy_contradictions_fail_without_source_or_history_changes(
     }
     if contradiction in statements:
       connection.execute(statements[contradiction])
-    elif contradiction == 'completed_import_history':
-      create_history(connection)
-      connection.execute(
-        'INSERT INTO rdpr_migrations VALUES (31, ?, ?, ?, ?)',
-        (
-          'migration_202511031501.py',
-          'preserved-checksum',
-          '2001-02-03 04:05:06',
-          '2001-02-04 04:05:06',
-        ),
-      )
     elif contradiction == 'duplicate_source_value':
       # OR IGNORE must never turn two source records into one successfully imported record.
       connection.executescript("""
@@ -3023,6 +3118,51 @@ async def test_legacy_contradictions_fail_without_source_or_history_changes(
   assert startup_store.writer_task is None
   assert startup_store.writer_state == 'FAILED'
   assert sqlite_snapshot(path) == before
+
+
+async def test_completed_legacy_history_preserves_old_sources_and_applies_only_new_migrations(app, startup_store):
+  """Completed import history is trusted even when historical source tables remain."""
+  path = Path(app.settings.db_path)
+  create_legacy_database(path)
+  sources = {
+    'dns_servers': 'SELECT * FROM dns_servers',
+    'ros_configs': 'SELECT * FROM ros_configs',
+    'domains_lists': 'SELECT * FROM domains_lists',
+    'ip_lists': 'SELECT * FROM ip_lists',
+    'domains': 'SELECT * FROM domains',
+    'ip_records': 'SELECT * FROM ip_records',
+    'jobs': 'SELECT * FROM jobs',
+  }
+  history = (31, 'migration_202511031501.py', 'preserved-checksum', '2001-02-03 04:05:06', '2001-02-04 04:05:06')
+  with closing(sqlite3.connect(path)) as connection, connection:
+    create_history(connection)
+    connection.execute('INSERT INTO rdpr_migrations VALUES (?,?,?,?,?)', history)
+    original = {
+      name: (
+        connection.execute('SELECT sql FROM sqlite_master WHERE name=?', (name,)).fetchone(),
+        connection.execute(query).fetchall(),
+      )
+      for name, query in sources.items()
+    }
+  await startup_store.setup()
+  assert startup_store.writer_state == 'RUNNING'
+  await startup_store.close(timeout=2)
+  with closing(sqlite3.connect(path)) as connection:
+    for name, query in sources.items():
+      assert (
+        connection.execute('SELECT sql FROM sqlite_master WHERE name=?', (name,)).fetchone(),
+        connection.execute(query).fetchall(),
+      ) == original[name]
+    assert connection.execute('SELECT * FROM rdpr_migrations WHERE id=31').fetchone() == history
+    rows = connection.execute('SELECT name,checksum,applied_at FROM rdpr_migrations WHERE id<>31').fetchall()
+    expected = {
+      migration.name: sha256(migration.read_text(encoding='utf-8').encode()).hexdigest()
+      for migration in (Path.cwd() / 'migrations').glob('migration_*.py')
+      if migration.name != history[1]
+    }
+    assert {name: checksum for name, checksum, applied in rows if applied is not None} == expected
+    assert connection.execute('SELECT id,name FROM rdpr_domains').fetchall() == [(0, 'default')]
+    assert connection.execute('SELECT * FROM rdpr_ip_records').fetchall() == []
 
 
 async def test_legacy_import_accepts_empty_compatible_targets_and_preserves_values(app, startup_store):
@@ -5672,6 +5812,8 @@ async def load_measure_pass(
             await asyncio.gather(*tasks, return_exceptions=True)
       finally:
         measurement['api_latency_measured'] = {name: load_quantiles(values) for name, values in observed.items()}
+        measurement['api_latency_samples_seconds'] = {name: list(values) for name, values in observed.items()}
+        measurement['resource_samples'] = resources
         measurement['api_bounds_frozen_seconds'] = bounds
         measurement['api_failures'] = observed.failures
     await load_drain_stored(client, configuration['pass_timeout'])
@@ -5688,6 +5830,11 @@ async def load_measure_pass(
       before, 'resolution_run_elapsed_seconds_count', mode=mode
     )
     assert source_run_count == 1, ('Unexpected successor source pass', source_run_count)
+    measurement.update(
+      auxiliary_drain_status='completed',
+      wall_seconds_including_auxiliary_drain=probe_drain_elapsed,
+      source_run_count=source_run_count,
+    )
     assert max(row['peak_rss_bytes'] for row in resources) <= configuration['rss_limit_mb'] * 1024 * 1024
     expected = dataset.manifest()['categories']
     assert fields['success'] == expected['success'] + expected['empty'], fields
@@ -6245,6 +6392,7 @@ async def test_resolution_load_measurement_keeps_completed_source_when_later_che
   assert measurement['api_bounds_frozen_seconds'] == bounds
   assert measurement.get('api_status') != 'passed'
   assert measurement['api_failures'] == []
+  assert (measurement.get('auxiliary_drain_status') == 'completed') is (failure == 'p99')
 
 
 async def load_begin_provider_cycle(providers, cycle):
@@ -6317,6 +6465,7 @@ def batch_comparison_configuration():
   supplied = json.loads(os.environ.get('GOST_BATCH_COMPARE_CONFIG', '{}'))
   assert isinstance(supplied, dict)
   defaults = {
+    'profile': 'historical',
     'variant': None,
     'source_root': None,
     'bounds_path': None,
@@ -6339,6 +6488,9 @@ def batch_comparison_configuration():
   }
   assert set(supplied) <= set(defaults), 'Unknown comparison configuration field'
   configuration = defaults | supplied
+  assert configuration['profile'] in {'historical', 'startup'}
+  if configuration['profile'] == 'startup' and 'seed' not in supplied:
+    configuration['seed'] = 20261104
   assert configuration['variant'] in {'before', 'after', 'smoke'}
   assert type(configuration['smoke']) is bool
   assert configuration['smoke'] == (configuration['variant'] == 'smoke')
@@ -6371,6 +6523,11 @@ def batch_comparison_configuration():
   assert configuration['verify_timeout'] <= 1200
   assert configuration['baseline_samples'] <= 100
   assert configuration['warmup_size'] <= 10000
+  if configuration['profile'] == 'startup':
+    assert configuration['seed'] == 20261104
+    assert configuration['provider_delay'] == 0.001
+    assert configuration['unique_ip_ratio'] == 0.7
+    assert configuration['alias_every'] == 10
   repository = Path(__file__).resolve().parents[2]
   for key in ('source_root', 'bounds_path'):
     assert isinstance(configuration[key], str), key
@@ -6379,6 +6536,55 @@ def batch_comparison_configuration():
     assert path.is_relative_to(repository / '.pytest_cache'), key
     configuration[key] = str(path)
   return configuration
+
+
+def batch_comparison_environment(configuration):
+  """Preserve historical replay defaults and select the fixed startup comparison explicitly."""
+  if configuration['profile'] == 'historical':
+    return {'DB_SAVE_BATCH_SIZE': '256', 'DB_SAVE_BATCH_TIMEOUT': '0.25'}
+  return {
+    'DOMAINS_RESOLVE_WORKER_LIMIT': '32',
+    'DOMAINS_RESOLVE_SEMAPHORE_LIMIT': '64',
+    'RIPE_STAT_REQUESTS_SEMAPHORE_LIMIT': '16',
+    'REQ_MAX_CONNECTIONS': '32',
+    'REQ_MAX_KEEPALIVE_CONNECTIONS': '32',
+    'QUEUE_MAX_SIZE': '10000',
+    'DB_SAVE_BATCH_SIZE': '1000',
+    'DB_SAVE_BATCH_TIMEOUT': '0.1',
+    'DOMAINS_UPDATE_INTERVAL': '0',
+  }
+
+
+async def batch_comparison_public_state(client, dataset, timeout):
+  """Hash exact public ownership and logical checkpoints; retain volatile timestamp evidence separately."""
+  rows = []
+  async with asyncio.timeout(timeout):
+    for offset in range(0, dataset.count + 2, 100):
+      response = await client.get('/domains', params={'limit': 100, 'offset': offset})
+      assert response.status_code == 200, response.text
+      assert response.json()['total'] == dataset.count + 2
+      rows.extend(response.json()['payload'])
+  assert len(rows) == dataset.count + 2
+  rows.sort(key=lambda row: row['id'])
+  normalized = [
+    [
+      row['id'],
+      row['name'],
+      row['resolved'],
+      sorted(row['ips_v4'] or []),
+      sorted(row['ips_v6'] or []),
+      row['last_resolved_at'] is not None,
+    ]
+    for row in rows
+  ]
+  return {
+    'normalized_sha256': sha256(json.dumps(normalized).encode()).hexdigest(),
+    'normalization': (
+      'Exclude volatile timestamp values; preserve checkpoint presence, resolved state, IDs and addresses'
+    ),
+    'refresh_interval_seconds': 0,
+    'raw_public_rows': rows,
+  }
 
 
 def batch_comparison_metric_delta(before, after):
@@ -6501,6 +6707,173 @@ def test_batch_comparison_requires_explicit_bounded_selection(monkeypatch, confi
     batch_comparison_configuration()
 
 
+def test_batch_comparison_startup_profile_preserves_fixed_workload_and_historical_defaults(monkeypatch):
+  root = Path(__file__).resolve().parents[2] / '.pytest_cache'
+  supplied = {'variant': 'before', 'source_root': str(root / 'source'), 'bounds_path': str(root / 'bounds.json')}
+  monkeypatch.setenv('GOST_BATCH_COMPARE_CONFIG', json.dumps(supplied))
+  historical = batch_comparison_configuration()
+  assert historical['seed'] == 20261106
+  assert batch_comparison_environment(historical) == {'DB_SAVE_BATCH_SIZE': '256', 'DB_SAVE_BATCH_TIMEOUT': '0.25'}
+  monkeypatch.setenv('GOST_BATCH_COMPARE_CONFIG', json.dumps(supplied | {'profile': 'startup'}))
+  current = batch_comparison_configuration()
+  assert (current['n'], current['repetitions'], current['seed']) == (10000, 3, 20261104)
+  assert current['provider_delay'] == 0.001
+  assert (current['unique_ip_ratio'], current['alias_every']) == (0.7, 10)
+  assert batch_comparison_environment(current) == {
+    'DOMAINS_RESOLVE_WORKER_LIMIT': '32',
+    'DOMAINS_RESOLVE_SEMAPHORE_LIMIT': '64',
+    'RIPE_STAT_REQUESTS_SEMAPHORE_LIMIT': '16',
+    'REQ_MAX_CONNECTIONS': '32',
+    'REQ_MAX_KEEPALIVE_CONNECTIONS': '32',
+    'QUEUE_MAX_SIZE': '10000',
+    'DB_SAVE_BATCH_SIZE': '1000',
+    'DB_SAVE_BATCH_TIMEOUT': '0.1',
+    'DOMAINS_UPDATE_INTERVAL': '0',
+  }
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+@pytest.mark.parametrize('failure_type', [ValueError, asyncio.CancelledError])
+@pytest.mark.parametrize('cleanup_type', [RuntimeError, ValueError, asyncio.CancelledError])
+async def test_process_startup_keeps_primary_error_when_cleanup_also_fails(
+  e2e_service, monkeypatch, failure_type, cleanup_type
+):
+  service = e2e_service
+  primary = failure_type('original startup failure')
+  cleanup = cleanup_type('secondary cleanup failure')
+  monkeypatch.setattr(asyncio, 'create_subprocess_exec', AsyncMock(side_effect=primary))
+  original_stop = service.stop
+  monkeypatch.setattr(service, 'stop', AsyncMock(side_effect=cleanup))
+  try:
+    with pytest.raises(failure_type) as caught:
+      await service.start()
+    assert caught.value is primary
+    assert service.startup_attempts == [
+      {
+        'status': 'failed',
+        'elapsed_seconds': service.startup_attempts[0]['elapsed_seconds'],
+        'error': repr(primary),
+        'cleanup_error': repr(cleanup),
+      }
+    ]
+    assert service.startup_attempts[0]['elapsed_seconds'] >= 0
+    assert caught.value.__notes__ == [f'Startup cleanup also failed: {cleanup!r}']
+  finally:
+    monkeypatch.setattr(service, 'stop', original_stop)
+    if service.log is not None:
+      service.log.close()
+      service.log = None
+
+
+@pytest.mark.e2e_load
+@pytest.mark.skipif('GOST_SUPPORT_COMPONENT_CONFIG' not in os.environ, reason='Explicit component profiling only')
+async def test_real_sqlite_support_maintenance_component_profile(app, startup_store, tmp_path):
+  """Measure actual component SQL separately from public black-box process measurements."""
+  configuration = json.loads(os.environ['GOST_SUPPORT_COMPONENT_CONFIG'])
+  assert set(configuration) <= {'n', 'repetitions'}
+  count = configuration.get('n', 40001)
+  repetitions = configuration.get('repetitions', 3)
+  assert type(count) is int
+  assert 1 <= count <= 50000
+  assert type(repetitions) is int
+  assert 3 <= repetitions <= 5
+  database_source = Path(app.database.__file__).resolve()
+  intended_source_root = Path(__file__).resolve().parents[2]
+  assert database_source == intended_source_root / 'database/db.py', 'Component imported an unintended database source'
+  store = startup_store
+  await store.setup()
+  await store.close(timeout=2)
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.DomainsDbo),
+      [{'id': value, 'name': f'domain-{value}.example.test', 'resolved': False} for value in (1, 2)],
+    )
+    await connection.execute(
+      insert(app.database.IpRecordsDbo),
+      [
+        {
+          'id': index + 1,
+          'domain_id': 1,
+          'addr_type': 4,
+          'ip_address': str(IPv4Address(int(IPv4Address('11.0.0.0')) + index)),
+        }
+        for index in range(count)
+      ],
+    )
+    await connection.execute(
+      insert(app.database.IpSupportDbo),
+      [{'ip_record_id': index + 1, 'domain_id': 1} for index in range(count)],
+    )
+  evidence = {
+    'boundary': 'component: real disposable SQLite/AsyncSession; not E2E phase timing',
+    'configuration': {'n': count, 'repetitions': repetitions, 'excluded_warmups': 1},
+    'database_source_path': str(database_source),
+    'intended_source_root': str(intended_source_root),
+    'database_source_sha256': sha256(database_source.read_bytes()).hexdigest(),
+    'sqlite': sqlite3.sqlite_version,
+    'trials': [],
+  }
+  for repetition in range(repetitions + 1):
+    async with store._DataBase__write_engine.begin() as connection:
+      await connection.execute(text('UPDATE rdpr_ip_records SET domain_id=2 WHERE id=1'))
+      await connection.execute(
+        insert(app.database.IpRecordsDbo).values(id=count + 1, domain_id=1, addr_type=4, ip_address='9.9.9.9')
+      )
+    statements = []
+    submitted_at = {}
+
+    def before(conn, cursor, statement, parameters, context, executemany, submitted_at=submitted_at):
+      submitted_at[id(context)] = perf_counter()
+
+    def after(
+      conn, cursor, statement, parameters, context, executemany, statements=statements, submitted_at=submitted_at
+    ):
+      statements.append(
+        {
+          'sql': statement,
+          'parameters': parameters,
+          'rowcount': cursor.rowcount,
+          'dbapi_seconds': perf_counter() - submitted_at.pop(id(context)),
+        }
+      )
+
+    engine = store._DataBase__write_engine.sync_engine
+    async with store._DataBase__write_session_factory() as session:
+      await session.execute(text('BEGIN IMMEDIATE'))
+      event.listen(engine, 'before_cursor_execute', before)
+      event.listen(engine, 'after_cursor_execute', after)
+      started = perf_counter()
+      try:
+        await store._DataBase__finish_ip_supports(session)
+      finally:
+        event.remove(engine, 'before_cursor_execute', before)
+        event.remove(engine, 'after_cursor_execute', after)
+      finish_seconds = perf_counter() - started
+      started = perf_counter()
+      await session.commit()
+      commit_seconds = perf_counter() - started
+    assert len(statements) == 2
+    assert statements[0]['sql'].startswith('DELETE FROM')
+    assert statements[1]['sql'].startswith('UPDATE ')
+    assert [statement['rowcount'] for statement in statements] == [1, 1]
+    async with store._DataBase__read_engine.connect() as connection:
+      assert (await connection.execute(text('SELECT domain_id FROM rdpr_ip_records WHERE id=1'))).scalar_one() == 1
+      assert (await connection.execute(text('SELECT count(*) FROM rdpr_ip_records'))).scalar_one() == count
+      for statement in statements:
+        result = await connection.exec_driver_sql('EXPLAIN QUERY PLAN ' + statement['sql'], statement['parameters'])
+        statement['explain_query_plan'] = [list(row) for row in result]
+    evidence['trials'].append(
+      {
+        'measured': repetition > 0,
+        'statements': statements,
+        'finish_seconds': finish_seconds,
+        'commit_seconds': commit_seconds,
+      }
+    )
+    load_write_artifact(tmp_path / 'support-maintenance-component.json', evidence)
+
+
 def test_batch_comparison_snapshot_copies_only_whitelisted_source_and_is_immutable(tmp_path):
   root = Path(__file__).resolve().parents[2]
   source = tmp_path / 'source'
@@ -6538,6 +6911,511 @@ def test_batch_comparison_snapshot_copies_only_whitelisted_source_and_is_immutab
       batch_comparison_snapshot(source, destination)
 
 
+async def test_startup_comparison_keeps_restart_failure_and_finishes_independent_cases(monkeypatch, tmp_path):
+  """A completed source pass remains measured when its restart fails; the matrix still finishes."""
+  module = sys.modules[__name__]
+  primary = AssertionError('first restart failed')
+  providers = SimpleNamespace(response_factory=None, reset_evidence=lambda: None, evidence=lambda: {'errors': []})
+  service = SimpleNamespace(providers=providers, startup_attempts=[], process=None, url='http://unused.test', starts=0)
+
+  async def start():
+    service.starts += 1
+    service.startup_attempts.append({'status': 'failed' if service.starts == 2 else 'ready'})
+    if service.starts == 2:
+      raise primary
+    service.process = object()
+
+  async def stop(**kwargs):
+    service.process = None
+
+  async def begin(*args):
+    pass
+
+  async def measure(*args, measurement, **kwargs):
+    measurement.update(
+      source_pass_status='completed',
+      auxiliary_drain_status='completed',
+      wall_seconds_to_known_writer_outcomes=1,
+      wall_seconds_including_auxiliary_drain=1,
+      source_run_count=1,
+      ripe_network_requests=0,
+      run=dict.fromkeys(
+        ('active', 'pending', 'admission_in_progress', 'unknown', 'known_not_committed', 'not_admitted'), 0
+      )
+      | {'selected': 2, 'attempted': 2, 'processing_complete': 1, 'admitted': 2, 'confirmed': 2},
+    )
+
+  async def verify(*args):
+    return {'verified_sources': 2}
+
+  async def public_state(*args):
+    return {'normalized_sha256': 'logical-state', 'raw_public_rows': []}
+
+  class Client:
+    def __init__(self, **kwargs):
+      pass
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, *args):
+      pass
+
+    async def get(self, path):
+      return httpx.Response(200, text='')
+
+  service.start = start
+  service.stop = stop
+  monkeypatch.setattr(module, 'batch_comparison_seed', lambda *args: (0, 'same-seed'))
+  monkeypatch.setattr(module, 'batch_comparison_executed_source', lambda *args: {'stable': True})
+  monkeypatch.setattr(module, 'load_begin_provider_cycle', begin)
+  monkeypatch.setattr(module, 'load_measure_pass', measure)
+  monkeypatch.setattr(module, 'load_verify_public', verify)
+  monkeypatch.setattr(module, 'batch_comparison_public_state', public_state)
+  monkeypatch.setattr(httpx, 'AsyncClient', Client)
+  configuration = {
+    'variant': 'before',
+    'bounds_path': str(tmp_path / 'bounds.json'),
+    'repetitions': 1,
+    'n': 2,
+    'warmup_size': 2,
+    'seed': 20261104,
+    'unique_ip_ratio': 0.7,
+    'alias_every': 10,
+    'provider_delay': 0.001,
+    'verify_timeout': 5,
+    'smoke': True,
+  }
+  shared = {
+    'baseline': {'bounds_seconds': {'read': 5}, 'p99_bounds_seconds': {'read': 1}},
+    'measured_initial_data_sha256': 'same-seed',
+  }
+  evidence = {'cases': []}
+  with pytest.raises(AssertionError) as caught:
+    await batch_comparison_startup_cases(service, configuration, shared, {}, evidence, tmp_path / 'facts.json')
+  assert caught.value is primary
+  assert len(evidence['cases']) == 8
+  assert [case['status'] for case in evidence['cases']] == ['passed', 'failed', *['passed'] * 6]
+  assert evidence['cases'][1]['failure']['message'] == 'first restart failed'
+  assert evidence['cases'][1]['measurement']['wall_seconds_to_known_writer_outcomes'] == 1
+  assert all(row['complete_source_measurements'] == 1 for row in evidence['summary'].values())
+  assert service.process is None
+  assert evidence['status'] == 'failed'
+
+
+@pytest.fixture
+def startup_comparison_harness(monkeypatch, tmp_path):
+  """Control process and measurement boundaries while exercising real matrix orchestration."""
+  module = sys.modules[__name__]
+  providers = SimpleNamespace(response_factory=None, reset_evidence=lambda: None, evidence=lambda: {'errors': []})
+  service = SimpleNamespace(
+    providers=providers, startup_attempts=[], process=None, url='http://unused.test', cycle=None
+  )
+  harness = SimpleNamespace(
+    service=service,
+    primary=AssertionError('list p99 exceeded 1 second'),
+    failure=None,
+    measurements=[],
+    events=[],
+    after_metrics=False,
+  )
+
+  async def start():
+    assert service.process is None
+    service.process = object()
+    service.startup_attempts.append({'status': 'ready'})
+    harness.events.append(('start', service.cycle, service.process))
+
+  async def stop(**kwargs):
+    running = service.process is not None
+    harness.events.append(('stop', service.cycle, service.process))
+    service.process = None
+    if running and harness.failure == 'cleanup' and service.cycle == 'healthy-1-cold':
+      raise RuntimeError('secondary cleanup failure')
+
+  async def begin(providers, cycle):
+    service.cycle = cycle
+    harness.after_metrics = False
+
+  async def measure(*args, measurement, **kwargs):
+    harness.measurements.append((service.cycle, service.process))
+    fields = dict.fromkeys(
+      ('active', 'pending', 'admission_in_progress', 'unknown', 'known_not_committed', 'not_admitted'), 0
+    )
+    fields.update(selected=2, attempted=2, processing_complete=1, admitted=2, confirmed=2)
+    measurement.update(
+      source_pass_status='completed',
+      auxiliary_drain_status='completed',
+      wall_seconds_to_known_writer_outcomes=2,
+      wall_seconds_including_auxiliary_drain=3,
+      source_run_count=1,
+      ripe_network_requests=1,
+      run=fields,
+      api_status='passed',
+    )
+    if service.cycle == 'healthy-1-cold' and harness.failure is not None:
+      measurement['api_status'] = 'failed'
+      if harness.failure in {'incomplete', 'cleanup'}:
+        measurement['source_pass_status'] = 'in_progress'
+      elif harness.failure == 'drain':
+        measurement.pop('auxiliary_drain_status')
+      elif harness.failure in {'pending', 'unknown'}:
+        fields[harness.failure] = 1
+      harness.after_metrics = True
+      raise harness.primary
+
+  async def verify(*args):
+    if service.cycle == 'healthy-1-cold' and harness.failure == 'verification':
+      raise ValueError('public ownership verification failed')
+    return {'verified_sources': 2, 'api_result_sha256': 'verified-result'}
+
+  async def public_state(*args):
+    return {'normalized_sha256': 'logical-state', 'raw_public_rows': []}
+
+  class Client:
+    def __init__(self, **kwargs):
+      pass
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, *args):
+      pass
+
+    async def get(self, path):
+      if harness.after_metrics and harness.failure == 'metrics':
+        raise httpx.ReadError('post-measurement metrics unavailable')
+      return httpx.Response(200, text='')
+
+  service.start, service.stop = start, stop
+  monkeypatch.setattr(module, 'batch_comparison_seed', lambda *args: (0, 'same-seed'))
+  monkeypatch.setattr(module, 'batch_comparison_executed_source', lambda *args: {'stable': True})
+  monkeypatch.setattr(module, 'load_begin_provider_cycle', begin)
+  monkeypatch.setattr(module, 'load_measure_pass', measure)
+  monkeypatch.setattr(module, 'load_verify_public', verify)
+  monkeypatch.setattr(module, 'batch_comparison_public_state', public_state)
+  monkeypatch.setattr(httpx, 'AsyncClient', Client)
+  harness.configuration = {
+    'variant': 'before',
+    'bounds_path': str(tmp_path / 'bounds.json'),
+    'repetitions': 1,
+    'n': 2,
+    'warmup_size': 2,
+    'seed': 20261104,
+    'unique_ip_ratio': 0.7,
+    'alias_every': 10,
+    'provider_delay': 0.001,
+    'verify_timeout': 5,
+    'smoke': True,
+  }
+  harness.shared = {
+    'baseline': {'bounds_seconds': {'list': 5}, 'p99_bounds_seconds': {'list': 1}},
+    'measured_initial_data_sha256': 'same-seed',
+  }
+  harness.evidence = {'cases': []}
+  harness.artifact_path = tmp_path / 'facts.json'
+  return harness
+
+
+@pytest.mark.parametrize(
+  'failure', ['p99', 'incomplete', 'drain', 'pending', 'unknown', 'verification', 'metrics', 'cleanup']
+)
+async def test_startup_comparison_separates_failed_acceptance_from_verified_warm_input(
+  startup_comparison_harness, failure
+):
+  """Only fully verified persisted input may retain a failed cold pass's process for warm measurement."""
+  harness = startup_comparison_harness
+  harness.failure = failure
+  with pytest.raises(AssertionError) as caught:
+    await batch_comparison_startup_cases(
+      harness.service, harness.configuration, harness.shared, {}, harness.evidence, harness.artifact_path
+    )
+  assert caught.value is harness.primary
+  cases = harness.evidence['cases']
+  assert len(cases) == 8
+  cold, warm = cases[2:4]
+  assert cold['status'] == 'failed'
+  assert cold['failure'] == {'type': 'AssertionError', 'message': 'list p99 exceeded 1 second'}
+  assert cold['measurement']['wall_seconds_to_known_writer_outcomes'] == 2
+  assert cold['measurement']['api_status'] == 'failed'
+  assert harness.evidence['status'] == 'failed'
+  assert all(case['status'] == 'passed' for case in [*cases[:2], *cases[4:]])
+  measurements = dict(harness.measurements)
+  if failure == 'p99':
+    assert warm['status'] == 'passed'
+    assert cold['warm_precondition'] == {
+      'source_completed': True,
+      'auxiliary_drained': True,
+      'known_writer_outcomes': True,
+      'public_results_verified': True,
+      'status': 'verified',
+    }
+    assert cold['verification']['verified_sources'] == 2
+    assert 'raw_metrics_after' in cold
+    assert measurements['healthy-1-cold'] is measurements['healthy-1-warm']
+    assert not any(event[:2] == ('stop', 'healthy-1-cold') for event in harness.events)
+    assert harness.evidence['summary']['healthy-cold']['fully_passed_cases'] == 0
+    assert harness.evidence['summary']['healthy-warm']['fully_passed_cases'] == 1
+  else:
+    assert warm['status'] == 'blocked'
+    assert warm['failure']['type'] == 'PreconditionFailure'
+    assert 'healthy-1-warm' not in measurements
+    assert cold['warm_precondition']['status'] == 'unverified'
+    assert any(event[:2] == ('stop', 'healthy-1-cold') for event in harness.events)
+    if failure in {'verification', 'metrics'}:
+      assert cold['secondary_failures'][0]['message'] in {
+        'public ownership verification failed',
+        'post-measurement metrics unavailable',
+      }
+    if failure == 'cleanup':
+      assert 'secondary cleanup failure' in cold['cleanup_error']
+  assert harness.service.process is None
+
+
+@pytest.mark.parametrize('reference', ['missing', 'mismatch'])
+async def test_startup_comparison_exercises_missing_reference_but_guards_existing_mismatch(
+  startup_comparison_harness, reference
+):
+  """Absent paired evidence cannot imply acceptance or suppress the current revision's measurements."""
+  harness = startup_comparison_harness
+  harness.configuration['variant'] = 'after'
+  states = {
+    f'{schedule}-{repetition}-{temperature}': 'logical-state'
+    for schedule in ('healthy', 'degraded')
+    for repetition in (0, 1)
+    for temperature in ('cold', 'warm')
+  }
+  key = 'healthy-1-warm' if reference == 'missing' else 'healthy-1-cold'
+  if reference == 'missing':
+    del states[key]
+  else:
+    states[key] = 'different-initial-state'
+  state_path = Path(harness.configuration['bounds_path']).with_suffix('.initial-states.json')
+  load_write_artifact(state_path, states)
+  original = state_path.read_bytes()
+  with pytest.raises(AssertionError, match='Missing initial state reference' if reference == 'missing' else 'differ'):
+    await batch_comparison_startup_cases(
+      harness.service, harness.configuration, harness.shared, {}, harness.evidence, harness.artifact_path
+    )
+  assert state_path.read_bytes() == original
+  assert harness.evidence['status'] == 'failed'
+  assert len(harness.evidence['cases']) == 8
+  measurements = dict(harness.measurements)
+  if reference == 'missing':
+    assert len(measurements) == 8
+    warm = harness.evidence['cases'][3]
+    assert warm['status'] == 'failed'
+    assert warm['comparison'] == {'status': 'INCOMPARABLE', 'missing_initial_state_reference': key}
+    assert warm['measurement']['source_pass_status'] == 'completed'
+    assert warm['restart_verification']['verified_sources'] == 2
+    assert measurements['healthy-1-cold'] is measurements['healthy-1-warm']
+  else:
+    assert len(measurements) == 6
+    assert 'healthy-1-cold' not in measurements
+    assert 'healthy-1-warm' not in measurements
+    assert harness.evidence['cases'][2]['measurement'] == {}
+    assert harness.evidence['cases'][3]['status'] == 'blocked'
+  assert harness.service.process is None
+
+
+async def batch_comparison_startup_cases(service, configuration, shared, manifest, evidence, artifact_path):
+  """Keep independent failure evidence across the complete cold/warm and provider matrix."""
+  first_failure = None
+
+  def record_failure(entry, error):
+    nonlocal first_failure
+    failure = {'type': type(error).__name__, 'message': str(error)[:4000]}
+    if 'failure' not in entry:
+      entry['failure'] = failure
+    elif entry['failure'] != failure:
+      entry.setdefault('secondary_failures', []).append(failure)
+    entry['status'] = 'failed'
+    if first_failure is None:
+      first_failure = error
+
+  state_path = Path(configuration['bounds_path']).with_suffix('.initial-states.json')
+  initial_states = json.loads(state_path.read_text(encoding='utf-8')) if configuration['variant'] == 'after' else {}
+  evidence['maintenance_phase_boundary'] = (
+    'Public E2E finish metric combines orphan deletion and incumbent repair. '
+    'Separate real SQLite component profile reports their SQL and durations; these are not E2E phase times.'
+  )
+  for schedule in ('healthy', 'degraded'):
+    for repetition in range(configuration['repetitions'] + 1):
+      warmup = repetition == 0
+      dataset = ResolutionLoadDataset(configuration['warmup_size'] if warmup else configuration['n'], configuration)
+      dataset.schedule = schedule
+      dataset.probe_ip_lists = True
+      service.providers.response_factory = dataset.response
+      await load_begin_provider_cycle(service.providers, f'{schedule}-{repetition}-cold')
+      service.providers.reset_evidence()
+      seed_seconds, initial_sha = batch_comparison_seed(service, dataset)
+      if not warmup:
+        assert initial_sha == shared['measured_initial_data_sha256'], 'Cold initial fixture changed'
+      source_ok = False
+      for temperature in ('cold', 'warm'):
+        entry = {
+          'schedule': schedule,
+          'cache': temperature,
+          'repetition': repetition,
+          'warmup': warmup,
+          'measured': not warmup,
+          'status': 'in_progress',
+          'dataset': dataset.manifest(),
+          'cold_initial_data_sha256': initial_sha,
+          'seed_seconds_excluded': seed_seconds,
+          'measurement': {},
+        }
+        evidence['cases'].append(entry)
+        try:
+          if temperature == 'cold':
+            startup_index = len(service.startup_attempts)
+            try:
+              await service.start()
+            finally:
+              entry['startup_attempts'] = service.startup_attempts[startup_index:]
+          elif not source_ok:
+            entry['status'] = 'blocked'
+            entry['failure'] = {'type': 'PreconditionFailure', 'message': 'Cold source did not establish warm state'}
+            continue
+          else:
+            await load_begin_provider_cycle(service.providers, f'{schedule}-{repetition}-warm')
+            service.providers.reset_evidence()
+          async with httpx.AsyncClient(base_url=service.url, timeout=5, trust_env=False) as client:
+            entry['initial_public_state'] = await batch_comparison_public_state(
+              client, dataset, configuration['verify_timeout']
+            )
+            raw_before = (await client.get('/metrics')).text
+          key = f'{schedule}-{repetition}-{temperature}'
+          state_hash = entry['initial_public_state']['normalized_sha256']
+          if configuration['variant'] == 'after':
+            if key not in initial_states:
+              entry['comparison'] = {'status': 'INCOMPARABLE', 'missing_initial_state_reference': key}
+              record_failure(entry, AssertionError(f'Missing initial state reference: {key}'))
+            else:
+              assert initial_states[key] == state_hash, 'Logical initial ownership/checkpoints differ across revisions'
+              entry['comparison'] = {'status': 'matched', 'initial_state_reference': key}
+          else:
+            initial_states[key] = state_hash
+            load_write_artifact(state_path, initial_states)
+          entry['raw_metrics_before'] = raw_before
+          try:
+            await load_measure_pass(
+              service,
+              dataset,
+              configuration,
+              shared['baseline']['bounds_seconds'],
+              mode='stale',
+              p99_bounds=shared['baseline']['p99_bounds_seconds'],
+              measurement=entry['measurement'],
+              on_progress=lambda progress, entry=entry: (
+                entry.update(progress=progress),
+                load_write_artifact(artifact_path, evidence),
+              ),
+            )
+          except (AssertionError, RuntimeError, ValueError, TimeoutError, OSError, httpx.HTTPError, KeyError) as error:
+            record_failure(entry, error)
+          measurement = entry['measurement']
+          fields = measurement.get('run', {})
+          entry['warm_precondition'] = {
+            'source_completed': measurement.get('source_pass_status') == 'completed',
+            'auxiliary_drained': (
+              measurement.get('auxiliary_drain_status') == 'completed'
+              and measurement.get('wall_seconds_including_auxiliary_drain') is not None
+              and measurement.get('source_run_count') == 1
+            ),
+            'known_writer_outcomes': (
+              fields.get('selected') == fields.get('attempted') == dataset.count
+              and fields.get('processing_complete') == 1
+              and fields.get('admitted') is not None
+              and fields.get('admitted') == fields.get('confirmed')
+              and all(
+                fields.get(name) == 0
+                for name in (
+                  'active',
+                  'pending',
+                  'admission_in_progress',
+                  'unknown',
+                  'known_not_committed',
+                  'not_admitted',
+                )
+              )
+            ),
+            'public_results_verified': False,
+            'status': 'unverified',
+          }
+          precondition = entry['warm_precondition']
+          assert all(
+            precondition[name] for name in ('source_completed', 'auxiliary_drained', 'known_writer_outcomes')
+          ), (
+            'Source did not establish drained, known writer outcomes',
+            precondition,
+          )
+          async with httpx.AsyncClient(base_url=service.url, timeout=5, trust_env=False) as client:
+            entry['raw_metrics_after'] = (await client.get('/metrics')).text
+            entry['verification'] = await load_verify_public(client, dataset, configuration['verify_timeout'])
+          assert entry['verification']['verified_sources'] == dataset.count, 'Public source verification is incomplete'
+          entry['writer_metric_deltas'] = batch_comparison_metric_delta(
+            parse_samples(raw_before), parse_samples(entry['raw_metrics_after'])
+          )
+          precondition.update(public_results_verified=True, status='verified')
+          source_ok = True
+          if temperature == 'warm':
+            cold = evidence['cases'][-2]
+            assert entry['measurement']['ripe_network_requests'] <= cold['measurement']['ripe_network_requests']
+            await service.stop()
+            entry['executed_source'] = batch_comparison_executed_source(service, manifest)
+            startup_index = len(service.startup_attempts)
+            try:
+              await service.start()
+            finally:
+              entry['restart_attempts'] = service.startup_attempts[startup_index:]
+            async with httpx.AsyncClient(base_url=service.url, timeout=5, trust_env=False) as client:
+              entry['restart_verification'] = await load_verify_public(client, dataset, configuration['verify_timeout'])
+            await service.stop()
+            entry['restart_source'] = batch_comparison_executed_source(service, manifest)
+          if 'failure' not in entry:
+            entry['status'] = 'passed'
+        except (AssertionError, RuntimeError, ValueError, TimeoutError, OSError, httpx.HTTPError, KeyError) as error:
+          record_failure(entry, error)
+        finally:
+          entry['providers'] = service.providers.evidence()
+          # A failed acceptance verdict can still leave valid warm input in the same process/cache.
+          if not source_ok or temperature == 'warm':
+            try:
+              await service.stop(allow_failure=entry['status'] != 'passed')
+            except (AssertionError, RuntimeError, TimeoutError, OSError) as cleanup_error:
+              entry['cleanup_error'] = repr(cleanup_error)
+              entry['status'] = 'failed'
+              if first_failure is None:
+                first_failure = cleanup_error
+          load_write_artifact(artifact_path, evidence)
+  evidence['summary'] = {}
+  for schedule in ('healthy', 'degraded'):
+    for temperature in ('cold', 'warm'):
+      cases = [
+        case
+        for case in evidence['cases']
+        if case['measured'] and case['schedule'] == schedule and case['cache'] == temperature
+      ]
+      timings = [
+        case['measurement']['wall_seconds_to_known_writer_outcomes']
+        for case in cases
+        if case['measurement'].get('source_pass_status') == 'completed'
+      ]
+      evidence['summary'][f'{schedule}-{temperature}'] = {
+        'complete_source_measurements': len(timings),
+        'fully_passed_cases': sum(case['status'] == 'passed' for case in cases),
+        'raw_seconds': timings,
+        'median_seconds': statistics.median(timings) if timings else None,
+        'acceptance_scale': not configuration['smoke'],
+      }
+  evidence['status'] = 'failed' if first_failure is not None else 'passed'
+  load_write_artifact(artifact_path, evidence)
+  if first_failure is not None:
+    raise first_failure
+  assert all(row['fully_passed_cases'] == configuration['repetitions'] for row in evidence['summary'].values())
+
+
 @pytest.mark.e2e
 @pytest.mark.e2e_load
 @pytest.mark.skipif(
@@ -6554,7 +7432,7 @@ async def test_ip_persistence_revision_comparison(e2e_service, tmp_path):
   assert json.loads((source_root / 'source-manifest.json').read_text(encoding='utf-8'))['source_sha256'] == manifest
   service.select_source(source_root)
   # Fixed test resource settings apply identically to both revisions; no algorithm selector exists.
-  service.environment.update({'DB_SAVE_BATCH_SIZE': '256', 'DB_SAVE_BATCH_TIMEOUT': '0.25'})
+  service.environment.update(batch_comparison_environment(configuration))
   bounds_path = Path(configuration['bounds_path'])
   artifact_path = tmp_path / 'ip-persistence-comparison.json'
   workload = {
@@ -6587,7 +7465,11 @@ async def test_ip_persistence_revision_comparison(e2e_service, tmp_path):
       'migrations': str(service.directory / 'migrations'),
     },
     'measurement_scope': 'attempted application writer DBAPI dispatch and phase metrics include auxiliary API writes',
-    'cache_precondition': 'cold process-local cache on every warmup and measured pass',
+    'cache_precondition': (
+      'cold process followed by warm pass in the same process; refresh interval zero, volatile checkpoints excluded'
+      if configuration['profile'] == 'startup'
+      else 'cold process-local cache on every warmup and measured pass'
+    ),
     'status': 'in_progress',
     'cases': [],
   }
@@ -6625,9 +7507,24 @@ async def test_ip_persistence_revision_comparison(e2e_service, tmp_path):
       with closing(sqlite3.connect(service.db_path)) as connection, connection:
         connection.execute("UPDATE rdpr_domains SET last_resolved_at='2100-01-01 00:00:00' WHERE id>0")
       service.providers.response_factory = idle.response
-      await service.start()
-      baseline = await load_freeze_api_bounds(service, idle, configuration)
-      await service.stop()
+      measured_refresh = service.environment.get('DOMAINS_UPDATE_INTERVAL')
+      if configuration['profile'] == 'startup':
+        # Idle probes must not reselect a committed canary while its deletion is being confirmed.
+        service.environment['DOMAINS_UPDATE_INTERVAL'] = '172800'
+        evidence['idle_only_environment_override'] = {'DOMAINS_UPDATE_INTERVAL': '172800'}
+        evidence['idle_effective_settings'] = load_effective_settings(service)
+      try:
+        await service.start()
+        baseline = await load_freeze_api_bounds(service, idle, configuration)
+        if configuration['profile'] == 'startup':
+          baseline['p99_bounds_seconds'] = dict.fromkeys(baseline['bounds_seconds'], 1.0)
+          baseline['formula'] = 'request/max <= 5s; p99 <= 1s for every route'
+        await service.stop()
+      finally:
+        if measured_refresh is None:
+          service.environment.pop('DOMAINS_UPDATE_INTERVAL', None)
+        else:
+          service.environment['DOMAINS_UPDATE_INTERVAL'] = measured_refresh
       assert {
         'ip_lists',
         'ip_list',
@@ -6651,6 +7548,9 @@ async def test_ip_persistence_revision_comparison(e2e_service, tmp_path):
       load_write_artifact(bounds_path, shared)
     evidence['shared_bounds_sha256'] = sha256(bounds_path.read_bytes()).hexdigest()
     evidence['shared_bounds'] = shared
+    if configuration['profile'] == 'startup':
+      await batch_comparison_startup_cases(service, configuration, shared, manifest, evidence, artifact_path)
+      return
     for repetition in range(configuration['repetitions'] + 1):
       warmup = repetition == 0
       dataset = ResolutionLoadDataset(configuration['warmup_size'] if warmup else configuration['n'], configuration)

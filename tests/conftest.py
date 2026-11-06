@@ -15,6 +15,7 @@ from collections import Counter
 from contextlib import closing
 from hashlib import sha256
 from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -398,6 +399,7 @@ class ServiceProcess:
     self.process = None
     self.log_path = directory / 'application.log'
     self.log = None
+    self.startup_attempts = []
 
   def select_source(self, root):
     """Bind entrypoint, imports and startup migrations to one generated source snapshot."""
@@ -554,6 +556,9 @@ class ServiceProcess:
       '    normalize_migration_coverage(coverage.get_data(), Path(sys.argv[1]).parent, [Path.cwd() / "migrations"])\n'
       '    coverage.save()\n'
     )
+    attempt = {'status': 'starting'}
+    self.startup_attempts.append(attempt)
+    started = perf_counter()
     self.log = self.log_path.open('ab', buffering=0)
     try:
       self.process = await asyncio.create_subprocess_exec(
@@ -574,12 +579,18 @@ class ServiceProcess:
             raise AssertionError(f'Application exited before readiness:\n{self.diagnostics()}')
           try:
             if await self.health_ready():
+              attempt.update(status='ready', readiness_seconds=perf_counter() - started)
               break
           except OSError, TimeoutError:
             pass
           await asyncio.sleep(0.02)
-    except BaseException:
-      await self.stop(allow_failure=True)
+    except BaseException as error:
+      attempt.update(status='failed', elapsed_seconds=perf_counter() - started, error=repr(error))
+      try:
+        await self.stop(allow_failure=True)
+      except BaseException as cleanup_error:  # noqa: BLE001 -- Preserve the primary error at this harness boundary.
+        attempt['cleanup_error'] = repr(cleanup_error)
+        error.add_note(f'Startup cleanup also failed: {cleanup_error!r}')
       raise
 
   @property

@@ -49,7 +49,7 @@ from metrics.metrics import (
   queue_duration,
   writer_duration,
 )
-from migrations.migration_202618042123 import ip_schema_kind, validate_support_schema, validate_support_state
+from migrations.migration_202618042123 import ip_schema_kind, validate_support_state
 from models.db.dns_servers_dbo import DnsServersDbo
 from models.db.domains_dbo import DomainsDbo
 from models.db.domains_lists_dbo import DomainsListsDbo
@@ -113,7 +113,6 @@ from utils.utils import calculate_checksum, check_ip_allow, get_ip_version
 
 LEGACY_IMPORT_MIGRATION = 'migration_202511031501.py'
 GATEWAY_MIGRATION = 'migration_202618042122.py'
-IP_SUPPORT_MIGRATION = 'migration_202618042123.py'
 DNS_SQL_PARAMETER_CAP = 900
 DNS_GLOBAL_ROW_BINDS = 4
 DNS_SUPPORT_ROW_BINDS = 3
@@ -416,19 +415,9 @@ class DataBase:
           await self.__get_all_applied_migrations(conn) if MigrationsDbo.__tablename__ in original_schema else []
         )
         completed = {migration.name for migration in applied if migration.applied_at is not None}
-        if GATEWAY_MIGRATION in completed:
-          if IpRecordsDbo.__tablename__ not in original_schema or not await self.__gateway_effect(conn):
-            raise DatabaseWriteError('Completed gateway migration has an incompatible schema')
-        if IP_SUPPORT_MIGRATION in completed:
-          if await ip_schema_kind(conn) != 'current':
-            raise DatabaseWriteError('Completed IP ownership migration has an incompatible schema')
-          await validate_support_schema(conn)
-          await validate_support_state(conn)
-        elif IpSupportDbo.__tablename__ in original_schema:
-          await validate_support_schema(conn)
         legacy_counts, remap_default_domain = await self.__startup_legacy_preflight(conn, original_schema, completed)
         await conn.run_sync(MigrationsDbo.metadata.create_all)
-        await self.__main_migrations(
+        migrations_processed = await self.__main_migrations(
           conn,
           completed=completed,
           legacy_counts=legacy_counts,
@@ -444,8 +433,9 @@ class DataBase:
               id=0, resolved=True, name='default', ros_comment='Default Domain', last_resolved_at=func.now()
             )
           )
-        await self.__check_startup_foreign_keys(conn)
-        await validate_support_state(conn)
+        if migrations_processed:
+          await self.__check_startup_foreign_keys(conn)
+          await validate_support_state(conn)
         await conn.commit()
       except BaseException:
         self.__initialization_failed = True
@@ -516,6 +506,8 @@ class DataBase:
     original_schema: dict[str, tuple[str, str | None]],
     completed: set[str],
   ) -> tuple[dict[str, int], bool]:
+    if LEGACY_IMPORT_MIGRATION in completed:
+      return {}, False
     targets = self.__legacy_targets()
     sources = set(LEGACY_BUSINESS_COLUMNS) | {'jobs'}
     present = sources & original_schema.keys()
@@ -533,8 +525,6 @@ class DataBase:
       return {}, False
     if present != sources or any(original_schema[name][0] != 'table' for name in sources):
       raise DatabaseWriteError('Legacy schema is incomplete or unsupported')
-    if LEGACY_IMPORT_MIGRATION in completed:
-      raise DatabaseWriteError('Completed legacy migration still has source tables')
     for name, columns in LEGACY_BUSINESS_COLUMNS.items():
       shape = (await conn.execute(text('SELECT * FROM pragma_table_xinfo(:name)'), {'name': name})).all()
       if {column.name for column in shape} != set(columns) or any(column.hidden for column in shape):
@@ -953,7 +943,9 @@ class DataBase:
     completed: set[str],
     legacy_counts: dict[str, int],
     remap_default_domain: bool,
-  ) -> None:
+  ) -> bool:
+    """Apply and stamp pending migrations; report whether any were processed."""
+    migrations_processed = False
     migration_files = await self.__get_migrations_files()
     if legacy_counts and LEGACY_IMPORT_MIGRATION not in {migration.name for migration in migration_files}:
       raise DatabaseWriteError('Legacy import migration is unavailable')
@@ -989,6 +981,8 @@ class DataBase:
           applied_at=datetime.now(UTC),
         )
       )
+      migrations_processed = True
+    return migrations_processed
 
   # DNS servers
 
@@ -2616,10 +2610,21 @@ class DataBase:
     """Delete final orphans and repair only vanished incumbent projections."""
     has_support = exists().where(IpSupportDbo.ip_record_id == IpRecordsDbo.id)
     await session.execute(delete(IpRecordsDbo).where(~has_support))
-    incumbent = exists().where(
-      IpSupportDbo.ip_record_id == IpRecordsDbo.id,
-      IpSupportDbo.domain_id == IpRecordsDbo.domain_id,
-      IpSupportDbo.ip_list_id.is_not_distinct_from(IpRecordsDbo.ip_list_id),
+    incumbent = (
+      IpRecordsDbo.ip_list_id.is_(None)
+      & exists().where(
+        IpSupportDbo.ip_record_id == IpRecordsDbo.id,
+        IpSupportDbo.domain_id == IpRecordsDbo.domain_id,
+        IpSupportDbo.ip_list_id.is_(None),
+      )
+    ) | (
+      IpRecordsDbo.ip_list_id.is_not(None)
+      & exists().where(
+        IpSupportDbo.ip_record_id == IpRecordsDbo.id,
+        IpSupportDbo.domain_id == IpRecordsDbo.domain_id,
+        IpSupportDbo.ip_list_id.is_not(None),
+        IpSupportDbo.ip_list_id == IpRecordsDbo.ip_list_id,
+      )
     )
     representative = (
       select(IpSupportDbo.domain_id, IpSupportDbo.ip_list_id)
