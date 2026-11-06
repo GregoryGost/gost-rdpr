@@ -1312,8 +1312,11 @@ class DataBase:
           domains_and_query[0]
         )
         query_total: int = domains_and_query[1]
+        ips_by_domain = await IpRecordsDbo.get_ips_on_domain_ids(
+          db_session=db_session, domain_ids=[domain[0] for domain in domains]
+        )
         for domain in domains:
-          ip_addr_v4, ip_addr_v6 = await IpRecordsDbo.get_ips_on_domain_id(db_session=db_session, domain_id=domain[0])
+          ip_addr_v4, ip_addr_v6 = ips_by_domain[domain[0]]
           payload.append(
             DomainElementResp(
               id=domain[0],

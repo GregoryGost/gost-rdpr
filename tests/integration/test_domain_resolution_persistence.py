@@ -248,6 +248,189 @@ async def seed(app, store, *, resolved=False, checkpoint=None):
     )
 
 
+@pytest.fixture
+async def domain_page_store(app, store):
+  """Keep support order different from global IP order, including shared and list-only sources."""
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.DomainsDbo),
+      [{'id': value, 'name': f'domain-{value}.example.test', 'resolved': value < 2} for value in (3, 2, 1, 0)],
+    )
+    await connection.execute(
+      insert(app.database.IpsListsDbo),
+      [{'id': value, 'name': f'list-{value}', 'url': f'https://lists.example.test/{value}'} for value in (1, 2)],
+    )
+    await connection.execute(
+      insert(app.database.IpRecordsDbo),
+      [
+        {'id': 40, 'domain_id': 2, 'ip_list_id': 2, 'addr_type': 6, 'ip_address': '2001:4860:4860::8844'},
+        {'id': 30, 'domain_id': 0, 'ip_list_id': None, 'addr_type': 4, 'ip_address': '1.1.1.1'},
+        {'id': 20, 'domain_id': 1, 'ip_list_id': None, 'addr_type': 6, 'ip_address': '2001:4860:4860::8888'},
+        {'id': 10, 'domain_id': 0, 'ip_list_id': 1, 'addr_type': 4, 'ip_address': '9.9.9.9'},
+      ],
+    )
+    await connection.execute(
+      insert(app.database.IpSupportDbo),
+      [
+        {'ip_record_id': ip_id, 'domain_id': domain_id, 'ip_list_id': list_id}
+        for ip_id, domain_id, list_id in (
+          (40, 2, 2),
+          (30, 0, None),
+          (20, 2, 2),
+          (20, 1, None),
+          (10, 1, None),
+          (10, 1, 2),
+          (10, 1, 1),
+          (10, 0, 1),
+        )
+      ],
+    )
+  return store, {
+    0: (['9.9.9.9', '1.1.1.1'], []),
+    1: (['9.9.9.9'], ['2001:4860:4860::8888']),
+    2: ([], ['2001:4860:4860::8888', '2001:4860:4860::8844']),
+    3: ([], []),
+  }
+
+
+@pytest.mark.parametrize(
+  ('domain_ids', 'maximum_queries'),
+  [([], 0), ([2, 1, 0, 1, 3], 1), ([*range(1001), 0, 1, 2], 3)],
+  ids=['empty', 'shared-addresses', 'large-page'],
+)
+async def test_domain_ip_batch_preserves_order_and_bounds_queries(app, domain_page_store, domain_ids, maximum_queries):
+  store, expected = domain_page_store
+  queries = []
+
+  def observe(connection, cursor, statement, parameters, context, many):
+    if statement.lstrip().upper().startswith('SELECT'):
+      queries.append(statement)
+
+  engine = store._DataBase__read_engine
+  event.listen(engine.sync_engine, 'before_cursor_execute', observe)
+  try:
+    async with AsyncSession(engine) as session:
+      raw = await (await session.connection()).get_raw_connection()
+      driver = raw.driver_connection
+      previous = await driver._execute(driver._conn.setlimit, sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+      try:
+        observed = await app.database.IpRecordsDbo.get_ips_on_domain_ids(session, domain_ids)
+      finally:
+        await driver._execute(driver._conn.setlimit, sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous)
+    assert observed == {value: expected.get(value, ([], [])) for value in domain_ids}
+    assert len(queries) <= maximum_queries
+  finally:
+    event.remove(engine.sync_engine, 'before_cursor_execute', observe)
+
+
+@pytest.mark.parametrize(
+  ('options', 'expected_ids', 'query_total'),
+  [
+    ({'limit': 2, 'offset': 0}, [0, 1], 4),
+    ({'limit': 2, 'offset': 1}, [1, 2], 4),
+    ({'limit': 4, 'offset': 0, 'resolved': True}, [0, 1], 2),
+    ({'limit': 4, 'offset': 0, 'resolved': False}, [2, 3], 2),
+    ({'limit': 4, 'offset': 0, 'search_text': 'domain-1'}, [1], 1),
+    ({'limit': 4, 'offset': 0, 'search_text': 'absent'}, [], 0),
+  ],
+)
+async def test_domain_page_reads_ips_together_without_changing_payload(
+  domain_page_store, options, expected_ids, query_total
+):
+  store, expected = domain_page_store
+  queries = []
+
+  def observe(connection, cursor, statement, parameters, context, many):
+    if statement.lstrip().upper().startswith('SELECT'):
+      queries.append(statement)
+
+  engine = store._DataBase__read_engine
+  event.listen(engine.sync_engine, 'before_cursor_execute', observe)
+  try:
+    response = await store.get_all_domains(before_time=perf_counter(), **options)
+  finally:
+    event.remove(engine.sync_engine, 'before_cursor_execute', observe)
+  assert (response.total, response.total_resolved, response.total_query, response.count) == (
+    4,
+    2,
+    query_total,
+    len(expected_ids),
+  )
+  assert [domain.id for domain in response.payload] == expected_ids
+  for domain in response.payload:
+    ipv4, ipv6 = expected[domain.id]
+    assert (domain.ips_v4, domain.ips_v6) == (ipv4 or None, ipv6 or None)
+    assert domain.name == f'domain-{domain.id}.example.test'
+  assert len(queries) <= (5 if expected_ids else 4)
+
+
+@pytest.mark.parametrize('scenario', ['empty', 'unlisted', 'listed', 'mixed'])
+async def test_ip_statistics_preserve_global_counts_and_distinct_list_members(app, store, scenario):
+  """List membership excludes domain-only supports and counts a shared address once per list."""
+  ip_lists = [
+    {'id': 0, 'name': 'zero', 'url': 'https://lists.example.test/zero', 'attempts': 1},
+    {'id': 7, 'name': 'shared', 'url': 'https://lists.example.test/shared', 'attempts': 2},
+    {'id': 9, 'name': 'empty', 'url': 'https://lists.example.test/empty', 'attempts': 3},
+  ]
+  records = []
+  supports = []
+  if scenario != 'empty':
+    records = [
+      {'id': 10, 'domain_id': 1, 'ip_list_id': None, 'addr_type': 4, 'ip_address': '8.8.8.8'},
+      {'id': 11, 'domain_id': 0, 'ip_list_id': None, 'addr_type': 6, 'ip_address': '2001:4860:4860::8888'},
+    ]
+    if scenario != 'listed':
+      records.extend(
+        [
+          {'id': 12, 'domain_id': 2, 'ip_list_id': None, 'addr_type': 4, 'ip_address': '9.9.9.9'},
+          {'id': 13, 'domain_id': 0, 'ip_list_id': None, 'addr_type': 6, 'ip_address': '2001:4860:4860::8844'},
+        ]
+      )
+      supports.extend({'ip_record_id': row['id'], 'domain_id': row['domain_id'], 'ip_list_id': None} for row in records)
+    if scenario != 'unlisted':
+      for row in records[:2]:
+        row['ip_list_id'] = 0
+        for list_id in (0, 7):
+          supports.append({'ip_record_id': row['id'], 'domain_id': row['domain_id'], 'ip_list_id': list_id})
+      # Independent domains can support the same address in both lists.
+      supports.extend({'ip_record_id': 10, 'domain_id': 2, 'ip_list_id': list_id} for list_id in (0, 7))
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.DomainsDbo),
+      [{'id': value, 'name': f'domain-{value}.example.test'} for value in range(3)],
+    )
+    await connection.execute(insert(app.database.IpsListsDbo), ip_lists)
+    if records:
+      await connection.execute(insert(app.database.IpRecordsDbo), records)
+      await connection.execute(insert(app.database.IpSupportDbo), supports)
+  async with AsyncSession(store._DataBase__read_engine) as session:
+    row = await app.database.IpRecordsDbo.get_stats(session)
+  observed = dict(row._mapping)
+  per_list = sorted(json.loads(observed.pop('per_list')), key=lambda item: item['list_id'])
+  count = {'empty': 0, 'unlisted': 4, 'listed': 2, 'mixed': 4}[scenario]
+  half = count // 2 if count else None
+  assert observed == {
+    'total': count,
+    'v4_total': half,
+    'v6_total': half,
+    'linked_to_domain': half,
+    'standalone': half,
+    'lists_total': 3,
+  }
+  members = 2 if scenario in {'listed', 'mixed'} else 0
+  assert per_list == [
+    {
+      'list_id': row['id'],
+      'list_name': row['name'],
+      'total': members if row['id'] != 9 else 0,
+      'v4_count': members // 2 if row['id'] != 9 else 0,
+      'v6_count': members // 2 if row['id'] != 9 else 0,
+      'attempts': row['attempts'],
+    }
+    for row in ip_lists
+  ]
+
+
 async def support_snapshot(store):
   """Read source ownership independently of the compatibility owner projection."""
   async with store._DataBase__read_engine.connect() as connection:
@@ -5300,11 +5483,42 @@ async def load_public_setup(service, timeout):
         await asyncio.sleep(0.02)
 
 
-async def load_wait_idle(client, mode, selected, previous, timeout, *, on_progress=None):
+async def load_metrics_request(client, observer=None, *, scope='metrics'):
+  """Keep optional scrape measurements separate from API acceptance samples."""
+  if observer is None:
+    return await client.get('/metrics')
+  started = perf_counter()
+  response = None
+  failure = None
+  try:
+    response = await client.get('/metrics')
+    assert response.status_code == 200, 'Metrics scrape failed'
+    return response
+  except BaseException as error:
+    failure = type(error).__name__
+    raise
+  finally:
+    ended = perf_counter()
+    observer.append(
+      {
+        'scope': scope,
+        'start_monotonic': started,
+        'end_monotonic': ended,
+        'elapsed_seconds': ended - started,
+        'status_code': response.status_code if response is not None else None,
+        'body_bytes': len(response.content) if response is not None else None,
+        'error_type': failure,
+      }
+    )
+
+
+async def load_wait_idle(
+  client, mode, selected, previous, timeout, *, on_progress=None, metrics_poll_interval=0.05, metrics_observer=None
+):
   next_progress = 0.0
   async with asyncio.timeout(timeout):
     while True:
-      response = await client.get('/metrics')
+      response = await load_metrics_request(client, metrics_observer, scope='source_idle_poll')
       assert response.status_code == 200
       samples = parse_samples(response.text)
       fields = run_fields(samples, mode)
@@ -5321,7 +5535,7 @@ async def load_wait_idle(client, mode, selected, previous, timeout, *, on_progre
         assert fields['admitted'] == fields['confirmed'], fields
         assert fields['attempted'] == selected, fields
         return samples, fields
-      await asyncio.sleep(0.05)
+      await asyncio.sleep(metrics_poll_interval)
 
 
 async def load_verify_public(client, dataset, timeout):
@@ -5368,9 +5582,10 @@ async def load_verify_public(client, dataset, timeout):
 class LoadApiObservations(dict):
   """Retain per-route latency samples and diagnostic facts for failed exchanges."""
 
-  def __init__(self):
+  def __init__(self, *, diagnostic=False):
     super().__init__()
     self.failures = []
+    self.requests = [] if diagnostic else None
 
 
 async def load_api_request(client, observations, label, method, path, *, timeout, statuses=(200,), **kwargs):
@@ -5379,6 +5594,19 @@ async def load_api_request(client, observations, label, method, path, *, timeout
   started = perf_counter()
   response = None
   failure = None
+  trace = [] if isinstance(observations, LoadApiObservations) and observations.requests is not None else None
+  trace_callback_seconds = 0.0
+
+  async def record_trace(event, info):
+    # Event names and clocks suffice; transport info may contain headers or payloads.
+    nonlocal trace_callback_seconds
+    before = perf_counter()
+    del info
+    trace.append({'event': event, 'at_monotonic': perf_counter()})
+    trace_callback_seconds += perf_counter() - before
+
+  if trace is not None:
+    kwargs['extensions'] = {**kwargs.get('extensions', {}), 'trace': record_trace}
   try:
     async with asyncio.timeout(limit):
       response = await client.request(method, path, **kwargs)
@@ -5386,10 +5614,38 @@ async def load_api_request(client, observations, label, method, path, *, timeout
     failure = type(error).__name__
     raise
   finally:
-    elapsed = perf_counter() - started
+    ended = perf_counter()
+    elapsed = ended - started
     if response is not None:
       observations.setdefault(label, []).append(elapsed)
     status = response.status_code if response is not None else None
+    if trace is not None:
+      before_observation = perf_counter()
+      duration = None
+      if response is not None:
+        try:
+          body = response.json()
+        except ValueError, UnicodeError:
+          body = None
+        if isinstance(body, dict) and type(body.get('duration')) in {int, float}:
+          duration = body['duration'] if math.isfinite(body['duration']) else None
+      observations.requests.append(
+        {
+          'route': label,
+          'method': method,
+          'path': path,
+          'start_monotonic': started,
+          'end_monotonic': ended,
+          'elapsed_seconds': elapsed,
+          'status_code': status,
+          'body_bytes': len(response.content) if response is not None else None,
+          'server_duration_seconds': duration,
+          'error_type': failure,
+          'transport_events': trace,
+          'trace_callback_seconds': trace_callback_seconds,
+        }
+      )
+      observations.requests[-1]['observation_seconds'] = perf_counter() - before_observation
     if isinstance(observations, LoadApiObservations) and (failure or elapsed > limit or status not in statuses):
       observations.failures.append(
         {
@@ -5703,13 +5959,23 @@ async def test_resolution_load_baseline_finishes_canary_lifecycle_before_freezin
 
 
 async def load_measure_pass(
-  service, dataset, configuration, bounds, *, mode, p99_bounds=None, on_progress=None, measurement=None
+  service,
+  dataset,
+  configuration,
+  bounds,
+  *,
+  mode,
+  p99_bounds=None,
+  on_progress=None,
+  measurement=None,
+  observations=None,
+  metrics_observer=None,
 ):
   measurement = {} if measurement is None else measurement
-  observed = LoadApiObservations()
+  observed = LoadApiObservations() if observations is None else observations
   finished = asyncio.Event()
   async with httpx.AsyncClient(base_url=service.url, timeout=max(bounds.values()), trust_env=False) as client:
-    before = parse_samples((await client.get('/metrics')).text)
+    before = parse_samples((await load_metrics_request(client, metrics_observer, scope='source_before')).text)
     pid = application_pid(before)
     resources = [service.resource_snapshot(pid)]
     last_api_at = None
@@ -5749,7 +6015,12 @@ async def load_measure_pass(
       assert response.status_code == 200, response.text
       # Freeze source membership before any public canary can enter selection.
       async with asyncio.timeout(configuration['pass_timeout']):
-        while run_fields(parse_samples((await client.get('/metrics')).text), mode).get('selected') != dataset.count:
+        while (
+          run_fields(
+            parse_samples((await load_metrics_request(client, metrics_observer, scope='source_selection')).text), mode
+          ).get('selected')
+          != dataset.count
+        ):
           await asyncio.sleep(0.01)
       canary_task = asyncio.create_task(
         load_probe_canaries(
@@ -5770,6 +6041,11 @@ async def load_measure_pass(
           sample_total(before, 'resolution_run_elapsed_seconds_count', mode=mode),
           configuration['pass_timeout'],
           on_progress=report_progress,
+          **(
+            {'metrics_poll_interval': configuration['metrics_poll_interval'], 'metrics_observer': metrics_observer}
+            if 'metrics_poll_interval' in configuration
+            else {}
+          ),
         )
         measurement.update(
           source_pass_status='completed',
@@ -5816,10 +6092,14 @@ async def load_measure_pass(
         measurement['resource_samples'] = resources
         measurement['api_bounds_frozen_seconds'] = bounds
         measurement['api_failures'] = observed.failures
-    await load_drain_stored(client, configuration['pass_timeout'])
+    await load_drain_stored(
+      client,
+      configuration['pass_timeout'],
+      **({'metrics_observer': metrics_observer} if metrics_observer is not None else {}),
+    )
     async with asyncio.timeout(configuration['pass_timeout']):
       while True:
-        current = parse_samples((await client.get('/metrics')).text)
+        current = parse_samples((await load_metrics_request(client, metrics_observer, scope='auxiliary_drain')).text)
         auxiliary = run_fields(current, 'new' if mode == 'stale' else 'stale')
         if all(auxiliary.get(key, 0) == 0 for key in ('active', 'pending', 'admission_in_progress')):
           break
@@ -5900,6 +6180,907 @@ async def load_measure_pass(
     return measurement
 
 
+def api_diagnostic_configuration():
+  """Require explicit diagnostic selection and preserve the original workload knobs."""
+  supplied = json.loads(os.environ['GOST_API_DIAGNOSTIC_CONFIG'])
+  defaults = {
+    'smoke': False,
+    'n': 10000,
+    'seed': 20261104,
+    'unique_ip_ratio': 0.7,
+    'alias_every': 10,
+    'provider_delay': 0.001,
+    'pass_timeout': 1800,
+    'verify_timeout': 180,
+    'rss_limit_mb': 2048,
+    'cpu_percent_limit': 1600,
+    'probe_interval': 0.25,
+    'idle_seconds': 15,
+    'progress_writes': 'original',
+    'independent_probe': True,
+    'metrics_poll_interval': 0.05,
+    'idle_metrics_polling': False,
+    'read_pool_size': None,
+  }
+  assert isinstance(supplied, dict)
+  assert set(supplied) <= set(defaults)
+  configuration = defaults | supplied
+  assert type(configuration['smoke']) is bool
+  assert type(configuration['independent_probe']) is bool
+  assert type(configuration['idle_metrics_polling']) is bool
+  assert type(configuration['n']) is int
+  assert 6 <= configuration['n'] <= 64 if configuration['smoke'] else configuration['n'] == 10000
+  for key in ('seed', 'unique_ip_ratio', 'alias_every', 'provider_delay', 'probe_interval'):
+    assert configuration[key] == defaults[key], ('Workload knob changed', key)
+  for key, maximum in (
+    ('pass_timeout', 1800),
+    ('verify_timeout', 600),
+    ('rss_limit_mb', 2048),
+    ('cpu_percent_limit', 1600),
+    ('idle_seconds', 60),
+  ):
+    assert type(configuration[key]) in {int, float}
+    assert math.isfinite(configuration[key]), key
+    assert 0 < configuration[key] <= maximum, key
+  assert configuration['progress_writes'] in {'original', 'deferred'}
+  assert type(configuration['metrics_poll_interval']) in {int, float}
+  assert math.isfinite(configuration['metrics_poll_interval'])
+  assert 0.05 <= configuration['metrics_poll_interval'] <= 1.0
+  if configuration['read_pool_size'] is not None:
+    assert type(configuration['read_pool_size']) is int
+    assert 1 <= configuration['read_pool_size'] <= 64
+  return configuration
+
+
+class ApiDiagnosticRecorder:
+  """Keep clocks in memory during requests; measure synchronous artifact work explicitly."""
+
+  def __init__(self):
+    self.observations = LoadApiObservations(diagnostic=True)
+    self.evidence = {'loop_interval_seconds': 0.02, 'loop_wakeups': [], 'artifact_writes': [], 'metrics_scrapes': []}
+
+  async def watch_loop(self):
+    interval = self.evidence['loop_interval_seconds']
+    while True:
+      scheduled = perf_counter() + interval
+      await asyncio.sleep(interval)
+      resumed = perf_counter()
+      before = perf_counter()
+      self.evidence['loop_wakeups'].append(
+        {'scheduled_monotonic': scheduled, 'resumed_monotonic': resumed, 'lag_seconds': max(0, resumed - scheduled)}
+      )
+      self.evidence['loop_wakeups'][-1]['observation_seconds'] = perf_counter() - before
+
+  def write(self, path, artifact):
+    started = perf_counter()
+    try:
+      load_write_artifact(path, artifact)
+    finally:
+      ended = perf_counter()
+      self.evidence['artifact_writes'].append(
+        {
+          'start_monotonic': started,
+          'end_monotonic': ended,
+          'elapsed_seconds': ended - started,
+          'bytes_after_write': path.stat().st_size if path.exists() else None,
+        }
+      )
+
+
+API_DIAGNOSTIC_PROBE = """
+import json, os, sys, threading, time
+import httpx
+stop = threading.Event()
+def read_stop():
+  os.read(sys.stdin.fileno(), 1)
+  stop.set()
+threading.Thread(target=read_stop, daemon=True).start()
+rows = []
+deadline = time.perf_counter() + float(sys.argv[3])
+with httpx.Client(base_url=sys.argv[1], timeout=5, trust_env=False) as client:
+  print(json.dumps({'ready': True, 'pid': os.getpid(), 'at_monotonic': time.perf_counter()}), flush=True)
+  while not stop.is_set() and time.perf_counter() < deadline:
+    for path in ('/health', '/ips/lists?limit=10'):
+      started = time.perf_counter()
+      row = {'path': path, 'start_monotonic': started}
+      try:
+        response = client.get(path)
+        row.update(status_code=response.status_code, body_bytes=len(response.content), error_type=None)
+      except httpx.HTTPError as error:
+        row.update(status_code=None, body_bytes=None, error_type=type(error).__name__)
+      ended = time.perf_counter()
+      row.update(end_monotonic=ended, elapsed_seconds=ended-started)
+      if row['status_code'] is not None:
+        try:
+          body = response.json()
+        except ValueError:
+          body = None
+        row['server_duration_seconds'] = body.get('duration') if isinstance(body, dict) else None
+      rows.append(row)
+      if stop.is_set():
+        break
+    stop.wait(float(sys.argv[2]))
+print(json.dumps({'requests': rows, 'deadline_reached': time.perf_counter() >= deadline}), flush=True)
+"""
+
+
+@asynccontextmanager
+async def api_diagnostic_observe(service, configuration, recorder):
+  """Own the loop sampler and an optional independent, additional read-only HTTP workload."""
+  watcher = asyncio.create_task(recorder.watch_loop())
+  process = None
+  drain = None
+  try:
+    if configuration['independent_probe']:
+      process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        '-B',
+        '-c',
+        API_DIAGNOSTIC_PROBE,
+        service.url,
+        str(configuration['probe_interval']),
+        str(configuration['pass_timeout'] + 30),
+        cwd=service.directory,
+        env=service.environment,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+      )
+      ready = await asyncio.wait_for(process.stdout.readline(), timeout=5)
+      recorder.evidence['independent_probe'] = {'ready': json.loads(ready), 'added_http_load': True}
+      # Drain concurrently so a full pipe cannot perturb the independent probe's clocks.
+      drain = asyncio.create_task(process.stdout.read())
+    yield
+  finally:
+    primary = sys.exception()
+    try:
+      if process is not None:
+        try:
+          if process.returncode is None:
+            try:
+              process.stdin.write(b'\n')
+              await process.stdin.drain()
+            except BrokenPipeError, ConnectionResetError:
+              pass
+          await asyncio.wait_for(process.wait(), timeout=6)
+          raw = await drain if drain is not None else await process.stdout.read()
+          stderr = await process.stderr.read()
+          assert process.returncode == 0, stderr.decode(errors='replace')
+          result = json.loads(raw)
+          recorder.evidence['independent_probe'].update(result, returncode=process.returncode)
+          assert not result['deadline_reached'], 'Independent probe reached its safety deadline'
+        finally:
+          if process.returncode is None:
+            process.kill()
+            await asyncio.wait_for(process.wait(), timeout=5)
+          if drain is not None:
+            await asyncio.gather(drain, return_exceptions=True)
+          process.stdin.close()
+          try:
+            await process.stdin.wait_closed()
+          except BrokenPipeError, ConnectionResetError:
+            pass
+    except BaseException as error:
+      recorder.evidence['probe_cleanup_failure'] = {'type': type(error).__name__, 'message': str(error)[:1000]}
+      if primary is None:
+        raise
+      primary.add_note(f'Diagnostic probe cleanup also failed: {error!r}')
+    finally:
+      watcher.cancel()
+      await asyncio.gather(watcher, return_exceptions=True)
+      recorder.evidence['requests'] = recorder.observations.requests
+      recorder.evidence['loop_lag'] = load_quantiles([row['lag_seconds'] for row in recorder.evidence['loop_wakeups']])
+
+
+async def api_diagnostic_idle(client, dataset, configuration, recorder):
+  """Sample reads on the same populated DB only after both saving job modes drain."""
+  async with asyncio.timeout(configuration['pass_timeout']):
+    while True:
+      response = await load_metrics_request(client, recorder.evidence['metrics_scrapes'], scope='idle_before')
+      assert response.status_code == 200
+      samples = parse_samples(response.text)
+      modes = {mode: run_fields(samples, mode) for mode in ('new', 'stale')}
+      if all(
+        all(fields.get(key) == 0 for key in ('active', 'pending', 'admission_in_progress', 'unknown'))
+        for fields in modes.values()
+      ):
+        break
+      await asyncio.sleep(configuration.get('metrics_poll_interval', 0.05))
+  recorder.evidence['idle_drained_modes_before'] = modes
+  counts = {mode: sample_total(samples, 'resolution_run_elapsed_seconds_count', mode=mode) for mode in modes}
+  deadline = perf_counter() + configuration['idle_seconds']
+  finished = asyncio.Event()
+
+  async def reads():
+    while perf_counter() < deadline:
+      for label, path in (
+        ('health', '/health'),
+        ('read', f'/domains/{dataset.count + 1}'),
+        ('list', '/domains?limit=10'),
+        ('stats', '/stats'),
+        ('ip_lists', '/ips/lists?limit=10'),
+        ('ip_list', '/ips/lists/1'),
+      ):
+        await load_api_request(client, recorder.observations, label, 'GET', path, timeout=5)
+      await asyncio.sleep(configuration['probe_interval'])
+
+  async def poll_metrics():
+    while not finished.is_set():
+      await load_metrics_request(client, recorder.evidence['metrics_scrapes'], scope='idle_poll')
+      try:
+        await asyncio.wait_for(finished.wait(), timeout=configuration.get('metrics_poll_interval', 0.05))
+      except TimeoutError:
+        pass
+
+  tasks = [asyncio.create_task(reads())]
+  if configuration.get('idle_metrics_polling', False):
+    tasks.append(asyncio.create_task(poll_metrics()))
+  try:
+    async with asyncio.timeout(configuration['idle_seconds'] + 20):
+      done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+      for task in done:
+        await task
+      await tasks[0]
+      finished.set()
+      if len(tasks) > 1:
+        await tasks[1]
+  finally:
+    finished.set()
+    for task in tasks:
+      if not task.done():
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+  response = await load_metrics_request(client, recorder.evidence['metrics_scrapes'], scope='idle_after')
+  assert response.status_code == 200
+  after = parse_samples(response.text)
+  assert counts == {mode: sample_total(after, 'resolution_run_elapsed_seconds_count', mode=mode) for mode in modes}
+  recorder.evidence['idle_drained_modes_after'] = {mode: run_fields(after, mode) for mode in modes}
+  assert all(
+    all(fields.get(key) == 0 for key in ('active', 'pending', 'admission_in_progress', 'unknown'))
+    for fields in recorder.evidence['idle_drained_modes_after'].values()
+  )
+
+
+@pytest.mark.e2e
+@pytest.mark.e2e_load
+@pytest.mark.skipif('GOST_API_DIAGNOSTIC_CONFIG' not in os.environ, reason='Explicit diagnostic configuration required')
+@pytest.mark.parametrize('e2e_service', [{'start': False, 'load': True, 'request_sample_limit': 128}], indirect=True)
+async def test_resolution_api_latency_diagnostic(e2e_service, tmp_path):
+  """Diagnose degraded cold/warm latency; every result is diagnostic, never campaign acceptance."""
+  configuration = api_diagnostic_configuration()
+  service = e2e_service
+  snapshot = load_source_evidence(service.root)
+  artifact_path = tmp_path / 'api-latency-diagnostic.json'
+  artifact = {
+    'purpose': 'diagnostic only; not acceptance',
+    'configuration': configuration,
+    'controls': {
+      'p99_seconds': 1,
+      'http_seconds': 5,
+      'startup_seconds': 15,
+      'shutdown_seconds': 20,
+      'historical_cpu_percent_limit': 1600,
+      'historical_verify_timeout_seconds': 180,
+      'read_pool_control': 'An explicit test-process DB_POOL_SIZE override; otherwise use the application default',
+      'focused_matrix': 'one degraded cold/warm pair, followed by read-only idle on the same populated DB',
+      'warmup_prelude': False,
+      'independent_probe_added_load': configuration['independent_probe'],
+      'timed_request_scope': 'load_api_request exchanges only; metrics polling and verification excluded',
+      'server_duration_scope': (
+        'Existing response duration is seconds from route entry to DB result construction; '
+        'excludes subsequent session close, route serialization and scheduling before route entry'
+      ),
+      'progress_write_control': 'Original progress cadence; enriched diagnostic artifact content differs from campaign',
+      'metrics_poll_interval_seconds': configuration['metrics_poll_interval'],
+      'metrics_poll_cadence': 'Sleep after response/parse; request time adds to the interval, not a fixed scrape rate',
+      'metrics_sample_scope': (
+        'Per-scrape scope tags distinguish phase setup, source observation, idle reads and post-source drain. '
+        'stored_drain and auxiliary_drain retain their original cadence and are outside the source wall interval.'
+      ),
+      'idle_metrics_polling': configuration['idle_metrics_polling'],
+      'metrics_control_scope': (
+        'Diagnostic comparison only; slower polling changes completion detection granularity, not throughput proof. '
+        'Idle scraping cannot rule out nonlinear interaction between metrics exposition and resolver work. '
+        'Compare with identical progress_writes and independent_probe controls.'
+      ),
+      'clock': 'time.perf_counter monotonic seconds; cross-process clocks on the same host',
+    },
+    'source_sha256': snapshot,
+    'cases': [],
+  }
+  first_failure = None
+  service.environment['TEST_SOURCE_EVIDENCE'] = str(tmp_path / 'executed-source.json')
+  service.environment.update(batch_comparison_environment({'profile': 'startup'}))
+  if configuration.get('read_pool_size') is not None:
+    service.environment['DB_POOL_SIZE'] = str(configuration['read_pool_size'])
+  load_write_artifact(artifact_path, artifact)
+  try:
+    await service.start()
+    await load_public_setup(service, 5)
+    await service.stop()
+    dataset = ResolutionLoadDataset(configuration['n'], configuration)
+    dataset.schedule = 'degraded'
+    dataset.probe_ip_lists = True
+    service.providers.response_factory = dataset.response
+    artifact['seed_seconds'], artifact['initial_data_sha256'] = batch_comparison_seed(service, dataset)
+    artifact['effective_settings'] = load_effective_settings(service)
+    await service.start()
+    for phase in ('cold', 'warm', 'idle'):
+      if phase != 'idle':
+        await load_begin_provider_cycle(service.providers, f'diagnostic-degraded-{phase}')
+        service.providers.reset_evidence()
+      recorder = ApiDiagnosticRecorder()
+      entry = {'phase': phase, 'status': 'in_progress', 'measurement': {}}
+      artifact['cases'].append(entry)
+      async with httpx.AsyncClient(base_url=service.url, timeout=5, trust_env=False) as client:
+        entry['initial_public_state'] = await batch_comparison_public_state(
+          client, dataset, configuration['verify_timeout']
+        )
+        samples = parse_samples(
+          (await load_metrics_request(client, recorder.evidence['metrics_scrapes'], scope='phase_before')).text
+        )
+        load_write_artifact(
+          tmp_path / 'current-phase.json',
+          {
+            'app_pid': application_pid(samples),
+            'url': service.url,
+            'phase': phase,
+            'at_monotonic': perf_counter(),
+            'output_directory': str(tmp_path),
+          },
+        )
+        recorder.write(artifact_path, artifact)
+
+        def progress(value, entry=entry, recorder=recorder):
+          entry['progress'] = value
+          if configuration['progress_writes'] == 'original':
+            recorder.write(artifact_path, artifact)
+
+        try:
+          async with api_diagnostic_observe(service, configuration, recorder):
+            if phase == 'idle':
+              await api_diagnostic_idle(client, dataset, configuration, recorder)
+            else:
+              await load_measure_pass(
+                service,
+                dataset,
+                configuration,
+                dict.fromkeys(('read', 'list', 'stats', 'write', 'job', 'search', 'delete', 'ip_lists', 'ip_list'), 5),
+                mode='stale',
+                on_progress=progress,
+                measurement=entry['measurement'],
+                observations=recorder.observations,
+                metrics_observer=recorder.evidence['metrics_scrapes'],
+              )
+        except (AssertionError, RuntimeError, ValueError, TimeoutError, OSError, httpx.HTTPError) as error:
+          entry['failure'] = {'type': type(error).__name__, 'message': str(error)[:4000]}
+          first_failure = error if first_failure is None else first_failure
+        finally:
+          entry['diagnostic'] = recorder.evidence
+          entry['api_latency'] = {name: load_quantiles(values) for name, values in recorder.observations.items()}
+          entry['p99_violations'] = {name: values for name, values in entry['api_latency'].items() if values['p99'] > 1}
+          entry['api_failures'] = recorder.observations.failures
+          entry['providers'] = service.providers.evidence()
+          recorder.write(artifact_path, artifact)
+        if phase != 'idle':
+          if entry['measurement'].get('auxiliary_drain_status') != 'completed':
+            if first_failure is not None:
+              first_failure.add_note('Warm/idle precondition not established; remaining phases were not started')
+              entry['status'] = 'failed'
+              raise first_failure
+            raise AssertionError('Warm/idle precondition not established')
+        entry['verification'] = await load_verify_public(client, dataset, configuration['verify_timeout'])
+        if phase == 'idle':
+          final_state = await batch_comparison_public_state(client, dataset, configuration['verify_timeout'])
+          assert final_state == entry['initial_public_state'], 'Idle reads changed public state'
+        independent = recorder.evidence.get('independent_probe', {}).get('requests', [])
+        entry['independent_p99'] = {
+          path: load_quantiles([row['elapsed_seconds'] for row in independent if row['path'] == path])
+          for path in ('/health', '/ips/lists?limit=10')
+        }
+        entry['independent_failures'] = [
+          row for row in independent if row['status_code'] != 200 or row['elapsed_seconds'] > 5
+        ]
+        entry['independent_p99_violations'] = {
+          path: values
+          for path, values in entry['independent_p99'].items()
+          if values['p99'] is not None and values['p99'] > 1
+        }
+        if entry['p99_violations'] or entry['independent_failures'] or entry['independent_p99_violations']:
+          first_failure = first_failure or AssertionError(f'Diagnostic latency violation in {phase}')
+        entry['status'] = (
+          'failed'
+          if 'failure' in entry
+          or entry['p99_violations']
+          or entry['independent_failures']
+          or entry['independent_p99_violations']
+          else 'passed'
+        )
+        recorder.write(artifact_path, artifact)
+  finally:
+    primary = sys.exception()
+    started = perf_counter()
+    artifact['startup_attempts'] = service.startup_attempts
+    try:
+      await service.stop(allow_failure=primary is not None)
+      artifact['shutdown_seconds'] = perf_counter() - started
+      assert artifact['shutdown_seconds'] <= 20
+      artifact['executed_source'] = batch_comparison_executed_source(service, snapshot)
+    except BaseException as cleanup_error:
+      artifact['cleanup_failure'] = {'type': type(cleanup_error).__name__, 'message': str(cleanup_error)[:4000]}
+      if primary is None:
+        raise
+      primary.add_note(f'Diagnostic service cleanup also failed: {cleanup_error!r}')
+    finally:
+      artifact['status'] = (
+        'failed'
+        if primary is not None or first_failure is not None or 'cleanup_failure' in artifact
+        else 'diagnostic_completed'
+      )
+      if primary is not None:
+        artifact['failure'] = {'type': type(primary).__name__, 'message': str(primary)[:4000]}
+      load_write_artifact(artifact_path, artifact)
+  if first_failure is not None:
+    raise first_failure
+
+
+@pytest.mark.parametrize(
+  'supplied',
+  [
+    {'n': 9999},
+    {'smoke': True, 'n': 65},
+    {'smoke': True, 'n': 5},
+    {'seed': 1},
+    {'provider_delay': 0},
+    {'probe_interval': 1},
+    {'idle_seconds': float('nan')},
+    {'pass_timeout': 1801},
+    {'independent_probe': 'yes'},
+    {'idle_metrics_polling': 'yes'},
+    {'metrics_poll_interval': True},
+    {'metrics_poll_interval': 0},
+    {'metrics_poll_interval': 0.049},
+    {'metrics_poll_interval': 1.001},
+    {'metrics_poll_interval': float('nan')},
+    {'metrics_poll_interval': float('inf')},
+    {'read_pool_size': True},
+    {'read_pool_size': 0},
+    {'read_pool_size': 65},
+    {'read_pool_size': 5.5},
+    {'read_pool_size': '32'},
+    {'progress_writes': 'silent'},
+    {'unknown': 1},
+  ],
+)
+def test_api_diagnostic_configuration_rejects_uncontrolled_comparisons(monkeypatch, supplied):
+  """Diagnostics cannot silently weaken workload, isolation bounds or explicit controls."""
+  monkeypatch.setenv('GOST_API_DIAGNOSTIC_CONFIG', json.dumps(supplied))
+  with pytest.raises(AssertionError):
+    api_diagnostic_configuration()
+
+
+def test_api_diagnostic_metrics_controls_are_explicit_and_preserve_other_defaults(monkeypatch):
+  monkeypatch.setenv('GOST_API_DIAGNOSTIC_CONFIG', '{}')
+  original = api_diagnostic_configuration()
+  assert original['metrics_poll_interval'] == 0.05
+  assert original['idle_metrics_polling'] is False
+  monkeypatch.setenv('GOST_API_DIAGNOSTIC_CONFIG', '{"metrics_poll_interval": 1, "idle_metrics_polling": true}')
+  controlled = api_diagnostic_configuration()
+  assert controlled == original | {'metrics_poll_interval': 1, 'idle_metrics_polling': True}
+
+
+@pytest.mark.parametrize('interval', [None, 1.0])
+async def test_load_wait_idle_metrics_control_changes_only_poll_wait(monkeypatch, interval):
+  waits, scrapes = [], []
+  requests = []
+  fields = dict.fromkeys(
+    ('active', 'pending', 'admission_in_progress', 'unknown', 'known_not_committed', 'not_admitted'), 0
+  )
+  fields.update(selected=2, processing_complete=1, admitted=2, confirmed=2, attempted=2)
+
+  async def request(request):
+    requests.append((request.method, request.url.path))
+    complete = len(requests) == 2
+    metrics = [f'resolution_run_elapsed_seconds_count{{mode="stale"}} {int(complete)}']
+    metrics.extend(f'resolution_run_snapshot{{mode="stale",field="{key}"}} {value}' for key, value in fields.items())
+    return httpx.Response(200, text='\n'.join(metrics))
+
+  async def sleep(seconds):
+    waits.append(seconds)
+
+  monkeypatch.setattr(asyncio, 'sleep', sleep)
+  kwargs = {} if interval is None else {'metrics_poll_interval': interval, 'metrics_observer': scrapes}
+  async with httpx.AsyncClient(base_url='http://test', transport=httpx.MockTransport(request)) as client:
+    _, actual = await load_wait_idle(client, 'stale', 2, 0, 1, **kwargs)
+  assert actual == fields
+  assert requests == [('GET', '/metrics'), ('GET', '/metrics')]
+  assert waits == [0.05 if interval is None else 1.0]
+  assert len(scrapes) == (0 if interval is None else 2)
+  assert all(row['status_code'] == 200 and row['body_bytes'] > 0 for row in scrapes)
+
+
+async def test_load_metrics_without_observer_returns_original_exchange(monkeypatch):
+  response = httpx.Response(503, text='original response')
+  client = SimpleNamespace(get=AsyncMock(return_value=response))
+
+  def unexpected_clock():
+    raise AssertionError('The ordinary metrics helper must not collect diagnostic clocks')
+
+  monkeypatch.setattr(sys.modules[__name__], 'perf_counter', unexpected_clock)
+  assert await load_metrics_request(client) is response
+  client.get.assert_awaited_once_with('/metrics')
+
+
+@pytest.mark.parametrize('outcome', ['success', 'status', 'network'])
+async def test_api_diagnostic_metrics_observation_is_separate_and_has_no_payload(outcome):
+  recorder = ApiDiagnosticRecorder()
+  failure = httpx.ReadError('synthetic scrape failure')
+
+  async def request(request):
+    if outcome == 'network':
+      raise failure
+    return httpx.Response(503 if outcome == 'status' else 200, text='private metric labels')
+
+  async with httpx.AsyncClient(base_url='http://test', transport=httpx.MockTransport(request)) as client:
+    if outcome == 'success':
+      response = await load_metrics_request(client, recorder.evidence['metrics_scrapes'])
+      assert response.text == 'private metric labels'
+    else:
+      with pytest.raises(AssertionError if outcome == 'status' else httpx.ReadError) as caught:
+        await load_metrics_request(client, recorder.evidence['metrics_scrapes'])
+      if outcome == 'network':
+        assert caught.value is failure
+  assert recorder.observations == {}
+  assert recorder.observations.requests == []
+  assert len(recorder.evidence['metrics_scrapes']) == 1
+  row = recorder.evidence['metrics_scrapes'][0]
+  assert row['elapsed_seconds'] == row['end_monotonic'] - row['start_monotonic']
+  assert row['elapsed_seconds'] >= 0
+  assert row['status_code'] == {'success': 200, 'status': 503, 'network': None}[outcome]
+  assert row['body_bytes'] == (None if outcome == 'network' else len(b'private metric labels'))
+  assert row['error_type'] == {'success': None, 'status': 'AssertionError', 'network': 'ReadError'}[outcome]
+  assert 'private metric labels' not in json.dumps(recorder.evidence)
+
+
+@pytest.mark.parametrize('outcome', ['success', 'status', 'network', 'read', 'cancel'])
+async def test_api_diagnostic_idle_metrics_polls_concurrently_and_retires_siblings(monkeypatch, outcome):
+  """Idle scrapes are read-only, fail promptly, and cannot outlive the idle observer."""
+  clock = [0.0]
+  read_started, poll_started = asyncio.Event(), asyncio.Event()
+  requests, tasks = [], {}
+  metric_requests = 0
+  primary = httpx.ReadError('synthetic idle failure')
+  metrics = '\n'.join(
+    [f'resolution_run_elapsed_seconds_count{{mode="{mode}"}} 0' for mode in ('new', 'stale')]
+    + [
+      f'resolution_run_snapshot{{mode="{mode}",field="{key}"}} 0'
+      for mode in ('new', 'stale')
+      for key in ('active', 'pending', 'admission_in_progress', 'unknown')
+    ]
+  )
+
+  async def request(request):
+    nonlocal metric_requests
+    requests.append((request.method, request.url.path))
+    if request.url.path == '/metrics':
+      metric_requests += 1
+      if metric_requests == 2:
+        tasks['poller'] = asyncio.current_task()
+        await read_started.wait()
+        poll_started.set()
+        if outcome == 'network':
+          raise primary
+        if outcome == 'status':
+          return httpx.Response(503, text='unavailable')
+        if outcome in {'read', 'cancel'}:
+          try:
+            await asyncio.Event().wait()
+          finally:
+            if outcome == 'read':
+              raise ValueError('secondary poller cleanup error')
+      return httpx.Response(200, text=metrics)
+    if request.url.path == '/health':
+      tasks['reader'] = asyncio.current_task()
+      read_started.set()
+      await poll_started.wait()
+      if outcome == 'read':
+        raise primary
+      if outcome in {'network', 'status', 'cancel'}:
+        await asyncio.Event().wait()
+    if request.url.path == '/ips/lists/1':
+      clock[0] = 1
+    return httpx.Response(200, json={})
+
+  monkeypatch.setattr(sys.modules[__name__], 'perf_counter', lambda: clock[0])
+  recorder = ApiDiagnosticRecorder()
+  configuration = {
+    'pass_timeout': 1,
+    'idle_seconds': 0.2,
+    'probe_interval': 0.001,
+    'metrics_poll_interval': 0.05,
+    'idle_metrics_polling': True,
+  }
+  async with httpx.AsyncClient(base_url='http://test', transport=httpx.MockTransport(request)) as client:
+    observer = asyncio.create_task(api_diagnostic_idle(client, SimpleNamespace(count=2), configuration, recorder))
+    try:
+      async with asyncio.timeout(1):
+        await poll_started.wait()
+        if outcome == 'cancel':
+          observer.cancel('cancel idle observer')
+        if outcome == 'success':
+          await observer
+        else:
+          expected = (
+            asyncio.CancelledError
+            if outcome == 'cancel'
+            else AssertionError
+            if outcome == 'status'
+            else httpx.ReadError
+          )
+          with pytest.raises(expected) as caught:
+            await observer
+          if outcome in {'read', 'network'}:
+            assert caught.value is primary
+          if outcome == 'cancel':
+            assert caught.value.args == ('cancel idle observer',)
+      assert set(tasks) == {'reader', 'poller'}
+      assert all(task.done() for task in tasks.values())
+      assert all(method == 'GET' for method, _ in requests)
+      assert 'metrics' not in recorder.observations
+      if outcome == 'success':
+        assert metric_requests == 3
+        assert recorder.evidence['idle_drained_modes_after'] == recorder.evidence['idle_drained_modes_before']
+        assert all(row['status_code'] == 200 for row in recorder.evidence['metrics_scrapes'])
+    finally:
+      observer.cancel()
+      await asyncio.gather(observer, return_exceptions=True)
+
+
+@pytest.mark.parametrize('failure_type', [TimeoutError, httpx.ReadError])
+async def test_api_diagnostic_early_measurement_failure_keeps_original_error_and_blocks_next_phase(
+  monkeypatch, tmp_path, failure_type
+):
+  """Exercise the orchestrator, artifact and cleanup boundary before any completed source pass."""
+  module = sys.modules[__name__]
+  primary = failure_type('early source observation failed')
+  phases = []
+  service = SimpleNamespace(
+    root=Path(__file__).resolve().parents[2],
+    directory=tmp_path,
+    environment={},
+    startup_attempts=[],
+    url='http://test',
+    process=None,
+    providers=SimpleNamespace(reset_evidence=lambda: None, evidence=lambda: {'errors': []}),
+  )
+
+  async def start():
+    service.process = object()
+
+  async def stop(**kwargs):
+    service.process = None
+
+  async def begin(providers, phase):
+    phases.append(phase)
+
+  async def measure(*args, **kwargs):
+    raise primary
+
+  async def public_state(*args):
+    return {'normalized_sha256': 'unchanged'}
+
+  async def request(request):
+    assert (request.method, request.url.path) == ('GET', '/metrics')
+    return httpx.Response(200, text='fastapi_app_info{pid="7"} 1')
+
+  service.start, service.stop = start, stop
+  real_client = httpx.AsyncClient
+  monkeypatch.setenv('GOST_API_DIAGNOSTIC_CONFIG', '{"smoke":true,"n":6,"independent_probe":false}')
+  monkeypatch.setattr(
+    httpx, 'AsyncClient', lambda **kwargs: real_client(transport=httpx.MockTransport(request), **kwargs)
+  )
+  monkeypatch.setattr(module, 'load_public_setup', AsyncMock())
+  monkeypatch.setattr(module, 'batch_comparison_seed', lambda *args: (0, 'seed'))
+  monkeypatch.setattr(module, 'batch_comparison_executed_source', lambda *args: {'stable': True})
+  monkeypatch.setattr(module, 'load_begin_provider_cycle', begin)
+  monkeypatch.setattr(module, 'load_measure_pass', measure)
+  monkeypatch.setattr(module, 'batch_comparison_public_state', public_state)
+  verify = AsyncMock()
+  monkeypatch.setattr(module, 'load_verify_public', verify)
+  async with asyncio.timeout(2):
+    with pytest.raises(failure_type) as caught:
+      await test_resolution_api_latency_diagnostic(service, tmp_path)
+  assert caught.value is primary
+  assert any('Warm/idle precondition not established' in note for note in primary.__notes__)
+  assert phases == ['diagnostic-degraded-cold']
+  verify.assert_not_awaited()
+  artifact = json.loads((tmp_path / 'api-latency-diagnostic.json').read_text(encoding='utf-8'))
+  assert artifact['status'] == 'failed'
+  assert artifact['failure'] == {'type': failure_type.__name__, 'message': str(primary)}
+  assert len(artifact['cases']) == 1
+  assert artifact['cases'][0]['status'] == 'failed'
+  assert artifact['cases'][0]['failure'] == artifact['failure']
+  assert service.process is None
+  assert not any(
+    task.get_coro().__qualname__.startswith('ApiDiagnosticRecorder.watch_loop') for task in asyncio.all_tasks()
+  )
+
+
+@pytest.mark.parametrize('outcome', ['success', 'status', 'network', 'cancel'])
+async def test_api_diagnostic_request_records_success_and_first_failure_without_payloads(outcome):
+  entered = asyncio.Event()
+
+  async def exchange(request):
+    await request.extensions['trace']('http11.receive_response_headers.started', {'private': 'secret payload'})
+    entered.set()
+    if outcome == 'cancel':
+      await asyncio.Event().wait()
+    if outcome == 'network':
+      raise httpx.ConnectError('synthetic connection failure')
+    return httpx.Response(503 if outcome == 'status' else 200, json={'duration': 0.125, 'private': 'secret payload'})
+
+  observations = LoadApiObservations(diagnostic=True)
+  async with httpx.AsyncClient(
+    transport=httpx.MockTransport(exchange), base_url='http://test', trust_env=False
+  ) as client:
+    task = asyncio.create_task(load_api_request(client, observations, 'ip_lists', 'GET', '/ips/lists', timeout=5))
+    if outcome == 'cancel':
+      await asyncio.wait_for(entered.wait(), timeout=1)
+      task.cancel()
+    if outcome == 'success':
+      response = await task
+    else:
+      expected = {'status': AssertionError, 'network': httpx.ConnectError, 'cancel': asyncio.CancelledError}[outcome]
+      with pytest.raises(expected):
+        await task
+  assert len(observations.requests) == 1
+  row = observations.requests[0]
+  assert row['elapsed_seconds'] == row['end_monotonic'] - row['start_monotonic']
+  assert row['trace_callback_seconds'] >= 0
+  assert row['observation_seconds'] >= 0
+  assert [event['event'] for event in row['transport_events']] == ['http11.receive_response_headers.started']
+  assert row['start_monotonic'] <= row['transport_events'][0]['at_monotonic'] <= row['end_monotonic']
+  assert 'secret payload' not in json.dumps(row)
+  if outcome in {'success', 'status'}:
+    assert row['server_duration_seconds'] == 0.125
+    assert row['status_code'] == (200 if outcome == 'success' else 503)
+    assert row['body_bytes'] == len(response.content) if outcome == 'success' else row['body_bytes'] > 0
+    assert observations['ip_lists'] == [row['elapsed_seconds']]
+  else:
+    assert row['status_code'] is None
+    assert row['body_bytes'] is None
+    assert row['error_type'] == ('ConnectError' if outcome == 'network' else 'CancelledError')
+    assert 'ip_lists' not in observations
+  assert len(observations.failures) == (0 if outcome == 'success' else 1)
+  assert LoadApiObservations().requests is None
+
+
+def test_api_diagnostic_artifact_failure_retains_attempt_and_original_error(monkeypatch, tmp_path):
+  recorder = ApiDiagnosticRecorder()
+  failure = OSError('synthetic artifact failure')
+
+  def fail(path, artifact):
+    raise failure
+
+  monkeypatch.setattr(sys.modules[__name__], 'load_write_artifact', fail)
+  with pytest.raises(OSError, match='synthetic artifact failure') as raised:
+    recorder.write(tmp_path / 'diagnostic.json', {})
+  assert raised.value is failure
+  assert len(recorder.evidence['artifact_writes']) == 1
+  row = recorder.evidence['artifact_writes'][0]
+  assert row['elapsed_seconds'] == row['end_monotonic'] - row['start_monotonic']
+  assert row['bytes_after_write'] is None
+
+
+async def test_api_diagnostic_observer_can_disable_independent_added_load(tmp_path):
+  recorder = ApiDiagnosticRecorder()
+  # No URL is supplied: the explicit control must avoid starting any HTTP probe.
+  async with api_diagnostic_observe(SimpleNamespace(directory=tmp_path), {'independent_probe': False}, recorder):
+    await asyncio.sleep(0)
+  assert 'independent_probe' not in recorder.evidence
+  assert recorder.evidence['requests'] == []
+  assert not any(
+    task.get_coro().__qualname__.startswith('ApiDiagnosticRecorder.watch_loop') for task in asyncio.all_tasks()
+  )
+
+
+@pytest.mark.parametrize('exit_mode', ['normal', 'failure', 'cancel'])
+async def test_api_diagnostic_independent_probe_retires_on_every_observer_exit(tmp_path, exit_mode):
+  """The real independent process must stop and retain HTTP facts even when its owner fails."""
+  paths = set()
+  served = asyncio.Event()
+  handlers = set()
+
+  async def serve(reader, writer):
+    task = asyncio.current_task()
+    handlers.add(task)
+    try:
+      while True:
+        headers = await reader.readuntil(b'\r\n\r\n')
+        paths.add(headers.split(b' ', 2)[1].decode())
+        body = b'{"duration":0.01}'
+        writer.write(b'HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\n' + body)
+        await writer.drain()
+        if paths == {'/health', '/ips/lists?limit=10'}:
+          served.set()
+    except asyncio.IncompleteReadError, ConnectionError:
+      pass
+    finally:
+      writer.close()
+      await writer.wait_closed()
+      handlers.discard(task)
+
+  server = await asyncio.start_server(serve, '127.0.0.1', 0)
+  service = SimpleNamespace(
+    url=f'http://127.0.0.1:{server.sockets[0].getsockname()[1]}', directory=tmp_path, environment=os.environ.copy()
+  )
+  recorder = ApiDiagnosticRecorder()
+  configuration = {'independent_probe': True, 'probe_interval': 0.25, 'pass_timeout': 10}
+
+  async def observe():
+    async with api_diagnostic_observe(service, configuration, recorder):
+      await asyncio.wait_for(served.wait(), timeout=5)
+      if exit_mode == 'failure':
+        raise LookupError('original owner failure')
+      if exit_mode == 'cancel':
+        asyncio.current_task().cancel()
+        await asyncio.sleep(0)
+
+  try:
+    if exit_mode == 'normal':
+      await observe()
+    else:
+      with pytest.raises(LookupError if exit_mode == 'failure' else asyncio.CancelledError):
+        await observe()
+    probe = recorder.evidence['independent_probe']
+    assert probe['returncode'] == 0
+    assert probe['ready']['pid'] != os.getpid()
+    assert probe['deadline_reached'] is False
+    assert {row['path'] for row in probe['requests']} == paths
+    assert all(row['status_code'] == 200 and row['server_duration_seconds'] == 0.01 for row in probe['requests'])
+    assert not any(
+      task.get_coro().__qualname__.startswith('ApiDiagnosticRecorder.watch_loop') for task in asyncio.all_tasks()
+    )
+    assert 'probe_cleanup_failure' not in recorder.evidence
+  finally:
+    server.close()
+    await server.wait_closed()
+    if handlers:
+      await asyncio.wait_for(asyncio.gather(*tuple(handlers)), timeout=2)
+
+
+@pytest.mark.parametrize('initial_blocker', ['unknown', 'missing'])
+async def test_api_diagnostic_idle_waits_for_verified_drain_and_never_triggers_jobs(initial_blocker):
+  calls = []
+  polls = 0
+
+  async def exchange(request):
+    nonlocal polls
+    calls.append((request.method, request.url.path))
+    if request.url.path == '/metrics':
+      polls += 1
+      lines = []
+      for mode in ('new', 'stale'):
+        for key in ('active', 'pending', 'admission_in_progress', 'unknown'):
+          if polls == 1 and key == 'unknown' and initial_blocker == 'missing':
+            continue
+          value = int(polls == 1 and key == 'unknown')
+          lines.append(f'resolution_run_snapshot{{mode="{mode}",field="{key}"}} {value}')
+      return httpx.Response(200, text='\n'.join(lines))
+    assert polls >= 2, 'Read sampling began before verified drain'
+    return httpx.Response(200, json={})
+
+  recorder = ApiDiagnosticRecorder()
+  async with httpx.AsyncClient(transport=httpx.MockTransport(exchange), base_url='http://test') as client:
+    await api_diagnostic_idle(
+      client, SimpleNamespace(count=6), {'pass_timeout': 1, 'idle_seconds': 0.001, 'probe_interval': 0.001}, recorder
+    )
+  assert polls == 3
+  assert all(method == 'GET' for method, path in calls)
+  assert set(recorder.observations) == {'health', 'read', 'list', 'stats', 'ip_lists', 'ip_list'}
+  assert len(recorder.observations.requests) == 6
+
+
 async def load_calibrate_providers(service, configuration):
   """Measure local provider wire capacity independently of application processing."""
   saved_factory = service.providers.response_factory
@@ -5964,10 +7145,12 @@ async def load_calibrate_providers(service, configuration):
   return results
 
 
-async def load_drain_stored(client, timeout):
+async def load_drain_stored(client, timeout, *, metrics_observer=None):
   async with asyncio.timeout(timeout):
     while True:
-      fields = run_fields(parse_samples((await client.get('/metrics')).text), 'stored')
+      fields = run_fields(
+        parse_samples((await load_metrics_request(client, metrics_observer, scope='stored_drain')).text), 'stored'
+      )
       if not fields or all(fields.get(key) == 0 for key in ('active', 'pending', 'admission_in_progress')):
         return
       await asyncio.sleep(0.05)
@@ -6299,7 +7482,10 @@ async def test_resolution_load_cancelled_http_request_is_not_a_response_latency_
 
 
 @pytest.mark.parametrize('failure', ['p99', 'drain'])
-async def test_resolution_load_measurement_keeps_completed_source_when_later_checks_fail(monkeypatch, failure):
+@pytest.mark.parametrize('diagnostic', [False, True])
+async def test_resolution_load_measurement_keeps_completed_source_when_later_checks_fail(
+  monkeypatch, failure, diagnostic
+):
   """A failed API verdict or auxiliary drain retains the completed source measurement."""
   admitted = False
   deleted = False
@@ -6307,6 +7493,7 @@ async def test_resolution_load_measurement_keeps_completed_source_when_later_che
   real_sleep = asyncio.sleep
   real_client = httpx.AsyncClient
   clock = [0.0]
+  metrics_calls, metrics_scrapes = [], []
   fields = dict.fromkeys(
     (
       'active',
@@ -6330,6 +7517,7 @@ async def test_resolution_load_measurement_keeps_completed_source_when_later_che
     if route == ('POST', '/commands/domains/resolve/stale'):
       admitted = True
     if route == ('GET', '/metrics'):
+      metrics_calls.append(route)
       if failure == 'drain' and deleted and source_completed.is_set():
         raise ValueError('Auxiliary drain failed')
       if admitted:
@@ -6374,16 +7562,20 @@ async def test_resolution_load_measurement_keeps_completed_source_when_later_che
   )
   bounds = dict.fromkeys(('read', 'list', 'stats', 'job', 'write', 'search', 'delete', 'stored_resolve'), 5)
   measurement = {}
+  configuration = {'probe_interval': 0.001, 'pass_timeout': 1, 'rss_limit_mb': 1, 'cpu_percent_limit': 100}
+  if diagnostic:
+    configuration['metrics_poll_interval'] = 0.05
   async with asyncio.timeout(2):
     with pytest.raises(AssertionError if failure == 'p99' else ValueError):
       await load_measure_pass(
         service,
         dataset,
-        {'probe_interval': 0.001, 'pass_timeout': 1, 'rss_limit_mb': 1, 'cpu_percent_limit': 100},
+        configuration,
         bounds,
         mode='stale',
         p99_bounds=dict.fromkeys(bounds, 0.001),
         measurement=measurement,
+        metrics_observer=metrics_scrapes if diagnostic else None,
       )
   assert measurement['source_pass_status'] == 'completed'
   assert measurement['wall_seconds_to_known_writer_outcomes'] > 0
@@ -6393,6 +7585,14 @@ async def test_resolution_load_measurement_keeps_completed_source_when_later_che
   assert measurement.get('api_status') != 'passed'
   assert measurement['api_failures'] == []
   assert (measurement.get('auxiliary_drain_status') == 'completed') is (failure == 'p99')
+  assert len(metrics_scrapes) == (len(metrics_calls) if diagnostic else 0)
+  assert 'metrics' not in measurement['api_latency_measured']
+  if diagnostic:
+    assert all(row['status_code'] == 200 for row in metrics_scrapes[:-1])
+    assert metrics_scrapes[-1]['error_type'] == ('ValueError' if failure == 'drain' else None)
+    scopes = {row['scope'] for row in metrics_scrapes}
+    assert {'source_before', 'source_selection', 'source_idle_poll', 'stored_drain'} <= scopes
+    assert ('auxiliary_drain' in scopes) is (failure == 'p99')
 
 
 async def load_begin_provider_cycle(providers, cycle):
@@ -6473,6 +7673,8 @@ def batch_comparison_configuration():
     'n': 10000,
     'repetitions': 3,
     'warmup_size': 128,
+    'schedules': ['healthy', 'degraded'],
+    'cache_states': ['cold', 'warm'],
     'seed': 20261106,
     'unique_ip_ratio': 0.7,
     'alias_every': 10,
@@ -6489,6 +7691,11 @@ def batch_comparison_configuration():
   assert set(supplied) <= set(defaults), 'Unknown comparison configuration field'
   configuration = defaults | supplied
   assert configuration['profile'] in {'historical', 'startup'}
+  assert configuration['schedules'] in (['healthy'], ['degraded'], ['healthy', 'degraded'])
+  assert configuration['cache_states'] in (['cold'], ['cold', 'warm'])
+  if configuration['profile'] == 'historical':
+    assert configuration['schedules'] == defaults['schedules']
+    assert configuration['cache_states'] == defaults['cache_states']
   if configuration['profile'] == 'startup' and 'seed' not in supplied:
     configuration['seed'] = 20261104
   assert configuration['variant'] in {'before', 'after', 'smoke'}
@@ -6502,7 +7709,8 @@ def batch_comparison_configuration():
     assert configuration['repetitions'] == 1
   else:
     assert configuration['n'] == 10000
-    assert 3 <= configuration['repetitions'] <= 5
+    minimum_repetitions = 1 if configuration['profile'] == 'startup' else 3
+    assert minimum_repetitions <= configuration['repetitions'] <= 5
   assert configuration['warmup_size'] <= configuration['n']
   for key in (
     'unique_ip_ratio',
@@ -6707,6 +7915,50 @@ def test_batch_comparison_requires_explicit_bounded_selection(monkeypatch, confi
     batch_comparison_configuration()
 
 
+@pytest.mark.parametrize('repetitions', [0, 1, 2, 5, 6])
+def test_batch_comparison_startup_profile_accepts_explicit_bounded_repetitions(monkeypatch, repetitions):
+  root = Path(__file__).resolve().parents[2] / '.pytest_cache'
+  supplied = {
+    'profile': 'startup',
+    'variant': 'before',
+    'source_root': str(root / 'source'),
+    'bounds_path': str(root / 'bounds.json'),
+    'repetitions': repetitions,
+  }
+  monkeypatch.setenv('GOST_BATCH_COMPARE_CONFIG', json.dumps(supplied))
+  if 1 <= repetitions <= 5:
+    assert batch_comparison_configuration()['repetitions'] == repetitions
+  else:
+    with pytest.raises(AssertionError):
+      batch_comparison_configuration()
+
+
+@pytest.mark.parametrize(
+  'selection',
+  [
+    {'schedules': []},
+    {'schedules': ['unknown']},
+    {'schedules': ['degraded', 'degraded']},
+    {'cache_states': []},
+    {'cache_states': ['warm']},
+    {'cache_states': ['cold', 'cold']},
+    {'profile': 'historical', 'schedules': ['degraded']},
+    {'profile': 'historical', 'cache_states': ['cold']},
+  ],
+)
+def test_batch_comparison_rejects_invalid_or_unsupported_scenario_selection(monkeypatch, selection):
+  root = Path(__file__).resolve().parents[2] / '.pytest_cache'
+  supplied = {
+    'profile': 'startup',
+    'variant': 'before',
+    'source_root': str(root / 'source'),
+    'bounds_path': str(root / 'bounds.json'),
+  }
+  monkeypatch.setenv('GOST_BATCH_COMPARE_CONFIG', json.dumps(supplied | selection))
+  with pytest.raises(AssertionError):
+    batch_comparison_configuration()
+
+
 def test_batch_comparison_startup_profile_preserves_fixed_workload_and_historical_defaults(monkeypatch):
   root = Path(__file__).resolve().parents[2] / '.pytest_cache'
   supplied = {'variant': 'before', 'source_root': str(root / 'source'), 'bounds_path': str(root / 'bounds.json')}
@@ -6717,6 +7969,8 @@ def test_batch_comparison_startup_profile_preserves_fixed_workload_and_historica
   monkeypatch.setenv('GOST_BATCH_COMPARE_CONFIG', json.dumps(supplied | {'profile': 'startup'}))
   current = batch_comparison_configuration()
   assert (current['n'], current['repetitions'], current['seed']) == (10000, 3, 20261104)
+  assert current['schedules'] == ['healthy', 'degraded']
+  assert current['cache_states'] == ['cold', 'warm']
   assert current['provider_delay'] == 0.001
   assert (current['unique_ip_ratio'], current['alias_every']) == (0.7, 10)
   assert batch_comparison_environment(current) == {
@@ -7218,6 +8472,23 @@ async def test_startup_comparison_exercises_missing_reference_but_guards_existin
   assert harness.service.process is None
 
 
+async def test_startup_comparison_cold_only_selection_still_verifies_restart_and_stops(startup_comparison_harness):
+  harness = startup_comparison_harness
+  harness.configuration.update(schedules=['degraded'], cache_states=['cold'])
+  await batch_comparison_startup_cases(
+    harness.service, harness.configuration, harness.shared, {}, harness.evidence, harness.artifact_path
+  )
+  cases = harness.evidence['cases']
+  assert [(case['schedule'], case['cache'], case['measured']) for case in cases] == [
+    ('degraded', 'cold', False),
+    ('degraded', 'cold', True),
+  ]
+  assert all(case['status'] == 'passed' and case['restart_verification']['verified_sources'] == 2 for case in cases)
+  assert [cycle for cycle, process in harness.measurements] == ['degraded-0-cold', 'degraded-1-cold']
+  assert set(harness.evidence['summary']) == {'degraded-cold'}
+  assert harness.service.process is None
+
+
 async def batch_comparison_startup_cases(service, configuration, shared, manifest, evidence, artifact_path):
   """Keep independent failure evidence across the complete cold/warm and provider matrix."""
   first_failure = None
@@ -7239,7 +8510,9 @@ async def batch_comparison_startup_cases(service, configuration, shared, manifes
     'Public E2E finish metric combines orphan deletion and incumbent repair. '
     'Separate real SQLite component profile reports their SQL and durations; these are not E2E phase times.'
   )
-  for schedule in ('healthy', 'degraded'):
+  schedules = configuration.get('schedules', ('healthy', 'degraded'))
+  cache_states = configuration.get('cache_states', ('cold', 'warm'))
+  for schedule in schedules:
     for repetition in range(configuration['repetitions'] + 1):
       warmup = repetition == 0
       dataset = ResolutionLoadDataset(configuration['warmup_size'] if warmup else configuration['n'], configuration)
@@ -7252,7 +8525,7 @@ async def batch_comparison_startup_cases(service, configuration, shared, manifes
       if not warmup:
         assert initial_sha == shared['measured_initial_data_sha256'], 'Cold initial fixture changed'
       source_ok = False
-      for temperature in ('cold', 'warm'):
+      for temperature in cache_states:
         entry = {
           'schedule': schedule,
           'cache': temperature,
@@ -7362,6 +8635,7 @@ async def batch_comparison_startup_cases(service, configuration, shared, manifes
           if temperature == 'warm':
             cold = evidence['cases'][-2]
             assert entry['measurement']['ripe_network_requests'] <= cold['measurement']['ripe_network_requests']
+          if temperature == cache_states[-1]:
             await service.stop()
             entry['executed_source'] = batch_comparison_executed_source(service, manifest)
             startup_index = len(service.startup_attempts)
@@ -7380,7 +8654,7 @@ async def batch_comparison_startup_cases(service, configuration, shared, manifes
         finally:
           entry['providers'] = service.providers.evidence()
           # A failed acceptance verdict can still leave valid warm input in the same process/cache.
-          if not source_ok or temperature == 'warm':
+          if not source_ok or temperature == cache_states[-1]:
             try:
               await service.stop(allow_failure=entry['status'] != 'passed')
             except (AssertionError, RuntimeError, TimeoutError, OSError) as cleanup_error:
@@ -7390,8 +8664,8 @@ async def batch_comparison_startup_cases(service, configuration, shared, manifes
                 first_failure = cleanup_error
           load_write_artifact(artifact_path, evidence)
   evidence['summary'] = {}
-  for schedule in ('healthy', 'degraded'):
-    for temperature in ('cold', 'warm'):
+  for schedule in schedules:
+    for temperature in cache_states:
       cases = [
         case
         for case in evidence['cases']

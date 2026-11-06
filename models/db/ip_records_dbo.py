@@ -1,4 +1,5 @@
 from datetime import datetime
+from itertools import batched
 from typing import Any, List, Optional, Self, Sequence, Tuple
 
 from sqlalchemy import (
@@ -133,6 +134,30 @@ class IpRecordsDbo(Dbo):
       raise err
 
   @classmethod
+  async def get_ips_on_domain_ids(
+    cls: type[Self], db_session: AsyncSession, domain_ids: list[int]
+  ) -> dict[int, tuple[list[str], list[str]]]:
+    """Read each supported global IP once per domain, preserving global IP order."""
+    result: dict[int, tuple[list[str], list[str]]] = {domain_id: ([], []) for domain_id in domain_ids}
+    # Bound the parameter count for large configured pages.
+    for portion in batched(result, 500, strict=False):
+      select_stmt = (
+        select(IpSupportDbo.domain_id, cls.id, cls.ip_address, cls.addr_type)
+        .select_from(IpSupportDbo)
+        .join(cls, cls.id == IpSupportDbo.ip_record_id)
+        .where(IpSupportDbo.domain_id.in_(portion))
+        .distinct()
+        .order_by(IpSupportDbo.domain_id, cls.id)
+      )
+      rows = await db_session.execute(select_stmt)
+      for domain_id, _ip_id, address, addr_type in rows:
+        if addr_type == 4:
+          result[domain_id][0].append(address)
+        elif addr_type == 6:
+          result[domain_id][1].append(address)
+    return result
+
+  @classmethod
   async def get_total_ips_on_ips_list(cls: type[Self], db_session: AsyncSession, ip_list_id: int) -> Tuple[int, int]:
     try:
       ip_v4_count: int = 0
@@ -260,7 +285,12 @@ class IpRecordsDbo(Dbo):
       #
       # CTE 2
       #
-      list_members = select(IpSupportDbo.ip_list_id, IpSupportDbo.ip_record_id).distinct().subquery()
+      list_members = (
+        select(IpSupportDbo.ip_list_id, IpSupportDbo.ip_record_id)
+        .where(IpSupportDbo.ip_list_id.is_not(None))
+        .distinct()
+        .subquery()
+      )
       per_list_stats_cte: CTE = (
         select(
           IpsListsDbo.id.label('list_id'),
