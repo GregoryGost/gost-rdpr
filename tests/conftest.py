@@ -12,7 +12,7 @@ import socket
 import sys
 from base64 import urlsafe_b64decode
 from collections import Counter
-from contextlib import closing
+from contextlib import closing, contextmanager
 from hashlib import sha256
 from pathlib import Path
 from time import perf_counter
@@ -382,6 +382,86 @@ def network(app, resolver, dns_message, monkeypatch):
   return install
 
 
+def load_cpu_kernel():
+  """Configure pointer-sized Windows APIs without inspecting any other process."""
+  if sys.platform != 'win32' or ctypes.sizeof(ctypes.c_void_p) != 8:
+    raise RuntimeError('Controlled CPU profiles require 64-bit Windows')
+  from ctypes import wintypes
+
+  kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+  kernel.GetCurrentProcess.restype = wintypes.HANDLE
+  kernel.GetProcessAffinityMask.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(ctypes.c_size_t)] * 2
+  kernel.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+  kernel.GetLogicalProcessorInformationEx.argtypes = [wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+  return kernel
+
+
+def load_cpu_mask():
+  kernel = load_cpu_kernel()
+  process, system = ctypes.c_size_t(), ctypes.c_size_t()
+  if not kernel.GetProcessAffinityMask(kernel.GetCurrentProcess(), ctypes.byref(process), ctypes.byref(system)):
+    raise ctypes.WinError(ctypes.get_last_error())
+  if not process.value:
+    raise RuntimeError('A single processor-group affinity is required')
+  return process.value
+
+
+def load_set_cpu_mask(mask):
+  kernel = load_cpu_kernel()
+  if not kernel.SetProcessAffinityMask(kernel.GetCurrentProcess(), mask):
+    raise ctypes.WinError(ctypes.get_last_error())
+  effective = load_cpu_mask()
+  if effective != mask:
+    raise RuntimeError(f'CPU affinity mismatch: requested {mask:#x}, effective {effective:#x}')
+  return effective
+
+
+def load_cpu_topology():
+  """Read native core classes; higher EfficiencyClass means greater performance."""
+  from ctypes import wintypes
+
+  kernel = load_cpu_kernel()
+  length = wintypes.DWORD()
+  if kernel.GetLogicalProcessorInformationEx(0, None, ctypes.byref(length)) or ctypes.get_last_error() != 122:
+    raise RuntimeError('Cannot size native CPU topology')
+  buffer = ctypes.create_string_buffer(length.value)
+  if not kernel.GetLogicalProcessorInformationEx(0, buffer, ctypes.byref(length)):
+    raise ctypes.WinError(ctypes.get_last_error())
+  raw = buffer.raw[: length.value]
+  cores = []
+  offset = 0
+  while offset < len(raw):
+    relationship = int.from_bytes(raw[offset : offset + 4], 'little')
+    size = int.from_bytes(raw[offset + 4 : offset + 8], 'little')
+    if relationship != 0 or size < 48 or offset + size > len(raw):
+      raise RuntimeError('Invalid native processor-core topology')
+    group_count = int.from_bytes(raw[offset + 30 : offset + 32], 'little')
+    group = int.from_bytes(raw[offset + 40 : offset + 42], 'little')
+    if group_count != 1 or group != 0:
+      raise RuntimeError('Controlled CPU profiles support only one processor group')
+    cores.append(
+      {'efficiency_class': raw[offset + 9], 'mask': int.from_bytes(raw[offset + 32 : offset + 40], 'little')}
+    )
+    offset += size
+  return cores
+
+
+def load_cpu_profile_mask(profile, topology, allowed):
+  if profile not in {'performance', 'efficiency'}:
+    raise ValueError(f'Unknown controlled CPU profile: {profile}')
+  classes = {core['efficiency_class'] for core in topology}
+  if len(classes) < 2:
+    raise RuntimeError('Requested CPU class is unavailable: heterogeneous core classes are required')
+  selected = max(classes) if profile == 'performance' else min(classes)
+  mask = 0
+  for core in topology:
+    if core['efficiency_class'] == selected:
+      mask |= core['mask'] & allowed
+  if not mask:
+    raise RuntimeError(f'Requested CPU profile {profile} has no allowed logical processors')
+  return mask
+
+
 class ServiceProcess:
   """Run the real entrypoint with disposable settings and graceful shutdown."""
 
@@ -400,6 +480,56 @@ class ServiceProcess:
     self.log_path = directory / 'application.log'
     self.log = None
     self.startup_attempts = []
+    self.cpu_evidence = None
+
+  @contextmanager
+  def cpu_profile(self, profile):
+    """Scope CPU changes to this pytest process and its test-owned application children."""
+    if profile not in {'unrestricted', 'performance', 'efficiency'}:
+      raise ValueError(f'Unknown CPU profile: {profile}')
+    if self.process is not None:
+      raise RuntimeError('Select a CPU profile before application startup')
+    original = None
+    evidence = {'profile': profile, 'runner_pid': os.getpid(), 'affinity_changed': False, 'requested_mask': None}
+    self.cpu_evidence = evidence
+    previous = self.environment.get('TEST_CPU_PROFILE')
+    try:
+      if profile != 'unrestricted':
+        original = load_cpu_mask()
+        topology = load_cpu_topology()
+        requested = load_cpu_profile_mask(profile, topology, original)
+        evidence.update(topology=topology, original_mask=original, requested_mask=requested)
+        evidence['selected_logical_cpus'] = [
+          index for index in range(requested.bit_length()) if requested & (1 << index)
+        ]
+        evidence['selected_efficiency_class'] = (
+          max(core['efficiency_class'] for core in topology)
+          if profile == 'performance'
+          else min(core['efficiency_class'] for core in topology)
+        )
+        evidence['effective_mask'] = load_set_cpu_mask(requested)
+        evidence['affinity_changed'] = True
+      elif sys.platform == 'win32':
+        evidence.update(original_mask=load_cpu_mask(), topology=load_cpu_topology())
+        evidence['requested_mask'] = None
+        evidence['effective_mask'] = evidence['original_mask']
+      self.environment['TEST_CPU_PROFILE'] = json.dumps(evidence)
+      yield evidence
+    finally:
+      primary = sys.exception()
+      try:
+        if original is not None:
+          evidence['restored_mask'] = load_set_cpu_mask(original)
+      except (OSError, RuntimeError) as error:
+        evidence['restore_error'] = repr(error)
+        if primary is None:
+          raise
+        primary.add_note(f'CPU affinity restoration failed: {error!r}')
+      finally:
+        if previous is None:
+          self.environment.pop('TEST_CPU_PROFILE', None)
+        else:
+          self.environment['TEST_CPU_PROFILE'] = previous
 
   def select_source(self, root):
     """Bind entrypoint, imports and startup migrations to one generated source snapshot."""
@@ -518,11 +648,25 @@ class ServiceProcess:
       raise RuntimeError('Application is already running')
     if getattr(self, 'load_mode', False) and self.environment.get('TEST_TASK_MEASUREMENTS'):
       raise ValueError('Load runs must use public metrics without task interception')
-    # The wrapper only converts test-owned stdin into SIGINT; main.py owns the app.
+    # Test-owned setup runs before main.py; stdin requests a graceful SIGINT shutdown.
     bootstrap = (
-      'import _thread, asyncio, json, os, runpy, sys, threading\n'
+      'import _thread, asyncio, ctypes, json, os, runpy, sys, threading\n'
       'from pathlib import Path\n'
       'from hashlib import sha256\n'
+      + inspect.getsource(load_cpu_kernel)
+      + '\n'
+      + inspect.getsource(load_cpu_mask)
+      + '\n'
+      + inspect.getsource(load_set_cpu_mask)
+      + '\n'
+      'if os.environ.get("TEST_CPU_PROFILE"):\n'
+      '  cpu = json.loads(os.environ["TEST_CPU_PROFILE"])\n'
+      '  cpu["application_pid"] = os.getpid()\n'
+      '  if cpu["requested_mask"] is not None:\n'
+      '    cpu["application_effective_mask"] = load_set_cpu_mask(cpu["requested_mask"])\n'
+      '  elif sys.platform == "win32":\n'
+      '    cpu["application_effective_mask"] = load_cpu_mask()\n'
+      '  Path("cpu-affinity.json").write_text(json.dumps(cpu), encoding="utf-8")\n'
       + inspect.getsource(normalize_migration_coverage)
       + '\n'
       + inspect.getsource(observe_child_tasks)
@@ -561,6 +705,8 @@ class ServiceProcess:
     started = perf_counter()
     self.log = self.log_path.open('ab', buffering=0)
     try:
+      if self.environment.get('TEST_CPU_PROFILE'):
+        (self.directory / 'cpu-affinity.json').unlink(missing_ok=True)
       self.process = await asyncio.create_subprocess_exec(
         sys.executable,
         '-B',
@@ -580,6 +726,8 @@ class ServiceProcess:
           try:
             if await self.health_ready():
               attempt.update(status='ready', readiness_seconds=perf_counter() - started)
+              if self.environment.get('TEST_CPU_PROFILE'):
+                attempt['cpu'] = json.loads((self.directory / 'cpu-affinity.json').read_text(encoding='utf-8'))
               break
           except OSError, TimeoutError:
             pass

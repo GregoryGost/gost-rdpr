@@ -5051,8 +5051,7 @@ def resolution_load_configuration():
     'headroom': 0.2,
     'seed': 20261104,
     'repetitions': 3,
-    # A finite runaway guard derived from local pilot throughput, not a full-pass SLA.
-    'pass_timeout': 14400,
+    'pass_timeout': 1800,
     'verify_timeout': 3600,
     'rss_limit_mb': 2048,
     'cpu_percent_limit': 200,
@@ -5068,6 +5067,12 @@ def resolution_load_configuration():
     'stages': ['baseline', 'warmup', 'healthy', 'degraded'],
     'candidate_names': None,
     'repetition_numbers': None,
+    'diagnostic': False,
+    'diagnostic_cold_only': False,
+    'metrics_poll_interval': 0.05,
+    'progress_writes': 'original',
+    'cpu_profile': 'unrestricted',
+    'full_size_stability': False,
     'candidates': [
       {'name': 'defaults', 'environment': {}},
       {
@@ -5087,6 +5092,18 @@ def resolution_load_configuration():
   assert set(supplied) <= set(configuration) | {'factors'}, 'Unknown load configuration field'
   configuration.update(supplied)
   assert configuration['profile'] in {'full', 'smoke'}
+  assert configuration['cpu_profile'] in {'unrestricted', 'performance', 'efficiency'}
+  assert type(configuration['full_size_stability']) is bool
+  assert type(configuration['diagnostic']) is bool
+  assert type(configuration['diagnostic_cold_only']) is bool
+  assert configuration['progress_writes'] in {'original', 'deferred'}
+  assert type(configuration['metrics_poll_interval']) in {int, float}
+  assert math.isfinite(configuration['metrics_poll_interval'])
+  assert 0.05 <= configuration['metrics_poll_interval'] <= 1
+  if not configuration['diagnostic']:
+    assert not configuration['diagnostic_cold_only']
+    assert configuration['progress_writes'] == 'original'
+    assert configuration['metrics_poll_interval'] == 0.05
   for key in ('n', 'seed', 'repetitions', 'warmup_size', 'soak_cycles', 'baseline_samples', 'alias_every'):
     assert isinstance(configuration[key], int), key
     assert configuration[key] > 0, key
@@ -5105,6 +5122,7 @@ def resolution_load_configuration():
   assert 0 <= configuration['provider_delay'] <= 1
   assert 0 <= configuration['headroom'] <= 1
   assert configuration['unique_ip_ratio'] <= 1
+  assert configuration['pass_timeout'] <= 1800, 'Source passes must finish through known writer outcomes within 1800s'
   assert configuration['n'] <= 1_000_000, 'Increase the explicit dataset safety bound before a larger campaign'
   assert 1 <= len(configuration['candidates']) <= 3
   assert configuration['candidates'][0] == {'name': 'defaults', 'environment': {}}
@@ -5164,6 +5182,35 @@ def resolution_load_configuration():
     assert configuration['repetitions'] >= 3
     assert factors == [0.5, 1, 1 + configuration['headroom']]
     assert configuration['soak_cycles'] >= 3
+  if configuration['full_size_stability']:
+    assert configuration['profile'] == 'full'
+    assert configuration['n'] == 156298
+    assert configuration['headroom'] == 0.2
+    assert configuration['seed'] == 20261104
+    assert configuration['unique_ip_ratio'] == 0.7
+    assert configuration['alias_every'] == 10
+    assert configuration['provider_delay'] == 0.001
+    assert configuration['probe_interval'] == 0.25
+    assert set(configuration['stages']) == {'warmup', 'healthy', 'degraded'}
+    assert configuration['repetition_numbers'] is None
+    assert configuration['soak_cycles'] == 3
+    assert not configuration['diagnostic']
+    assert configuration['cpu_profile'] != 'unrestricted'
+    assert configuration['candidate_names'] is not None
+    assert len(configuration['candidate_names']) == 1
+    selected_candidate = next(
+      candidate for candidate in configuration['candidates'] if candidate['name'] in configuration['candidate_names']
+    )
+    assert selected_candidate['environment'] == {
+      'DOMAINS_RESOLVE_WORKER_LIMIT': '32',
+      'DOMAINS_RESOLVE_SEMAPHORE_LIMIT': '64',
+      'RIPE_STAT_REQUESTS_SEMAPHORE_LIMIT': '16',
+      'REQ_MAX_CONNECTIONS': '32',
+      'REQ_MAX_KEEPALIVE_CONNECTIONS': '32',
+      'QUEUE_MAX_SIZE': '10000',
+      'DB_SAVE_BATCH_SIZE': '1000',
+      'DB_SAVE_BATCH_TIMEOUT': '0.1',
+    }, 'Stability replay must retain the original workload candidate'
   return configuration
 
 
@@ -5177,6 +5224,14 @@ def resolution_load_configuration():
     {'repetition_numbers': [0]},
     {'repetition_numbers': [4]},
     {'repetition_numbers': [1, 1]},
+    {'diagnostic': 'yes'},
+    {'diagnostic_cold_only': True},
+    {'metrics_poll_interval': 1},
+    {'progress_writes': 'deferred'},
+    {'diagnostic': True, 'metrics_poll_interval': True},
+    {'diagnostic': True, 'metrics_poll_interval': float('nan')},
+    {'diagnostic': True, 'metrics_poll_interval': 0.049},
+    {'diagnostic': True, 'progress_writes': 'silent'},
   ],
 )
 def test_resolution_load_replay_rejects_invalid_selection(monkeypatch, selection):
@@ -5184,6 +5239,318 @@ def test_resolution_load_replay_rejects_invalid_selection(monkeypatch, selection
   monkeypatch.setenv('GOST_LOAD_CONFIG', json.dumps(selection))
   with pytest.raises(AssertionError):
     resolution_load_configuration()
+
+
+def test_resolution_load_diagnostic_controls_preserve_workload_and_require_explicit_selection(monkeypatch):
+  monkeypatch.setenv('GOST_LOAD_CONFIG', '{}')
+  original = resolution_load_configuration()
+  controls = {
+    'diagnostic': True,
+    'diagnostic_cold_only': True,
+    'metrics_poll_interval': 1,
+    'progress_writes': 'deferred',
+  }
+  monkeypatch.setenv('GOST_LOAD_CONFIG', json.dumps(controls))
+  assert resolution_load_configuration() == original | controls
+
+
+@pytest.mark.parametrize(
+  ('budget', 'elapsed', 'valid'), [(1800, 1800, True), (1800, 1800.001, False), (2, 2.001, False)]
+)
+def test_resolution_load_source_budget_rejects_late_completion_and_preserves_facts(budget, elapsed, valid):
+  measurement = {
+    'source_pass_status': 'completed',
+    'wall_seconds_to_known_writer_outcomes': elapsed,
+    'run': {'confirmed': 1},
+  }
+  if valid:
+    load_assert_source_budget(measurement, {'pass_timeout': budget})
+  else:
+    with pytest.raises(AssertionError, match='Source pass exceeded'):
+      load_assert_source_budget(measurement, {'pass_timeout': budget})
+  assert measurement['source_budget']['within_maximum'] is valid
+  assert measurement['source_pass_status'] == 'completed'
+  assert measurement['run'] == {'confirmed': 1}
+
+
+@pytest.mark.parametrize(('profile', 'expected'), [('performance', 0b0010), ('efficiency', 0b1100)])
+@pytest.mark.parametrize('exit_mode', ['success', 'failure', 'cancel', 'partial_setup'])
+@pytest.mark.parametrize('e2e_service', [{'start': False}], indirect=True)
+def test_resolution_cpu_profile_scopes_allowed_masks_and_restores_on_every_exit(
+  e2e_service, monkeypatch, profile, expected, exit_mode
+):
+  service = e2e_service
+  boundary = sys.modules[type(service).__module__]
+  state = {'mask': 0b1110}
+  changes = []
+
+  def set_mask(mask):
+    state['mask'] = mask
+    changes.append(mask)
+    if exit_mode == 'partial_setup' and len(changes) == 1:
+      raise RuntimeError('Verification failed after setting affinity')
+    return mask
+
+  monkeypatch.setattr(boundary, 'load_cpu_mask', lambda: state['mask'])
+  monkeypatch.setattr(boundary, 'load_set_cpu_mask', set_mask)
+  monkeypatch.setattr(
+    boundary,
+    'load_cpu_topology',
+    lambda: [{'efficiency_class': 3, 'mask': 0b0011}, {'efficiency_class': 1, 'mask': 0b1100}],
+  )
+  primary = asyncio.CancelledError('cancel CPU scope') if exit_mode == 'cancel' else RuntimeError('scenario failed')
+
+  def exercise():
+    with service.cpu_profile(profile) as evidence:
+      assert state['mask'] == expected
+      assert evidence['requested_mask'] == evidence['effective_mask'] == expected
+      assert evidence['runner_pid'] == os.getpid()
+      assert json.loads(service.environment['TEST_CPU_PROFILE'])['profile'] == profile
+      if exit_mode in {'failure', 'cancel'}:
+        raise primary
+
+  if exit_mode == 'success':
+    exercise()
+  else:
+    with pytest.raises(type(primary)) as caught:
+      exercise()
+    if exit_mode != 'partial_setup':
+      assert caught.value is primary
+  assert state['mask'] == 0b1110
+  assert changes == [expected, 0b1110]
+  assert 'TEST_CPU_PROFILE' not in service.environment
+
+
+@pytest.mark.parametrize(
+  ('topology', 'allowed'),
+  [
+    ([{'efficiency_class': 0, 'mask': 3}], 3),
+    ([{'efficiency_class': 0, 'mask': 1}, {'efficiency_class': 1, 'mask': 2}], 1),
+  ],
+)
+@pytest.mark.parametrize('e2e_service', [{'start': False}], indirect=True)
+def test_resolution_cpu_profile_rejects_missing_class_or_unavailable_processors(e2e_service, topology, allowed):
+  boundary = sys.modules[type(e2e_service).__module__]
+  with pytest.raises(RuntimeError, match=r'unavailable|no allowed'):
+    boundary.load_cpu_profile_mask('performance', topology, allowed)
+
+
+@pytest.mark.e2e
+@pytest.mark.e2e_load
+@pytest.mark.skipif(sys.platform != 'win32', reason='Native Windows affinity boundary')
+@pytest.mark.parametrize('profile', ['performance', 'efficiency'])
+@pytest.mark.parametrize('e2e_service', [{'start': False, 'load': True}], indirect=True)
+async def test_resolution_cpu_profile_applies_to_actual_application_before_startup_and_restart(e2e_service, profile):
+  service = e2e_service
+  boundary = sys.modules[type(service).__module__]
+  original = boundary.load_cpu_mask()
+  with service.cpu_profile(profile) as runner:
+    for _ in range(2):
+      await service.start()
+      try:
+        async with httpx.AsyncClient(base_url=service.url, timeout=5, trust_env=False) as client:
+          pid = application_pid(parse_samples((await client.get('/metrics')).text))
+        actual = service.startup_attempts[-1]['cpu']
+        assert actual['application_pid'] == pid
+        assert actual['runner_pid'] == os.getpid()
+        assert actual['requested_mask'] == actual['application_effective_mask'] == boundary.load_cpu_mask()
+        assert runner['requested_mask'] & original == runner['requested_mask']
+      finally:
+        await service.stop()
+  assert runner['restored_mask'] == boundary.load_cpu_mask() == original
+
+
+@pytest.mark.e2e
+@pytest.mark.e2e_load
+@pytest.mark.skipif(sys.platform != 'win32', reason='Native Windows affinity boundary')
+@pytest.mark.parametrize('profile', ['performance', 'efficiency'])
+@pytest.mark.parametrize('e2e_service', [{'start': False, 'load': True}], indirect=True)
+async def test_resolution_cpu_profile_small_load_preserves_public_results_and_runner_resources(
+  e2e_service, tmp_path, monkeypatch, profile
+):
+  """Exercise the actual load orchestrator with disposable public API data on each CPU class."""
+  supplied = {
+    'profile': 'smoke',
+    'n': 8,
+    'repetitions': 1,
+    'factors': [1],
+    'soak_cycles': 3,
+    'warmup_size': 4,
+    'baseline_samples': 2,
+    'pass_timeout': 30,
+    'verify_timeout': 30,
+    'stages': ['warmup', 'healthy', 'degraded'],
+    'candidate_names': ['small'],
+    'cpu_profile': profile,
+    'candidates': [
+      {'name': 'defaults', 'environment': {}},
+      {'name': 'small', 'environment': {'DB_SAVE_BATCH_TIMEOUT': '0.1'}},
+    ],
+  }
+  monkeypatch.setenv('GOST_LOAD_CONFIG', json.dumps(supplied))
+  observed_pids = []
+  original_start = e2e_service.start
+
+  async def start_and_observe():
+    await original_start()
+    async with httpx.AsyncClient(base_url=e2e_service.url, timeout=5, trust_env=False) as client:
+      async with asyncio.timeout(5):
+        response = await client.get('/metrics')
+        assert response.status_code == 200
+        observed_pids.append(application_pid(parse_samples(response.text)))
+
+  monkeypatch.setattr(e2e_service, 'start', start_and_observe)
+  await test_resolution_load_campaign(e2e_service, tmp_path)
+  artifact = json.loads((tmp_path / 'resolution-load-campaign.json').read_text(encoding='utf-8'))
+  assert artifact['status'] == 'passed'
+  assert artifact['acceptance_scale'] is False
+  assert artifact['cpu_profile']['profile'] == profile
+  assert artifact['cpu_profile']['restored_mask'] == artifact['cpu_profile']['original_mask']
+  startups = artifact['startup_attempts']
+  assert len(startups) == len(observed_pids) == 8
+  assert all(attempt['status'] == 'ready' for attempt in startups)
+  assert [attempt['cpu']['application_pid'] for attempt in startups] == observed_pids
+  assert all(
+    attempt['cpu']['application_effective_mask'] == artifact['cpu_profile']['requested_mask'] for attempt in startups
+  )
+  assert artifact['idle_api_baseline']['p99_bounds_seconds'] == dict.fromkeys(
+    artifact['idle_api_baseline']['bounds_seconds'], 1.0
+  )
+  assert [(case['schedule'], case['cache']) for case in artifact['cases'] if case['measured']] == [
+    ('healthy', 'cold'),
+    ('healthy', 'warm'),
+    ('degraded', 'cold'),
+    ('degraded', 'warm'),
+  ]
+  for case in artifact['cases']:
+    assert case['status'] == 'passed'
+    assert case['verification']['verified_sources'] == case['size']
+    assert case['measurement']['source_budget']['within_maximum'] is True
+    assert case['measurement']['cpu']['application_pid'] != case['measurement']['cpu']['runner_pid']
+    assert len(case['measurement']['runner_resource_samples']) >= 2
+    assert case['measurement']['api_status'] == 'passed'
+    if case['cache'] == 'warm':
+      assert case['restart_verification']['verified_sources'] == case['size']
+
+
+@pytest.mark.parametrize(
+  'override',
+  [
+    {},
+    {'pass_timeout': 1801},
+    {'soak_cycles': 4},
+    {'repetition_numbers': [1]},
+    {'cpu_profile': 'unrestricted'},
+    {'n': 10},
+    {'stages': ['healthy', 'degraded']},
+    {'candidate_names': ['defaults']},
+  ],
+)
+def test_resolution_load_full_size_stability_requires_unchanged_workload_and_complete_repetitions(
+  monkeypatch, override
+):
+  supplied = {
+    'full_size_stability': True,
+    'cpu_profile': 'performance',
+    'stages': ['warmup', 'healthy', 'degraded'],
+    'candidate_names': ['original'],
+    'candidates': [
+      {'name': 'defaults', 'environment': {}},
+      {
+        'name': 'original',
+        'environment': {
+          'DOMAINS_RESOLVE_WORKER_LIMIT': '32',
+          'DOMAINS_RESOLVE_SEMAPHORE_LIMIT': '64',
+          'RIPE_STAT_REQUESTS_SEMAPHORE_LIMIT': '16',
+          'REQ_MAX_CONNECTIONS': '32',
+          'REQ_MAX_KEEPALIVE_CONNECTIONS': '32',
+          'QUEUE_MAX_SIZE': '10000',
+          'DB_SAVE_BATCH_SIZE': '1000',
+          'DB_SAVE_BATCH_TIMEOUT': '0.1',
+        },
+      },
+    ],
+  }
+  monkeypatch.setenv('GOST_LOAD_CONFIG', json.dumps(supplied | override))
+  if override:
+    with pytest.raises(AssertionError):
+      resolution_load_configuration()
+  else:
+    configuration = resolution_load_configuration()
+    assert configuration['pass_timeout'] == 1800
+    assert configuration['repetitions'] == configuration['soak_cycles'] == 3
+    assert configuration['factors'] == [0.5, 1, 1.2]
+    assert math.ceil(configuration['n'] * max(configuration['factors'])) == 187558
+
+
+@pytest.mark.parametrize('e2e_service', [{'start': False}], indirect=True)
+def test_resolution_cpu_restoration_failure_keeps_original_error_and_diagnostic(e2e_service, monkeypatch):
+  service = e2e_service
+  boundary = sys.modules[type(service).__module__]
+  changes = []
+
+  def set_mask(mask):
+    changes.append(mask)
+    if len(changes) == 2:
+      raise OSError('restore failed')
+    return mask
+
+  monkeypatch.setattr(boundary, 'load_cpu_mask', lambda: 3)
+  monkeypatch.setattr(
+    boundary, 'load_cpu_topology', lambda: [{'efficiency_class': 1, 'mask': 1}, {'efficiency_class': 0, 'mask': 2}]
+  )
+  monkeypatch.setattr(boundary, 'load_set_cpu_mask', set_mask)
+  original = RuntimeError('original failure')
+  with pytest.raises(RuntimeError) as caught:
+    with service.cpu_profile('performance'):
+      raise original
+  assert caught.value is original
+  assert changes == [1, 3]
+  assert service.cpu_evidence['restore_error'] == "OSError('restore failed')"
+  assert caught.value.__notes__ == ["CPU affinity restoration failed: OSError('restore failed')"]
+  assert 'TEST_CPU_PROFILE' not in service.environment
+
+
+@pytest.mark.parametrize('e2e_service', [{'start': False}], indirect=True)
+async def test_resolution_cpu_profile_startup_failure_restores_mask_and_closes_partial_log(e2e_service, monkeypatch):
+  service = e2e_service
+  boundary = sys.modules[type(service).__module__]
+  state = {'mask': 3}
+
+  def set_mask(mask):
+    state['mask'] = mask
+    return mask
+
+  monkeypatch.setattr(boundary, 'load_cpu_mask', lambda: state['mask'])
+  monkeypatch.setattr(
+    boundary, 'load_cpu_topology', lambda: [{'efficiency_class': 1, 'mask': 1}, {'efficiency_class': 0, 'mask': 2}]
+  )
+  monkeypatch.setattr(boundary, 'load_set_cpu_mask', set_mask)
+  primary = OSError('child creation failed')
+  monkeypatch.setattr(asyncio, 'create_subprocess_exec', AsyncMock(side_effect=primary))
+  with pytest.raises(OSError, match='child creation failed') as caught:
+    with service.cpu_profile('performance'):
+      await service.start()
+  assert caught.value is primary
+  assert state['mask'] == 3
+  assert service.cpu_evidence['restored_mask'] == 3
+  assert service.process is None
+  assert service.log is None
+  assert service.startup_attempts[-1]['status'] == 'failed'
+  assert 'TEST_CPU_PROFILE' not in service.environment
+
+
+@pytest.mark.parametrize('e2e_service', [{'start': False}], indirect=True)
+def test_resolution_cpu_profile_rejects_unsupported_platform_without_mutation(e2e_service, monkeypatch):
+  service = e2e_service
+  boundary = sys.modules[type(service).__module__]
+  with monkeypatch.context() as scoped:
+    scoped.setattr(boundary.sys, 'platform', 'unsupported')
+    with pytest.raises(RuntimeError, match='require 64-bit Windows'):
+      with service.cpu_profile('performance'):
+        pytest.fail('Unsupported platforms must not enter a controlled measurement')
+  assert service.cpu_evidence['affinity_changed'] is False
+  assert 'TEST_CPU_PROFILE' not in service.environment
 
 
 class ResolutionLoadDataset:
@@ -5471,6 +5838,32 @@ def load_prepare_offline(service, dataset, *, stale=False, reset=False):
   return perf_counter() - started
 
 
+def load_database_input_evidence(service):
+  """Observe only the closed disposable fixture before starting its application process."""
+  assert service.process is None
+  assert service.db_path.resolve().is_relative_to(service.directory.resolve())
+  with closing(sqlite3.connect(service.db_path.as_uri() + '?mode=ro', uri=True)) as connection:
+    return {
+      'bytes': service.db_path.stat().st_size,
+      'pragmas': {
+        name: connection.execute(f'PRAGMA {name}').fetchone()[0]
+        for name in (
+          'page_count',
+          'freelist_count',
+          'page_size',
+          'journal_mode',
+          'schema_version',
+        )
+      },
+      'ip_read_plan': connection.execute(
+        'EXPLAIN QUERY PLAN SELECT id, ip_address, addr_type FROM rdpr_ip_records '
+        'WHERE id IN (SELECT ip_record_id FROM rdpr_ip_supports WHERE domain_id=?)',
+        (1,),
+      ).fetchall(),
+      'indexes': connection.execute("SELECT name, sql FROM sqlite_schema WHERE type='index' ORDER BY name").fetchall(),
+    }
+
+
 async def load_public_setup(service, timeout):
   async with httpx.AsyncClient(base_url=service.url, timeout=timeout, trust_env=False) as client:
     response = await client.post('/dns', json=[{'server': service.dns_host}, {'doh_server': service.doh_url}])
@@ -5513,14 +5906,31 @@ async def load_metrics_request(client, observer=None, *, scope='metrics'):
 
 
 async def load_wait_idle(
-  client, mode, selected, previous, timeout, *, on_progress=None, metrics_poll_interval=0.05, metrics_observer=None
+  client,
+  mode,
+  selected,
+  previous,
+  timeout,
+  *,
+  on_progress=None,
+  metrics_poll_interval=0.05,
+  metrics_observer=None,
+  diagnostic=None,
 ):
   next_progress = 0.0
   async with asyncio.timeout(timeout):
     while True:
+      before_request = perf_counter() if diagnostic is not None else 0
       response = await load_metrics_request(client, metrics_observer, scope='source_idle_poll')
       assert response.status_code == 200
+      before_parse = perf_counter() if diagnostic is not None else 0
       samples = parse_samples(response.text)
+      if diagnostic is not None:
+        scrape = diagnostic.setdefault('metrics', {'count': 0, 'request_seconds': 0, 'parse_seconds': 0, 'bytes': 0})
+        scrape['count'] += 1
+        scrape['request_seconds'] += before_parse - before_request
+        scrape['parse_seconds'] += perf_counter() - before_parse
+        scrape['bytes'] += len(response.content)
       fields = run_fields(samples, mode)
       if on_progress is not None and perf_counter() >= next_progress:
         await on_progress(samples, fields)
@@ -5774,11 +6184,8 @@ async def load_freeze_api_bounds(service, dataset, configuration):
     'samples': quantiles,
     'canary_lifecycles': lifecycles,
     'bounds_seconds': dict.fromkeys(quantiles, 5.0),
-    'p99_bounds_seconds': {
-      name: min(5.0, max(1.0, values['p99'] * configuration['latency_factor'] + configuration['latency_slack']))
-      for name, values in quantiles.items()
-    },
-    'formula': 'request/max <= 5s; p99 <= min(5s, max(1s, idle p99 * latency_factor + latency_slack))',
+    'p99_bounds_seconds': {name: 1.0 for name, values in quantiles.items()},
+    'formula': 'request/max <= 5s; p99 <= 1s',
     'scope': 'finite conservative local campaign guardrails, not deployment or product SLAs',
     'frozen_before_candidate_measurements': True,
   }
@@ -5958,6 +6365,101 @@ async def test_resolution_load_baseline_finishes_canary_lifecycle_before_freezin
     await asyncio.gather(*owned, return_exceptions=True)
 
 
+def load_assert_source_budget(measurement, configuration):
+  """Reject late completions even when event-loop timer delivery was delayed."""
+  elapsed = measurement['wall_seconds_to_known_writer_outcomes']
+  budget = min(configuration['pass_timeout'], 1800)
+  within = elapsed <= budget
+  measurement['source_budget'] = {'maximum_seconds': budget, 'elapsed_seconds': elapsed, 'within_maximum': within}
+  assert within, f'Source pass exceeded {budget}s through known writer outcomes: {elapsed}s'
+
+
+@pytest.mark.parametrize('delayed_stage', ['admission', 'selection'])
+async def test_resolution_load_source_deadline_includes_admission_selection_and_retires_tasks(
+  monkeypatch, delayed_stage
+):
+  """Time spent before source selection cannot be granted again to persistence."""
+  loop = asyncio.get_running_loop()
+  selected, completed = asyncio.Event(), asyncio.Event()
+  pending, retired = set(), set()
+  timers = []
+  started = False
+
+  async def request(request):
+    nonlocal started
+    route = (request.method, request.url.path)
+    if route == ('POST', '/commands/domains/resolve/stale'):
+      started = True
+      timers.extend([loop.call_later(0.1, selected.set), loop.call_later(0.2, completed.set)])
+      if delayed_stage == 'admission':
+        await selected.wait()
+    if route == ('GET', '/metrics'):
+      if started and delayed_stage == 'selection':
+        await selected.wait()
+      fields = {
+        'selected': int(selected.is_set()),
+        'processing_complete': int(completed.is_set()),
+        'active': int(not completed.is_set()),
+        'pending': 0,
+        'admission_in_progress': 0,
+        'admitted': 1,
+        'confirmed': 1,
+        'attempted': 1,
+        'unknown': 0,
+        'known_not_committed': 0,
+        'not_admitted': 0,
+      }
+      return httpx.Response(
+        200,
+        text='\n'.join(
+          [
+            'fastapi_app_info{pid="7"} 1',
+            f'resolution_run_elapsed_seconds_count{{mode="stale"}} {int(completed.is_set())}',
+            *(f'resolution_run_snapshot{{mode="stale",field="{key}"}} {value}' for key, value in fields.items()),
+          ]
+        ),
+      )
+    if route in {('GET', '/domains/2'), ('POST', '/domains')}:
+      task = asyncio.current_task()
+      pending.add(task)
+      try:
+        await asyncio.Event().wait()
+      finally:
+        retired.add(task)
+    return httpx.Response(200, json={})
+
+  real_client = httpx.AsyncClient
+  transport = httpx.MockTransport(request)
+  monkeypatch.setattr(httpx, 'AsyncClient', lambda **kwargs: real_client(transport=transport, **kwargs))
+  service = SimpleNamespace(
+    url='http://deadline.test',
+    resource_snapshot=lambda pid: {'rss_bytes': 1, 'peak_rss_bytes': 1, 'cpu_seconds': 0, 'source': 'controlled OS'},
+  )
+  measurement = {}
+  try:
+    async with asyncio.timeout(1):
+      with pytest.raises(TimeoutError):
+        await load_measure_pass(
+          service,
+          SimpleNamespace(count=1),
+          {'pass_timeout': 0.15, 'probe_interval': 1, 'rss_limit_mb': 1, 'cpu_percent_limit': 100},
+          {'read': 5, 'list': 5, 'stats': 5, 'job': 5, 'write': 5},
+          mode='stale',
+          measurement=measurement,
+        )
+    assert selected.is_set()
+    assert not completed.is_set()
+    assert measurement['source_pass_status'] == 'failed'
+    assert measurement['source_failure']['type'] == 'TimeoutError'
+    assert measurement.get('api_status') != 'passed'
+    assert len(pending) == 2
+    assert retired == pending
+    assert all(task.done() for task in pending)
+  finally:
+    for timer in timers:
+      timer.cancel()
+
+
 async def load_measure_pass(
   service,
   dataset,
@@ -5973,10 +6475,22 @@ async def load_measure_pass(
 ):
   measurement = {} if measurement is None else measurement
   observed = LoadApiObservations() if observations is None else observations
+  diagnostic = {} if configuration.get('diagnostic', False) else None
+  capture_runner = diagnostic is not None or configuration.get('cpu_profile', 'unrestricted') != 'unrestricted'
+  runner_resources = []
+  if diagnostic is not None:
+    measurement['diagnostic'] = diagnostic
+    diagnostic.update(runner_pid=os.getpid(), runner_parent_pid=os.getppid(), runner_executable=sys.executable)
   finished = asyncio.Event()
   async with httpx.AsyncClient(base_url=service.url, timeout=max(bounds.values()), trust_env=False) as client:
     before = parse_samples((await load_metrics_request(client, metrics_observer, scope='source_before')).text)
     pid = application_pid(before)
+    if getattr(service, 'cpu_evidence', None) is not None:
+      cpu = service.startup_attempts[-1]['cpu']
+      assert cpu['application_pid'] == pid, 'CPU evidence must describe the actual application process'
+      if cpu['requested_mask'] is not None:
+        assert cpu['application_effective_mask'] == cpu['effective_mask'] == cpu['requested_mask']
+      measurement['cpu'] = cpu
     resources = [service.resource_snapshot(pid)]
     last_api_at = None
 
@@ -5984,6 +6498,11 @@ async def load_measure_pass(
       nonlocal last_api_at
       while not finished.is_set():
         resources.append(service.resource_snapshot(pid))
+        if capture_runner:
+          runner_resources.append(
+            {'elapsed_seconds': perf_counter() - started, **service.resource_snapshot(os.getpid())}
+          )
+          assert runner_resources[-1]['rss_bytes'] <= configuration['rss_limit_mb'] * 1024 * 1024
         assert resources[-1]['rss_bytes'] <= configuration['rss_limit_mb'] * 1024 * 1024
         await load_api_round(client, dataset, observed, timeout=bounds, job_mode='new' if mode == 'stale' else 'stale')
         last_api_at = perf_counter()
@@ -6002,67 +6521,100 @@ async def load_measure_pass(
             'resource': service.resource_snapshot(application_pid(samples)),
             'last_api_round_elapsed_seconds': last_api_at - started if last_api_at is not None else None,
             'api_sample_counts': {name: len(values) for name, values in observed.items()},
+            **({'diagnostic': diagnostic} if diagnostic is not None else {}),
           }
         )
 
     monitor_task = None
     canary_task = None
     pass_task = None
+    loop_task = None
+    loop = asyncio.get_running_loop()
+    source_budget = min(configuration['pass_timeout'], 1800)
     started = perf_counter()
+    deadline = loop.time() + source_budget
+    measurement.update(source_budget_seconds=source_budget, source_pass_status='in_progress')
+
+    async def watch_loop():
+      lag = diagnostic['loop_lag'] = {'count': 0, 'sum_seconds': 0, 'max_seconds': 0, 'over_50ms': 0}
+      while True:
+        scheduled = perf_counter() + 0.02
+        await asyncio.sleep(0.02)
+        seconds = max(0, perf_counter() - scheduled)
+        lag['count'] += 1
+        lag['sum_seconds'] += seconds
+        lag['max_seconds'] = max(lag['max_seconds'], seconds)
+        lag['over_50ms'] += seconds > 0.05
+
     try:
+      if capture_runner:
+        runner_resources.append({'elapsed_seconds': 0, **service.resource_snapshot(os.getpid())})
+      if diagnostic is not None:
+        loop_task = asyncio.create_task(watch_loop())
       monitor_task = asyncio.create_task(monitor())
-      response = await client.post(f'/commands/domains/resolve/{mode}')
-      assert response.status_code == 200, response.text
-      # Freeze source membership before any public canary can enter selection.
-      async with asyncio.timeout(configuration['pass_timeout']):
-        while (
-          run_fields(
-            parse_samples((await load_metrics_request(client, metrics_observer, scope='source_selection')).text), mode
-          ).get('selected')
-          != dataset.count
-        ):
-          await asyncio.sleep(0.01)
-      canary_task = asyncio.create_task(
-        load_probe_canaries(
-          client,
-          observed,
-          finished,
-          configuration,
-          job_mode='new' if mode == 'stale' else 'stale',
-          request_timeout=bounds,
+      async with asyncio.timeout_at(deadline):
+        await load_api_request(client, observed, 'job', 'POST', f'/commands/domains/resolve/{mode}', timeout=5)
+        # Freeze source membership before any public canary can enter selection.
+        async with asyncio.timeout_at(deadline):
+          while (
+            run_fields(
+              parse_samples((await load_metrics_request(client, metrics_observer, scope='source_selection')).text), mode
+            ).get('selected')
+            != dataset.count
+          ):
+            await asyncio.sleep(0.01)
+        canary_task = asyncio.create_task(
+          load_probe_canaries(
+            client,
+            observed,
+            finished,
+            configuration,
+            job_mode='new' if mode == 'stale' else 'stale',
+            request_timeout=bounds,
+          )
         )
-      )
 
-      async def observe_source():
-        samples, fields = await load_wait_idle(
-          client,
-          mode,
-          dataset.count,
-          sample_total(before, 'resolution_run_elapsed_seconds_count', mode=mode),
-          configuration['pass_timeout'],
-          on_progress=report_progress,
-          **(
-            {'metrics_poll_interval': configuration['metrics_poll_interval'], 'metrics_observer': metrics_observer}
-            if 'metrics_poll_interval' in configuration
-            else {}
-          ),
-        )
-        measurement.update(
-          source_pass_status='completed',
-          wall_seconds_to_known_writer_outcomes=perf_counter() - started,
-          source_population=dataset.count,
-          run=fields,
-        )
-        return samples, fields
+        async def observe_source():
+          samples, fields = await load_wait_idle(
+            client,
+            mode,
+            dataset.count,
+            sample_total(before, 'resolution_run_elapsed_seconds_count', mode=mode),
+            max(0, deadline - loop.time()),
+            on_progress=report_progress,
+            **({'diagnostic': diagnostic} if diagnostic is not None else {}),
+            **(
+              {'metrics_poll_interval': configuration['metrics_poll_interval'], 'metrics_observer': metrics_observer}
+              if 'metrics_poll_interval' in configuration
+              else {}
+            ),
+          )
+          source_elapsed = perf_counter() - started
+          measurement.update(
+            source_pass_status='completed',
+            wall_seconds_to_known_writer_outcomes=source_elapsed,
+            source_population=dataset.count,
+            run=fields,
+          )
+          load_assert_source_budget(measurement, configuration)
+          return samples, fields
 
-      pass_task = asyncio.create_task(observe_source())
-      done, _ = await asyncio.wait((pass_task, monitor_task, canary_task), return_when=asyncio.FIRST_COMPLETED)
-      for task in done:
-        if task is not pass_task:
-          await task
-      samples, fields = await pass_task
-      elapsed = measurement['wall_seconds_to_known_writer_outcomes']
+        pass_task = asyncio.create_task(observe_source())
+        done, _ = await asyncio.wait((pass_task, monitor_task, canary_task), return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+          if task is not pass_task:
+            await task
+        samples, fields = await pass_task
+        elapsed = measurement['wall_seconds_to_known_writer_outcomes']
       resources.append(service.resource_snapshot(pid))
+    except BaseException as error:
+      if measurement['source_pass_status'] != 'completed':
+        measurement.update(
+          source_pass_status='failed',
+          wall_seconds_to_failure=perf_counter() - started,
+          source_failure={'type': type(error).__name__, 'message': str(error)[:4000]},
+        )
+      raise
     finally:
       try:
         finished.set()
@@ -6087,6 +6639,19 @@ async def load_measure_pass(
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
       finally:
+        if loop_task is not None:
+          loop_task.cancel()
+          await asyncio.gather(loop_task, return_exceptions=True)
+        if capture_runner:
+          try:
+            runner_resources.append(
+              {'elapsed_seconds': perf_counter() - started, **service.resource_snapshot(os.getpid())}
+            )
+          except (OSError, AssertionError) as error:
+            measurement['runner_final_resource_error'] = type(error).__name__
+          measurement['runner_resource_samples'] = runner_resources
+          if diagnostic is not None:
+            diagnostic['runner_resource_samples'] = runner_resources
         measurement['api_latency_measured'] = {name: load_quantiles(values) for name, values in observed.items()}
         measurement['api_latency_samples_seconds'] = {name: list(values) for name, values in observed.items()}
         measurement['resource_samples'] = resources
@@ -7481,7 +8046,7 @@ async def test_resolution_load_cancelled_http_request_is_not_a_response_latency_
       await asyncio.gather(task, return_exceptions=True)
 
 
-@pytest.mark.parametrize('failure', ['p99', 'drain'])
+@pytest.mark.parametrize('failure', ['p99', 'drain', 'budget'])
 @pytest.mark.parametrize('diagnostic', [False, True])
 async def test_resolution_load_measurement_keeps_completed_source_when_later_checks_fail(
   monkeypatch, failure, diagnostic
@@ -7522,6 +8087,8 @@ async def test_resolution_load_measurement_keeps_completed_source_when_later_che
         raise ValueError('Auxiliary drain failed')
       if admitted:
         source_completed.set()
+      if failure == 'budget' and len(metrics_calls) == 3:
+        clock[0] = 1801
       metrics = ['fastapi_app_info{pid="7"} 1', f'resolution_run_elapsed_seconds_count{{mode="stale"}} {int(admitted)}']
       metrics.extend(
         f'resolution_run_snapshot{{mode="stale",field="{key}"}} {value if admitted else 0}'
@@ -7562,11 +8129,11 @@ async def test_resolution_load_measurement_keeps_completed_source_when_later_che
   )
   bounds = dict.fromkeys(('read', 'list', 'stats', 'job', 'write', 'search', 'delete', 'stored_resolve'), 5)
   measurement = {}
-  configuration = {'probe_interval': 0.001, 'pass_timeout': 1, 'rss_limit_mb': 1, 'cpu_percent_limit': 100}
+  configuration = {'probe_interval': 0.001, 'pass_timeout': 1800, 'rss_limit_mb': 1, 'cpu_percent_limit': 100}
   if diagnostic:
     configuration['metrics_poll_interval'] = 0.05
   async with asyncio.timeout(2):
-    with pytest.raises(AssertionError if failure == 'p99' else ValueError):
+    with pytest.raises(ValueError if failure == 'drain' else AssertionError):
       await load_measure_pass(
         service,
         dataset,
@@ -7580,6 +8147,12 @@ async def test_resolution_load_measurement_keeps_completed_source_when_later_che
   assert measurement['source_pass_status'] == 'completed'
   assert measurement['wall_seconds_to_known_writer_outcomes'] > 0
   assert measurement['run'] == fields
+  if failure == 'budget':
+    assert measurement['source_budget']['within_maximum'] is False
+    assert measurement['wall_seconds_to_known_writer_outcomes'] > 1800
+    assert measurement.get('api_status') != 'passed'
+    assert measurement.get('auxiliary_drain_status') is None
+    return
   assert {'read', 'list', 'stats', 'job', 'write', 'search', 'delete'} <= set(measurement['api_latency_measured'])
   assert measurement['api_bounds_frozen_seconds'] == bounds
   assert measurement.get('api_status') != 'passed'
@@ -8938,19 +9511,45 @@ async def test_ip_persistence_revision_comparison(e2e_service, tmp_path):
 @pytest.mark.e2e_load
 @pytest.mark.parametrize('e2e_service', [{'start': False, 'load': True, 'request_sample_limit': 128}], indirect=True)
 async def test_resolution_load_campaign(e2e_service, tmp_path):
-  """Compare defaults and bounded candidates using complete public flows and frozen API bounds."""
-  service = e2e_service
   configuration = resolution_load_configuration()
+  try:
+    with e2e_service.cpu_profile(configuration['cpu_profile']):
+      await load_run_campaign(e2e_service, tmp_path, configuration)
+  finally:
+    path = tmp_path / 'resolution-load-campaign.json'
+    if path.exists():
+      primary = sys.exception()
+      try:
+        artifact = json.loads(path.read_text(encoding='utf-8'))
+        artifact['cpu_profile'] = e2e_service.cpu_evidence
+        artifact['startup_attempts'] = e2e_service.startup_attempts
+        if primary is not None:
+          artifact.update(status='failed', failure={'type': type(primary).__name__, 'message': str(primary)[:4000]})
+        load_write_artifact(path, artifact)
+      except (OSError, ValueError) as error:
+        if primary is None:
+          raise
+        primary.add_note(f'Final campaign artifact update failed: {error!r}')
+
+
+async def load_run_campaign(service, tmp_path, configuration):
+  """Compare defaults and bounded candidates using complete public flows and frozen API bounds."""
   source_snapshot = load_source_evidence(service.root)
   artifact_path = tmp_path / 'resolution-load-campaign.json'
   sizes = list(dict.fromkeys(math.ceil(configuration['n'] * value) for value in configuration['factors']))
+  if configuration['full_size_stability']:
+    sizes = [max(sizes)]
   entire_matrix = (
     set(configuration['stages']) == {'baseline', 'warmup', 'healthy', 'degraded'}
     and configuration['candidate_names'] is None
     and configuration['repetition_numbers'] is None
+    and not configuration['diagnostic']
+    and not configuration['full_size_stability']
   )
   artifact = {
     'profile': configuration['profile'],
+    'campaign_scope': 'full_size_cpu_stability' if configuration['full_size_stability'] else 'size_candidate_matrix',
+    'cpu_profile': service.cpu_evidence,
     'run_started_at_utc': datetime.now(UTC).isoformat(),
     'acceptance_scale': configuration['profile'] == 'full' and configuration['n'] == 156298 and entire_matrix,
     'scale_basis': 'observed 2026-11-04 domain count' if configuration['n'] == 156298 else 'explicit custom size',
@@ -8998,6 +9597,20 @@ async def test_resolution_load_campaign(e2e_service, tmp_path):
       'scope': 'User-required full STALE pass through known persistence; API guards remain independent',
     },
     'cases': [],
+    'planned_stability_cases': [
+      {
+        'schedule': schedule,
+        'repetition': repetition,
+        'cycle': cycle,
+        'cache': 'cold' if cycle == 0 else 'warm',
+        'size': max(sizes),
+      }
+      for schedule in ('healthy', 'degraded')
+      for repetition in range(1, configuration['repetitions'] + 1)
+      for cycle in range(3)
+    ]
+    if configuration['full_size_stability']
+    else [],
     'status': 'in_progress',
   }
   load_write_artifact(artifact_path, artifact)
@@ -9021,19 +9634,24 @@ async def test_resolution_load_campaign(e2e_service, tmp_path):
     service.environment.clear()
     service.environment.update(isolation)
     service.environment.update(candidate['environment'])
+    if configuration['full_size_stability']:
+      effective = load_effective_settings(service)
+      assert int(effective['DB_POOL_SIZE']) == 5, 'Stability replay must retain the original read pool'
+      assert int(effective['RIPE_STAT_CACHE_SIZE']) == 10000, 'Stability replay must retain the original cache size'
     workload = {} if true_defaults else {'DOMAINS_UPDATE_INTERVAL': '0'}
     service.environment.update(workload)
     service.providers.response_factory = dataset.response
     service.providers.begin_cycle(f'{candidate["name"]}-{count}-{schedule}-{repetition}-cold')
     service.providers.reset_evidence()
     seed_seconds = load_prepare_offline(service, dataset, stale=not true_defaults, reset=True)
+    database_input = load_database_input_evidence(service) if configuration['diagnostic'] else None
     started = perf_counter()
     manifest = dataset.manifest()
     generator_seconds = perf_counter() - started
     await service.start()
     temperatures = (
       ('cold',)
-      if true_defaults
+      if true_defaults or configuration['diagnostic_cold_only']
       else (
         'cold',
         *('warm' for _ in range(configuration['soak_cycles'] - 1 if configuration['profile'] == 'full' else 1)),
@@ -9062,7 +9680,9 @@ async def test_resolution_load_campaign(e2e_service, tmp_path):
         'dataset': manifest,
         'seed_seconds_excluded': seed_seconds,
         'generator_seconds_excluded': generator_seconds,
+        **({'database_input': database_input} if database_input is not None else {}),
         'status': 'in_progress',
+        'cpu': service.startup_attempts[-1].get('cpu'),
       }
       artifact['cases'].append(entry)
       load_write_artifact(artifact_path, artifact)
@@ -9071,7 +9691,8 @@ async def test_resolution_load_campaign(e2e_service, tmp_path):
         entry['progress'] = progress
         entry['progress_updates'] = entry.get('progress_updates', 0) + 1
         before_write = perf_counter()
-        load_write_artifact(artifact_path, artifact)
+        if configuration['progress_writes'] == 'original':
+          load_write_artifact(artifact_path, artifact)
         entry['progress_artifact_write_seconds'] = entry.get('progress_artifact_write_seconds', 0) + (
           perf_counter() - before_write
         )
@@ -9089,6 +9710,7 @@ async def test_resolution_load_campaign(e2e_service, tmp_path):
           measurement=entry['measurement'],
         )
         entry['measurement'] = measurement
+        load_assert_source_budget(measurement, configuration)
         if not true_defaults:
           duration = measurement['wall_seconds_to_known_writer_outcomes']
           entry['stale_budget'] = {
@@ -9142,11 +9764,20 @@ async def test_resolution_load_campaign(e2e_service, tmp_path):
       finally:
         artifact['summary'] = load_campaign_summary(artifact['cases'])
         load_write_artifact(artifact_path, artifact)
-    await service.stop()
-    await service.start()
-    async with httpx.AsyncClient(base_url=service.url, timeout=max(bounds.values()), trust_env=False) as client:
-      entry['restart_verification'] = await load_verify_public(client, dataset, configuration['verify_timeout'])
-    await service.stop()
+    try:
+      await service.stop()
+      await service.start()
+      async with httpx.AsyncClient(base_url=service.url, timeout=max(bounds.values()), trust_env=False) as client:
+        entry['restart_verification'] = await load_verify_public(client, dataset, configuration['verify_timeout'])
+      await service.stop()
+    except BaseException as error:
+      entry.update(status='failed', failure={'type': type(error).__name__, 'message': str(error)[:4000]})
+      try:
+        await service.stop(allow_failure=True)
+      except BaseException as cleanup_error:  # noqa: BLE001 -- Preserve the first restart failure.
+        entry['restart_cleanup_error'] = repr(cleanup_error)
+        error.add_note(f'Restart cleanup failed: {cleanup_error!r}')
+      raise
     load_write_artifact(artifact_path, artifact)
 
   try:
@@ -9174,6 +9805,17 @@ async def test_resolution_load_campaign(e2e_service, tmp_path):
     artifact['failure'] = {'type': type(error).__name__, 'message': str(error)[:4000]}
     raise
   finally:
+    artifact['summary'] = load_campaign_summary(artifact['cases'])
+    artifact['uncompleted_stability_cases'] = [
+      planned
+      for planned in artifact['planned_stability_cases']
+      if not any(
+        entry['status'] == 'passed'
+        and not entry['warmup']
+        and all(entry[key] == value for key, value in planned.items())
+        for entry in artifact['cases']
+      )
+    ]
     load_write_artifact(artifact_path, artifact)
 
 
