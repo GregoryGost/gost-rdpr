@@ -8,6 +8,11 @@
 .travis.yml
 .taskcluster.yml
 
+# Agent configuration and local handoffs
+.agents/
+.codex/
+.agent-handoffs/
+
 # Docker
 docker-compose.yml
 Dockerfile

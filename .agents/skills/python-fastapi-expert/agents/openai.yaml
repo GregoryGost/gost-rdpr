@@ -1,0 +1,4 @@
+interface:
+  display_name: "Python Fastapi Expert"
+  short_description: "Develops scalable FastAPI backend features. Responsible for A..."
+  default_prompt: "Use $python-fastapi-expert for this workflow."

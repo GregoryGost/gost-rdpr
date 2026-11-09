@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Set
+
 
 @dataclass
 class DomainsListDto:
@@ -13,4 +13,4 @@ class DomainsListDto:
   description: str | None = None
   updated_at: datetime | None = None
   #
-  found_elements: Set[str] | None = None # for after search process
+  found_elements: set[str] | None = None  # for after search process

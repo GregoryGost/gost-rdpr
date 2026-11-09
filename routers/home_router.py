@@ -1,25 +1,22 @@
-from fastapi import APIRouter, status
-from fastapi.responses import JSONResponse
-from datetime import datetime
 from time import time
 from typing import Self
 
-from logger.logger import logger
+from fastapi import APIRouter, status
+from fastapi.responses import JSONResponse
+
 from config.config import settings
 from database.db import db
+from logger.logger import logger
+from models.http.home_resp import ConfigDynamic, ConfigResp, ConfigStatic, HealthResp, WelcomeResp
 
 from .base_router import BaseRouter
 
-from models.http.home_resp import WelcomeResp, HealthResp, ConfigResp, ConfigStatic, ConfigDynamic
 
 class HomeRouter(BaseRouter):
-
   start_time: float = time()
 
   def __init__(self: Self) -> None:
-    self.router: APIRouter = APIRouter(
-      tags=[self.tags.home_tag.name]
-    )
+    self.router: APIRouter = APIRouter(tags=[self.tags.home_tag.name])
     logger.info('HomeRouter init')
 
   def get_router(self: Self) -> APIRouter:
@@ -28,38 +25,23 @@ class HomeRouter(BaseRouter):
     # Welcome
     ############################################
 
-    @router.get(
-      path='/',
-      name='Welcome',
-      description='Base welcome answer',
-      response_model=WelcomeResp
-    )
+    @router.get(path='/', name='Welcome', description='Base welcome answer', response_model=WelcomeResp)
     async def welcome() -> JSONResponse:
-      logger.debug(f'Call API route: GET /')
+      logger.debug('Call API route: GET /')
       resp: WelcomeResp = WelcomeResp(version=settings.app_version, docs='/docs')
       return JSONResponse(resp.to_dict(), status.HTTP_200_OK)
-    
+
     # Health
     ############################################
 
-    @router.get(
-      path='/health',
-      name='Health check',
-      description='API OK checker',
-      response_model=HealthResp
-    )
+    @router.get(path='/health', name='Health check', description='API OK checker', response_model=HealthResp)
     async def health() -> JSONResponse:
-      logger.debug(f'Call API route: GET /health')
-      now = datetime.now()
-      ts = datetime.timestamp(now) // 1
+      logger.debug('Call API route: GET /health')
+      ts = time() // 1
       uptime = (time() - self.start_time) // 1
-      resp: HealthResp = HealthResp(
-        ts=ts,
-        uptime=uptime,
-        db_pool=db.read_pool_status
-      )
+      resp: HealthResp = HealthResp(ts=ts, uptime=uptime, db_pool=db.read_pool_status)
       return JSONResponse(resp.to_dict(), status.HTTP_200_OK)
-    
+
     # Current config
     ############################################
 
@@ -67,10 +49,10 @@ class HomeRouter(BaseRouter):
       path='/config',
       name='Current config',
       description='Current config. All settings parameters',
-      response_model=ConfigResp
+      response_model=ConfigResp,
     )
     async def get_config() -> JSONResponse:
-      logger.debug(f'Call API route: GET /config')
+      logger.debug('Call API route: GET /config')
       resp: ConfigResp = ConfigResp(
         static=ConfigStatic(
           root_path=settings.root_path,
@@ -88,9 +70,6 @@ class HomeRouter(BaseRouter):
           queue_sleep_timeout=settings.queue_sleep_timeout,
           db_log_level=settings.db_log_level,
           db_timeout=settings.db_timeout,
-          # db_pool_size=settings.db_pool_size,
-          # db_pool_size_overflow=settings.db_pool_size_overflow,
-          # db_pool_recycle_sec=settings.db_pool_recycle_sec,
           db_base_dir=settings.db_base_dir,
           db_file_name=settings.db_file_name,
           db_table_prefix=settings.db_table_prefix,
@@ -107,20 +86,19 @@ class HomeRouter(BaseRouter):
           req_default_limit=settings.req_default_limit,
           domains_filtered_min_len=settings.domains_filtered_min_len,
           domains_update_interval=settings.domains_update_interval,
-          # domains_one_job_resolve_limit=settings.domains_one_job_resolve_limit,
           domain_resolve_semaphore_limit=settings.domains_resolve_semaphore_limit,
           domains_black_list=settings.domains_black_list,
           lists_update_interval_sec=settings.lists_update_interval_sec,
           ip_not_allowed=settings.ip_not_allowed,
-          ros_rest_api_read_timeout=settings.ros_rest_api_read_timeout
+          ros_rest_api_read_timeout=settings.ros_rest_api_read_timeout,
         ),
         dynamic=ConfigDynamic(
           ip_not_allowed_list=settings.ip_not_allowed_list,
           app_title_metrics=settings.app_title_metrics,
           db_path=settings.db_path,
-          db_connection=settings.db_connection
-        )
+          db_connection=settings.db_connection,
+        ),
       )
       return JSONResponse(resp.to_dict(), status.HTTP_200_OK)
-    
+
     return router

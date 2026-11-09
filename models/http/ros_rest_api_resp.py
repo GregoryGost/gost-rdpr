@@ -1,9 +1,11 @@
+from typing import Annotated, Self
+
 from pydantic import Field, model_validator
-from typing import Annotated, List, Tuple, Self, Set
+
+from utils.utils import get_ip_version, get_ip_without_prefix
 
 from .base import Base
 
-from utils.utils import get_ip_without_prefix, get_ip_version
 
 class RosFirewallIpResp(Base):
   id: Annotated[str, Field(alias='.id')]
@@ -16,15 +18,17 @@ class RosFirewallIpResp(Base):
     # set type
     self.type = get_ip_version(ip=self.address)
     return self
-  
+
   @staticmethod
-  def separate_duplicates(addresses: List[RosFirewallIpResp]) -> Tuple[List[RosFirewallIpResp], List[RosFirewallIpResp]]:
-    duplicates: List[RosFirewallIpResp] = []
-    unique: List[RosFirewallIpResp] = []
-    seen: Set[Tuple[str, str]] = set()
+  def separate_duplicates(
+    addresses: list[RosFirewallIpResp],
+  ) -> tuple[list[RosFirewallIpResp], list[RosFirewallIpResp]]:
+    duplicates: list[RosFirewallIpResp] = []
+    unique: list[RosFirewallIpResp] = []
+    seen: set[tuple[str, str]] = set()
 
     for record in addresses:
-      key: Tuple[str, str] = (record.list_name, record.address)
+      key: tuple[str, str] = (record.list_name, record.address)
       if key in seen:
         duplicates.append(record)
       else:
@@ -32,7 +36,8 @@ class RosFirewallIpResp(Base):
         seen.add(key)
 
     return duplicates, unique
-  
+
+
 class RosRoutingIpResp(Base):
   id: Annotated[str, Field(alias='.id')]
   address: Annotated[str, Field(alias='dst-address')]
@@ -46,12 +51,12 @@ class RosRoutingIpResp(Base):
     # set type
     self.type = get_ip_version(ip=self.address)
     return self
-  
+
   @staticmethod
-  def separate_duplicates(addresses: List[RosRoutingIpResp]) -> Tuple[List[RosRoutingIpResp], List[RosRoutingIpResp]]:
-    duplicates: List[RosRoutingIpResp] = []
-    unique: List[RosRoutingIpResp] = []
-    seen: Set[str] = set()
+  def separate_duplicates(addresses: list[RosRoutingIpResp]) -> tuple[list[RosRoutingIpResp], list[RosRoutingIpResp]]:
+    duplicates: list[RosRoutingIpResp] = []
+    unique: list[RosRoutingIpResp] = []
+    seen: set[str] = set()
 
     for record in addresses:
       if record.address in seen:
@@ -62,10 +67,12 @@ class RosRoutingIpResp(Base):
 
     return duplicates, unique
 
+
 class RosIpRouteDefaultGatewayResp(Base):
   gateway: str
   routing_table: Annotated[str, Field(alias='routing-table')]
   immediate_gw: Annotated[str, Field(alias='immediate-gw')]
+
 
 class RosRoutingTableResp(Base):
   id: Annotated[str, Field(alias='.id')]

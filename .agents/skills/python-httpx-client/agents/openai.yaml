@@ -1,0 +1,4 @@
+interface:
+  display_name: "Python HTTPX Client"
+  short_description: "HTTPX integration-client guidance"
+  default_prompt: "Use $python-httpx-client to build or review an outgoing HTTPX integration client."

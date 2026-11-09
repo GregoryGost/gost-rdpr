@@ -1,18 +1,22 @@
+from typing import Annotated
+
 from pydantic import Field
-from typing import Annotated, List
 
 from .base import Base
+
 
 class WelcomeResp(Base):
   version: Annotated[str, Field(title='API Version')]
   message: Annotated[str, Field(title='Welcome message')] = 'Welcome to API'
   docs: Annotated[str, Field(title='link to docs')]
 
+
 class HealthResp(Base):
   status: Annotated[str, Field(title='Application status')] = 'OK'
   ts: Annotated[float, Field(title='Response now timestamp')]
   uptime: Annotated[float, Field(title='Application uptime')]
   db_pool: Annotated[str, Field(title='Database pool status')]
+
 
 class ConfigStatic(Base):
   root_path: str
@@ -33,9 +37,6 @@ class ConfigStatic(Base):
   # DB section
   db_log_level: str
   db_timeout: float
-  # db_pool_size: int
-  # db_pool_size_overflow: int
-  # db_pool_recycle_sec: int
   db_base_dir: str
   db_file_name: str
   db_table_prefix: str
@@ -55,7 +56,6 @@ class ConfigStatic(Base):
   # Domains section
   domains_filtered_min_len: int
   domains_update_interval: int
-  # domains_one_job_resolve_limit: int
   domain_resolve_semaphore_limit: int
   domains_black_list: str
   # Lists section
@@ -65,11 +65,13 @@ class ConfigStatic(Base):
   # ROUTEROS section
   ros_rest_api_read_timeout: float
 
+
 class ConfigDynamic(Base):
-  ip_not_allowed_list: List[str]
+  ip_not_allowed_list: list[str]
   app_title_metrics: str
   db_path: str
   db_connection: str
+
 
 class ConfigResp(Base):
   static: ConfigStatic

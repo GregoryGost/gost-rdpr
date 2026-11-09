@@ -1,6 +1,5 @@
-from typing import Optional, List
-
 from .base import Base, BasePayloadResp
+
 
 class RosConfigElementResp(Base):
   id: int
@@ -8,11 +7,13 @@ class RosConfigElementResp(Base):
   user: str
   password: str
   bgp_list_name: str
-  description: Optional[str] = None
+  description: str | None = None
   created_at: int | float
   created_at_hum: str
-  updated_at: Optional[int | float] = None
-  updated_at_hum: Optional[str] = None
+  updated_at: int | float | None = None
+  updated_at_hum: str | None = None
+
 
 class RosConfigPayloadResp(BasePayloadResp):
-  payload: List[RosConfigElementResp] = []
+  # Keep the literal default so Pydantic and OpenAPI retain the existing [] default.
+  payload: list[RosConfigElementResp] = []  # noqa: RUF012

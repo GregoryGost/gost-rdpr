@@ -1,0 +1,4 @@
+interface:
+  display_name: "Python Core"
+  short_description: "Portable Python 3.14+ coding and review guidance"
+  default_prompt: "Use $python-core for Python 3.14+ language guidance, PEP-oriented style, environment discovery, validation workflow, typing, idiomatic patterns, comments/docstrings, and Python-code review."

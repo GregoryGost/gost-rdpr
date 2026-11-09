@@ -1,21 +1,23 @@
-from typing import Optional, List
-
 from .base import Base, BasePayloadResp
+
 
 class DnsElementResp(Base):
   id: int
-  server: Optional[str] = None
-  doh_server: Optional[str] = None
-  description: Optional[str] = None
+  server: str | None = None
+  doh_server: str | None = None
+  description: str | None = None
   created_at: int | float
   created_at_hum: str
-  updated_at: Optional[int | float] = None
-  updated_at_hum: Optional[str] = None
+  updated_at: int | float | None = None
+  updated_at_hum: str | None = None
+
 
 class DnsPayloadResp(BasePayloadResp):
-  payload: List[DnsElementResp] = []
+  # Keep the literal default so Pydantic and OpenAPI retain the existing [] default.
+  payload: list[DnsElementResp] = []  # noqa: RUF012
+
 
 class DnsPostElementResp(Base):
   name: str
-  id: Optional[int] = None
-  error: Optional[str] = None
+  id: int | None = None
+  error: str | None = None

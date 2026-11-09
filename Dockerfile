@@ -7,13 +7,13 @@
 # Build arguments:
 #   UI_REPO_URL - UI repository URL (default: https://github.com/GregoryGost/gost-rdpr-ui.git)
 #   UI_BRANCH - UI branch to clone (default: main)
-#   PYTHON_VERSION - Python base image version (default: 3.14-slim-trixie)
+#   PYTHON_VERSION - Python base image version (default: 3.15-slim-trixie)
 #   NODE_VERSION - Node.js base image version (default: 24.13-alpine)
 #
 # Note: Nginx is installed from Debian repositories (python:slim-trixie is Debian-based)
 #
 
-ARG PYTHON_VERSION=3.14-slim-trixie
+ARG PYTHON_VERSION=3.15-slim-trixie
 ARG NODE_VERSION=24.13-alpine
 
 ########################################################################################################################
@@ -64,7 +64,7 @@ WORKDIR /app
 COPY poetry.lock pyproject.toml LICENSE ./
 
 # Install Poetry and dependencies
-ARG POETRY_VERSION=2.4.1
+ARG POETRY_VERSION=2.5.1
 RUN pip install poetry==${POETRY_VERSION} --no-cache --root-user-action=ignore \
   && poetry config virtualenvs.in-project true \
   && poetry install --no-interaction --no-cache

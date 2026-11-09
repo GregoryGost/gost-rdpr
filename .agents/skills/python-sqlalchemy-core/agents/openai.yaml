@@ -1,0 +1,4 @@
+interface:
+  display_name: "Python SQLAlchemy Core"
+  short_description: "Common SQLAlchemy backend guidance"
+  default_prompt: "Use $python-sqlalchemy-core for common SQLAlchemy models, sessions, transactions, repositories, and DB integration tests."
