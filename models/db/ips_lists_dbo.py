@@ -1,33 +1,21 @@
-from datetime import datetime, timedelta
-from sqlalchemy import (
-  select,
-  text,
-  or_,
-  and_,
-  func,
-  Index,
-  Row,
-  Select,
-  Result,
-  CheckConstraint,
-  INTEGER,
-  TIMESTAMP,
-  TEXT
-)
-from sqlalchemy.orm import Mapped, mapped_column
+from collections.abc import Sequence
+from datetime import datetime
+from typing import Self
+
+from sqlalchemy import INTEGER, TEXT, TIMESTAMP, CheckConstraint, Index, Result, Row, Select, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Optional, Tuple, Self, Sequence, List
+from sqlalchemy.orm import Mapped, mapped_column
 
 from config.config import settings
+from models.dto.ips_lists_dto import IpsListDto
 
 from .base_dbo import Dbo
 
-from models.dto.ips_lists_dto import IpsListDto
 
 class IpsListsDbo(Dbo):
-  '''
+  """
   IP address lists table
-  '''
+  """
 
   __tablename__ = 'ips_lists'
 
@@ -35,17 +23,18 @@ class IpsListsDbo(Dbo):
 
   name: Mapped[str] = mapped_column(TEXT, unique=True, index=True, nullable=False)
   url: Mapped[str] = mapped_column(TEXT, nullable=False)
-  description: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
-  hash: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
-  attempts: Mapped[int] = mapped_column(INTEGER, nullable=False, default=0) # If attempts > settings(attempts_limit), then the file is no longer available
+  description: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+  hash: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+  # The list becomes unavailable after exceeding the configured attempt limit.
+  attempts: Mapped[int] = mapped_column(INTEGER, nullable=False, default=0)
 
   created_at: Mapped[datetime] = mapped_column(TIMESTAMP, index=True, server_default=func.now())
-  updated_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP, onupdate=func.now(), nullable=True)
+  updated_at: Mapped[datetime | None] = mapped_column(TIMESTAMP, onupdate=func.now(), nullable=True)
 
   __table_args__ = (
     CheckConstraint("name != ''", name='name_chk'),
     CheckConstraint("url != ''", name='url_chk'),
-    Index(f'ix_{__tablename__}_updated_at', 'updated_at', sqlite_where=text('updated_at IS NOT NULL'))
+    Index(f'ix_{__tablename__}_updated_at', 'updated_at', sqlite_where=text('updated_at IS NOT NULL')),
   )
 
   # get_total in Base class
@@ -57,79 +46,56 @@ class IpsListsDbo(Dbo):
     db_session: AsyncSession,
     limit: int,
     offset: int,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    search_text: Optional[str] = None,
-    attempts: Optional[int] = None
-  ) -> Sequence[Row[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]]]:
+    start_date: str | None = None,
+    end_date: str | None = None,
+    search_text: str | None = None,
+    attempts: int | None = None,
+  ) -> Sequence[Row[int, str, str, str | None, str | None, int, datetime, datetime | None]]:
     try:
-      select_stmt: Select[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]] = select(
-        cls.id,
-        cls.name,
-        cls.url,
-        cls.description,
-        cls.hash,
-        cls.attempts,
-        cls.created_at,
-        cls.updated_at
+      select_stmt: Select[int, str, str, str | None, str | None, int, datetime, datetime | None] = select(
+        cls.id, cls.name, cls.url, cls.description, cls.hash, cls.attempts, cls.created_at, cls.updated_at
       )
-      if start_date != None:
+      if start_date is not None:
         select_stmt = select_stmt.where(cls.created_at >= start_date)
-      if end_date != None:
+      if end_date is not None:
         select_stmt = select_stmt.where(cls.created_at <= end_date)
-      if search_text != None:
-        select_stmt = select_stmt.where(
-          or_(
-            cls.name.contains(search_text),
-            cls.url.contains(search_text)
-          )
-        )
-      if attempts != None:
+      if search_text is not None:
+        select_stmt = select_stmt.where(or_(cls.name.contains(search_text), cls.url.contains(search_text)))
+      if attempts is not None:
         select_stmt = select_stmt.where(cls.attempts == attempts)
-      select_limit_stmt: Select[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]] = \
+      select_limit_stmt: Select[int, str, str, str | None, str | None, int, datetime, datetime | None] = (
         select_stmt.limit(limit).offset(offset)
-      exec_result: Result[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]] = \
-        await db_session.execute(select_limit_stmt)
+      )
+      exec_result: Result[
+        int, str, str, str | None, str | None, int, datetime, datetime | None
+      ] = await db_session.execute(select_limit_stmt)
       #
       return exec_result.fetchall()
     except Exception as err:
       raise err
 
   @classmethod
-  async def get_for_update(cls: type[Self], db_session: AsyncSession, forced: bool) -> List[IpsListDto]:
+  async def get_for_update(cls: type[Self], db_session: AsyncSession, forced: bool) -> list[IpsListDto]:
     try:
       elapsed_expr = func.coalesce(
-        func.unixepoch(func.current_timestamp()) - func.unixepoch(cls.updated_at),
-        settings.lists_update_interval_sec
+        func.unixepoch(func.current_timestamp()) - func.unixepoch(cls.updated_at), settings.lists_update_interval_sec
       )
       #
-      select_stmt: Select[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]] = select(
-        cls.id,
-        cls.name,
-        cls.url,
-        cls.description,
-        cls.hash,
-        cls.attempts,
-        cls.created_at,
-        cls.updated_at
-      ).where(
-        cls.attempts < settings.attempts_limit
-      )
+      select_stmt: Select[int, str, str, str | None, str | None, int, datetime, datetime | None] = select(
+        cls.id, cls.name, cls.url, cls.description, cls.hash, cls.attempts, cls.created_at, cls.updated_at
+      ).where(cls.attempts < settings.attempts_limit)
       if forced is False:
         elapsed_expr = func.coalesce(
-          func.unixepoch(func.current_timestamp()) - func.unixepoch(cls.updated_at),
-          settings.lists_update_interval_sec
+          func.unixepoch(func.current_timestamp()) - func.unixepoch(cls.updated_at), settings.lists_update_interval_sec
         )
         select_stmt = select_stmt.where(
-          or_(
-            cls.updated_at.is_(None),
-            elapsed_expr >= settings.lists_update_interval_sec
-          )
+          or_(cls.updated_at.is_(None), elapsed_expr >= settings.lists_update_interval_sec)
         )
       #
-      exec_result: Result[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]] = \
-        await db_session.execute(select_stmt)
-      result: List[IpsListDto] = [
+      exec_result: Result[
+        int, str, str, str | None, str | None, int, datetime, datetime | None
+      ] = await db_session.execute(select_stmt)
+      result: list[IpsListDto] = [
         IpsListDto(
           id=row[0],
           name=row[1],
@@ -138,33 +104,25 @@ class IpsListsDbo(Dbo):
           hash=row[4],
           attempts=row[5],
           created_at=row[6],
-          updated_at=row[7]
+          updated_at=row[7],
         )
         for row in exec_result.fetchall()
       ]
       return result
     except Exception as err:
-        raise err
+      raise err
 
   @classmethod
   async def get_on_id(
-    cls: type[Self],
-    db_session: AsyncSession,
-    id: int
-  ) -> Optional[Row[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]]]:
+    cls: type[Self], db_session: AsyncSession, id: int
+  ) -> Row[int, str, str, str | None, str | None, int, datetime, datetime | None] | None:
     try:
-      select_stmt: Select[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]] = select(
-        cls.id,
-        cls.name,
-        cls.url,
-        cls.description,
-        cls.hash,
-        cls.attempts,
-        cls.created_at,
-        cls.updated_at
+      select_stmt: Select[int, str, str, str | None, str | None, int, datetime, datetime | None] = select(
+        cls.id, cls.name, cls.url, cls.description, cls.hash, cls.attempts, cls.created_at, cls.updated_at
       ).where(cls.id == id)
-      exec_result: Result[Tuple[int, str, str, str | None, str | None, int, datetime, datetime | None]] = \
-        await db_session.execute(select_stmt)
+      exec_result: Result[
+        int, str, str, str | None, str | None, int, datetime, datetime | None
+      ] = await db_session.execute(select_stmt)
       return exec_result.fetchone()
     except Exception as err:
       raise err

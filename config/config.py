@@ -1,13 +1,14 @@
-from os import getcwd
-from os.path import normpath, join
 from ipaddress import IPv4Network, IPv6Network, ip_network
+from os import getcwd
+from os.path import join, normpath
+from pathlib import Path
+from re import IGNORECASE, Pattern, compile, escape, sub
+from typing import Any, Self
+
+from dotenv import load_dotenv
 from pydantic import Field, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pathlib import Path
 from toml import load
-from dotenv import load_dotenv
-from typing import Self, List, Pattern, Dict, Any
-from re import sub, escape, compile, IGNORECASE
 
 
 class Settings(BaseSettings):
@@ -26,7 +27,7 @@ class Settings(BaseSettings):
     and routing table"""
   )
   app_debug: bool = Field(default=False)
-  app_host: str = Field(default='0.0.0.0')
+  app_host: str = Field(default='0.0.0.0')  # noqa: S104 - The container API must bind its published interfaces.
   app_port: int = Field(default=4000)
   app_log_level: str = Field(default='error')
   # Queue section
@@ -48,15 +49,12 @@ class Settings(BaseSettings):
   db_pool_timeout: int = Field(default=30)
   db_pool_size_overflow: int = Field(default=0)  # max 3+2=5
   db_tune_journal_mode: str = Field(default='WAL')  # Write-Ahead Logging - better concurrent access
-  db_tune_wal_autocheckpoint: int = Field(
-    default=1000
-  )  # Initiate a checkpoint approximately every 1000 WAL pages (choose experimentally: if WAL grows too quickly, decrease it; if checkpoints interfere, increase it)
-  db_tune_synchronous: str = Field(
-    default='NORMAL'
-  )  # NORMAL - A good balance of performance and reliability for most VDS applications. `FULL`` provides maximum reliability, but is more expensive in terms of I/O.
-  db_tune_busy_timeout: int = Field(
-    default=2000
-  )  # This is the timeout (in milliseconds) during which SQLite will retry acquiring a lock instead of immediately failing with a "database is locked" error. Defaults in SQLite to 0 (no wait).
+  # Checkpoint approximately every 1000 WAL pages; tune for WAL growth and checkpoint latency.
+  db_tune_wal_autocheckpoint: int = Field(default=1000)
+  # NORMAL balances performance and reliability; FULL provides stronger durability with more I/O.
+  db_tune_synchronous: str = Field(default='NORMAL')
+  # Milliseconds to retry acquiring a lock before reporting a locked database; SQLite defaults to zero.
+  db_tune_busy_timeout: int = Field(default=2000)
   db_tune_temp_store: str = Field(default='FILE')
   db_tune_mmap_size: int = Field(default=0)
   db_tune_cache_size: int = Field(default=-2048)
@@ -141,18 +139,18 @@ class Settings(BaseSettings):
     version: str = 'unknown'
     pyproject_toml_file = Path(join(self.root_path, 'pyproject.toml'))
     if pyproject_toml_file.exists() and pyproject_toml_file.is_file():
-      data: Dict[str, Any] = load(pyproject_toml_file)
+      data: dict[str, Any] = load(pyproject_toml_file)
       if 'project' in data and 'version' in data['project']:
         version = data['project']['version']
     return version
 
   @computed_field
   @property
-  def ip_not_allowed_list(self: Self) -> List[str]:
+  def ip_not_allowed_list(self: Self) -> list[str]:
     return [value.strip() for value in self.ip_not_allowed.split(',') if value.strip()]
 
   @property
-  def ip_not_allowed_networks(self: Self) -> List[IPv4Network | IPv6Network]:
+  def ip_not_allowed_networks(self: Self) -> list[IPv4Network | IPv6Network]:
     return [ip_network(value, strict=False) for value in self.ip_not_allowed_list]
 
   @computed_field
@@ -160,8 +158,8 @@ class Settings(BaseSettings):
   def domains_not_allowed_pattern(self: Self) -> Pattern[str] | None:
     if len(self.domains_black_list) < 1:
       return None
-    domains: List[str] = self.domains_black_list.split(',')
-    escaped_domains: List[str] = [escape(domain) for domain in domains]
+    domains: list[str] = self.domains_black_list.split(',')
+    escaped_domains: list[str] = [escape(domain) for domain in domains]
     pattern: str = r'\b(?:' + '|'.join(escaped_domains) + r')\b'
     return compile(pattern=pattern, flags=IGNORECASE)
 

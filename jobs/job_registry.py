@@ -14,18 +14,18 @@ class Jobs(StrEnum):
 
 
 class JobRegistry:
-  '''
+  """
   Stores active background jobs in the current application process.
-  '''
+  """
 
   def __init__(self: Self) -> None:
     self.__active_jobs: set[Jobs] = set()
     self.__lock: Lock = Lock()
 
   async def try_start(self: Self, job: Jobs) -> bool:
-    '''
+    """
     Atomically reserves a job. Returns False when the job is already active.
-    '''
+    """
     async with self.__lock:
       if job in self.__active_jobs:
         return False
@@ -34,9 +34,9 @@ class JobRegistry:
       return True
 
   async def finish(self: Self, job: Jobs) -> None:
-    '''
+    """
     Marks a job as inactive. It is safe to call more than once.
-    '''
+    """
     async with self.__lock:
       self.__active_jobs.discard(job)
       logger.debug(f'Job {job} finished')
@@ -46,9 +46,9 @@ class JobRegistry:
       return job in self.__active_jobs
 
   async def reset(self: Self) -> None:
-    '''
+    """
     Clears all in-memory statuses before application startup.
-    '''
+    """
     async with self.__lock:
       self.__active_jobs.clear()
       logger.debug(f'{self.__class__.__name__} reset')

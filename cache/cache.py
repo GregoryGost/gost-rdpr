@@ -1,18 +1,20 @@
-from cashews import cache
-from cashews.backends.interface import Backend
 from typing import Any, Self
 
-from logger.logger import logger
-from config.config import settings
+from cashews import cache
+from cashews.backends.interface import Backend
 
-class Cache():
-  '''
-  Async cache framework with simple API to build fast and reliable applications.  
+from config.config import settings
+from logger.logger import logger
+
+
+class Cache:
+  """
+  Async cache framework with simple API to build fast and reliable applications.
   Doc: https://github.com/Krukov/cashews
-  '''
+  """
 
   def __init__(self, prefix: str, size: int | None = None) -> None:
-    if size != None:
+    if size is not None:
       mem = f'mem://?size={size}'
     else:
       mem = 'mem://'
@@ -31,10 +33,8 @@ class Cache():
   def lock(self: Self, key: str, expire: float, wait: bool = True) -> Any:
     return self.cache.lock(key=key, expire=expire, wait=wait)
 
+
 try:
-  ripe_stat_cache: Cache = Cache(
-    'ripe_stat_cache',
-    size=settings.ripe_stat_cache_size
-  )
+  ripe_stat_cache: Cache = Cache('ripe_stat_cache', size=settings.ripe_stat_cache_size)
 except Exception as err:
   raise err

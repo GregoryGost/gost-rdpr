@@ -2890,6 +2890,145 @@ async def test_public_current_schema_upgrade_backfills_source_and_preserves_rows
 
 @pytest.mark.e2e
 @pytest.mark.parametrize('e2e_service', [False], indirect=True)
+@pytest.mark.parametrize('prefix', ['rdpr_', ''])
+async def test_public_checksum_refresh_preserves_history_and_data_across_failure_and_restart(e2e_service, prefix):
+  service = e2e_service
+  service.environment['DB_TABLE_PREFIX'] = prefix
+  refresh_name = 'migration_202618042124.py'
+  # These persisted checksums were independently verified against the previous release sources.
+  old_checksums = {
+    'migration_202511031501.py': '293ddda35db4553c0174d8ecb07902add5bb664a7137e0ce6f36a05899b83fa7',
+    'migration_202602192245.py': '8a271a80e72ba229ca6deabd4e0458bb14170f77398585a7e8e27a8eb24be8e9',
+    'migration_202618042122.py': '563a6f0d402a11b7e044b60ec29a64cf81f3216f00f3aacc5da2da82cf72e80c',
+  }
+  current_checksums = {
+    name: sha256((service.root / 'migrations' / name).read_text(encoding='utf-8').encode()).hexdigest()
+    for name in (*old_checksums, refresh_name)
+  }
+  history_query, delete_refresh, insert_history, set_old_checksum, domain_insert, ip_insert, support_insert = {
+    'rdpr_': (
+      'SELECT * FROM rdpr_migrations ORDER BY id',
+      'DELETE FROM rdpr_migrations WHERE name=?',
+      'INSERT INTO rdpr_migrations VALUES (?,?,?,?,?)',
+      'UPDATE rdpr_migrations SET checksum=?,created_at=?,applied_at=? WHERE name=?',
+      'INSERT INTO rdpr_domains (id,name,resolved,ros_comment,created_at,updated_at,last_resolved_at) '
+      'VALUES (7,?,?,?,?,?,?)',
+      'INSERT INTO rdpr_ip_records (id,domain_id,addr_type,ip_address,ros_comment,use_default_gw,created_at) '
+      'VALUES (17,7,4,?,?,1,?)',
+      'INSERT INTO rdpr_ip_supports (ip_record_id,domain_id) VALUES (17,7)',
+    ),
+    '': (
+      'SELECT * FROM migrations ORDER BY id',
+      'DELETE FROM migrations WHERE name=?',
+      'INSERT INTO migrations VALUES (?,?,?,?,?)',
+      'UPDATE migrations SET checksum=?,created_at=?,applied_at=? WHERE name=?',
+      'INSERT INTO domains (id,name,resolved,ros_comment,created_at,updated_at,last_resolved_at) '
+      'VALUES (7,?,?,?,?,?,?)',
+      'INSERT INTO ip_records (id,domain_id,addr_type,ip_address,ros_comment,use_default_gw,created_at) '
+      'VALUES (17,7,4,?,?,1,?)',
+      'INSERT INTO ip_supports (ip_record_id,domain_id) VALUES (17,7)',
+    ),
+  }[prefix]
+
+  def business_snapshot():
+    return tuple(
+      line for line in sqlite_snapshot(service.db_path) if not line.startswith(f'INSERT INTO "{prefix}migrations"')
+    )
+
+  await service.start()
+  await service.stop()
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    connection.execute(delete_refresh, (refresh_name,))
+    refreshed_ids = set()
+    for index, (name, checksum) in enumerate(old_checksums.items()):
+      created, applied = '2001-02-03 04:05:06', '2002-03-04 05:06:07'
+      connection.execute(set_old_checksum, (checksum, created, applied, name))
+      row_id = next(row[0] for row in connection.execute(history_query) if row[1] == name)
+      refreshed_ids.update((row_id, 100 + index * 10))
+      connection.executemany(
+        insert_history,
+        [
+          (100 + index * 10, name, checksum, created, applied),
+          (101 + index * 10, name, checksum, created, None),
+          (102 + index * 10, name, 'unknown-source-checksum', created, applied),
+          (103 + index * 10, name, current_checksums[name], created, applied),
+        ],
+      )
+    connection.execute(
+      insert_history,
+      (200, 'retired-migration.py', next(iter(old_checksums.values())), created, applied),
+    )
+    connection.execute(
+      domain_insert,
+      ('preserved.example.test', 1, 'domain metadata', created, applied, applied),
+    )
+    connection.execute(
+      ip_insert,
+      ('8.8.8.8', 'IP metadata', created),
+    )
+    connection.execute(support_insert)
+    old_history = connection.execute(history_query).fetchall()
+  expected_history = [
+    (*row[:2], current_checksums[row[1]], *row[3:]) if row[0] in refreshed_ids else row for row in old_history
+  ]
+  business_before = business_snapshot()
+  # A completed migration must never be imported again, even when its source checksum differs.
+  for name in old_checksums:
+    source = service.directory / 'migrations' / name
+    source.write_text(
+      source.read_text(encoding='utf-8') + '\nraise RuntimeError("completed migration was replayed")\n',
+      encoding='utf-8',
+    )
+  failure = service.directory / 'migrations' / 'migration_999999999999.py'
+  failure.write_text(
+    'from sqlalchemy import text\nasync def upgrade(conn):\n'
+    '  await conn.execute(text("CREATE TABLE incomplete_refresh (value TEXT)"))\n'
+    '  raise RuntimeError("synthetic failure after checksum refresh")\n',
+    encoding='utf-8',
+  )
+  before_failure = sqlite_snapshot(service.db_path)
+  with pytest.raises(AssertionError, match='Application exited before readiness'):
+    await service.start()
+  assert 'synthetic failure after checksum refresh' in service.diagnostics()
+  assert service.process is None
+  assert sqlite_snapshot(service.db_path) == before_failure
+  failure.unlink()
+
+  await service.start()
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    response = await client.get('/domains/7')
+    assert response.status_code == 200, response.text
+    assert response.json()['ips_v4'] == ['8.8.8.8']
+  await service.stop()
+  assert business_snapshot() == business_before
+  with closing(sqlite3.connect(service.db_path)) as connection:
+    history = connection.execute(history_query).fetchall()
+  assert [row for row in history if row[1] != refresh_name] == expected_history
+  stamps = [row for row in history if row[1] == refresh_name]
+  assert len(stamps) == 1
+  assert stamps[0][2] == current_checksums[refresh_name]
+  assert stamps[0][3] is not None
+  assert stamps[0][4] is not None
+
+  # Reapplying only the refresh must preserve already corrected and unrecognized history.
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    connection.execute(delete_refresh, (refresh_name,))
+  await service.start()
+  await service.stop()
+  assert business_snapshot() == business_before
+  with closing(sqlite3.connect(service.db_path)) as connection:
+    history = connection.execute(history_query).fetchall()
+  assert [row for row in history if row[1] != refresh_name] == expected_history
+  assert len([row for row in history if row[1] == refresh_name]) == 1
+  before_restart = sqlite_snapshot(service.db_path)
+  await service.start()
+  await service.stop()
+  assert sqlite_snapshot(service.db_path) == before_restart
+  assert service.providers.requests == []
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
 async def test_public_historical_gateway_upgrade_preserves_old_data_and_all_history(e2e_service):
   service = e2e_service
   with closing(sqlite3.connect(service.db_path)) as connection, connection:
@@ -2946,7 +3085,7 @@ async def test_public_historical_gateway_upgrade_preserves_old_data_and_all_hist
       '9.9.9.9',
       'custom',
     )
-    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations').fetchone() == (7,)
+    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations').fetchone() == (8,)
   before = sqlite_snapshot(service.db_path)
   await service.start()
   await service.stop()
@@ -2993,7 +3132,7 @@ async def test_public_legacy_import_failure_rolls_back_and_fresh_process_recover
   assert_legacy_import(service.db_path)
   with closing(sqlite3.connect(service.db_path)) as connection:
     assert connection.execute('SELECT * FROM rdpr_migrations WHERE id<=42 ORDER BY id').fetchall() == old_history
-    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations').fetchone() == (6,)
+    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations').fetchone() == (7,)
   recovered = sqlite_snapshot(service.db_path)
   await service.start()
   await service.stop()
@@ -3428,7 +3567,7 @@ async def test_startup_error_after_physical_commit_keeps_writer_stopped_and_allo
   assert startup_store.writer_state == 'FAILED'
   path = Path(app.settings.db_path)
   with closing(sqlite3.connect(path)) as connection:
-    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations WHERE applied_at IS NOT NULL').fetchone() == (4,)
+    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations WHERE applied_at IS NOT NULL').fetchone() == (5,)
     assert connection.execute('SELECT id, name FROM rdpr_domains').fetchall() == [(0, 'default')]
   committed = sqlite_snapshot(path)
   recovered = app.database.DataBase()

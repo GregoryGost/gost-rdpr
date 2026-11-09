@@ -1,25 +1,18 @@
+from collections.abc import Sequence
 from datetime import datetime
-from sqlalchemy import (
-  select,
-  func,
-  Row,
-  Select,
-  Result,
-  CheckConstraint,
-  INTEGER,
-  TIMESTAMP,
-  TEXT
-)
-from sqlalchemy.orm import Mapped, mapped_column
+from typing import Self
+
+from sqlalchemy import INTEGER, TEXT, TIMESTAMP, CheckConstraint, Result, Row, Select, func, select
 from sqlalchemy.ext.asyncio import AsyncConnection
-from typing import Self, Tuple, Sequence
+from sqlalchemy.orm import Mapped, mapped_column
 
 from .base_dbo import Dbo
 
+
 class MigrationsDbo(Dbo):
-  '''
+  """
   Migrations table
-  '''
+  """
 
   __tablename__ = 'migrations'
 
@@ -29,20 +22,13 @@ class MigrationsDbo(Dbo):
   created_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=func.now())
   applied_at: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=True)
 
-  __table_args__ = (
-    CheckConstraint("name != ''", name='name_chk'),
-  )
+  __table_args__ = (CheckConstraint("name != ''", name='name_chk'),)
 
   @classmethod
-  async def get_all(cls: type[Self], conn: AsyncConnection) -> Sequence[Row[Tuple[int, str, str, datetime]]]:
+  async def get_all(cls: type[Self], conn: AsyncConnection) -> Sequence[Row[int, str, str, datetime]]:
     try:
-      select_stmt: Select[Tuple[int, str, str, datetime]] = select(
-        cls.id,
-        cls.name,
-        cls.checksum,
-        cls.applied_at
-      )
-      exec_result: Result[Tuple[int, str, str, datetime]] = await conn.execute(select_stmt)
+      select_stmt: Select[int, str, str, datetime] = select(cls.id, cls.name, cls.checksum, cls.applied_at)
+      exec_result: Result[int, str, str, datetime] = await conn.execute(select_stmt)
       return exec_result.fetchall()
     except Exception as err:
       raise err

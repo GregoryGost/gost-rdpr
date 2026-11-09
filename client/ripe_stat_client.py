@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from ipaddress import ip_address
 from time import perf_counter
-from typing import Any, Dict, Self
+from typing import Any, Self
 
 from httpx import AsyncClient, HTTPError, Response, Timeout
 
@@ -144,7 +144,7 @@ class RipeStatClient:
       headers={'Accept': 'application/json'},
     )
 
-    payload: Dict[str, Any] = self.__get_payload(response=response)
+    payload: dict[str, Any] = self.__get_payload(response=response)
 
     if not response.is_success or payload.get('status') != 'ok':
       message: str = str(payload.get('message', response.reason_phrase))
@@ -193,7 +193,7 @@ class RipeStatClient:
     return RipeStatAddressPrefixDto(address=address, prefix=cached_prefix or None)
 
   @staticmethod
-  def __get_payload(response: Response) -> Dict[str, Any]:
+  def __get_payload(response: Response) -> dict[str, Any]:
     try:
       payload: Any = response.json()
     except ValueError as err:

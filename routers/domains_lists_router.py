@@ -1,41 +1,38 @@
-from fastapi import APIRouter, status, BackgroundTasks, Query, Path, Body
-from fastapi.responses import JSONResponse
 from time import monotonic
-from typing import Annotated, Self, List, Dict
+from typing import Annotated, ClassVar, Self
 
-from logger.logger import logger
+from fastapi import APIRouter, BackgroundTasks, Body, Path, Query, status
+from fastapi.responses import JSONResponse
+
 from database.db import db
+from logger.logger import logger
+
+# base
+from models.http.base import ErrorResp, NoDataResp, NotFoundResp, OkResp
+
+# request models
+from models.http.domains_lists_req import DomainsListsPostElementReq, DomainsListsQueryReq, DomainsListsSearchQueryReq
+
+# response models
+from models.http.domains_lists_resp import DomainsListElementResp, DomainsListsPayloadResp
 
 from .base_router import BaseRouter
 
-# base
-from models.http.base import ErrorResp, NotFoundResp, NoDataResp, OkResp
-# request models
-from models.http.domains_lists_req import DomainsListsQueryReq, DomainsListsSearchQueryReq, DomainsListsPostElementReq
-# response models
-from models.http.domains_lists_resp import DomainsListsPayloadResp, DomainsListElementResp
 
 class DomainsListsRouter(BaseRouter):
-
-  __domains_lists_post_body_examples: List[List[Dict[str, str]]] = [
+  __domains_lists_post_body_examples: ClassVar[list[list[dict[str, str]]]] = [
     [
-      {
-        'name': 'voice-domains-list',
-        'url': 'https://somedomain.som/path/path/path/voice.txt'
-      },
+      {'name': 'voice-domains-list', 'url': 'https://somedomain.som/path/path/path/voice.txt'},
       {
         'name': 'voice-domains-list-2',
         'url': 'https://somedomain.som/path/path/path/voice-2.txt',
-        'description': 'Description for some voice domains list'
-      }
+        'description': 'Description for some voice domains list',
+      },
     ]
   ]
 
   def __init__(self: Self) -> None:
-    self.router: APIRouter = APIRouter(
-      tags=[self.tags.domains_lists_tag.name],
-      prefix='/domains/lists'
-    )
+    self.router: APIRouter = APIRouter(tags=[self.tags.domains_lists_tag.name], prefix='/domains/lists')
     logger.info('DomainsListsRouter init')
 
   def get_router(self: Self) -> APIRouter:
@@ -46,12 +43,10 @@ class DomainsListsRouter(BaseRouter):
       name='Get all Domains lists',
       description='Displays all Domains lists records',
       response_model=DomainsListsPayloadResp,
-      responses={
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
-      }
+      responses={status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}},
     )
     async def get_all_domains_lists(query: Annotated[DomainsListsQueryReq, Query()]) -> JSONResponse:
-      logger.debug(f'Call API route: GET /domains/lists')
+      logger.debug('Call API route: GET /domains/lists')
       try:
         before_time: float = monotonic()
         return_data: DomainsListsPayloadResp = await db.get_all_domains_lists(
@@ -60,10 +55,10 @@ class DomainsListsRouter(BaseRouter):
           offset=query.offset,
           start_date=query.start_date,
           end_date=query.end_date,
-          attempts=query.attempts
+          attempts=query.attempts,
         )
         return JSONResponse(return_data.to_dict(), status.HTTP_200_OK)
-      except Exception as err:
+      except Exception as err:  # noqa: BLE001 - The shared API boundary logs and translates every exception.
         return self.errorResp(err)
 
     @router.get(
@@ -71,12 +66,10 @@ class DomainsListsRouter(BaseRouter):
       name='Find Domains lists by text',
       description='Find a Domains lists by text. Using fields "name" or "url"',
       response_model=DomainsListsPayloadResp,
-      responses={
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
-      }
+      responses={status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}},
     )
     async def search_domains_lists(query: Annotated[DomainsListsSearchQueryReq, Query()]) -> JSONResponse:
-      logger.debug(f'Call API route: GET /domains/lists/search')
+      logger.debug('Call API route: GET /domains/lists/search')
       try:
         before_time: float = monotonic()
         return_data: DomainsListsPayloadResp = await db.get_all_domains_lists(
@@ -86,10 +79,10 @@ class DomainsListsRouter(BaseRouter):
           start_date=query.start_date,
           end_date=query.end_date,
           search_text=query.text,
-          attempts=query.attempts
+          attempts=query.attempts,
         )
         return JSONResponse(return_data.to_dict(), status.HTTP_200_OK)
-      except Exception as err:
+      except Exception as err:  # noqa: BLE001 - The shared API boundary logs and translates every exception.
         return self.errorResp(err)
 
     @router.get(
@@ -99,8 +92,8 @@ class DomainsListsRouter(BaseRouter):
       response_model=DomainsListElementResp,
       responses={
         status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp},
-        status.HTTP_404_NOT_FOUND: {'model': NotFoundResp}
-      }
+        status.HTTP_404_NOT_FOUND: {'model': NotFoundResp},
+      },
     )
     async def get_domains_list_on_id(id: Annotated[int, Path(gt=0, title='Domains list record ID')]) -> JSONResponse:
       logger.debug(f'Call API route: GET /domains/lists/{id}')
@@ -110,7 +103,7 @@ class DomainsListsRouter(BaseRouter):
           not_found_resp: NotFoundResp = NotFoundResp(resolution=f"Domains list ID '{id}' not found in local db")
           return JSONResponse(not_found_resp.to_dict(), status.HTTP_404_NOT_FOUND)
         return JSONResponse(domains_lists_resp.to_dict(), status.HTTP_200_OK)
-      except Exception as err:
+      except Exception as err:  # noqa: BLE001 - The shared API boundary logs and translates every exception.
         return self.errorResp(err)
 
     @router.post(
@@ -120,20 +113,20 @@ class DomainsListsRouter(BaseRouter):
       response_model=OkResp,
       responses={
         status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp},
-        status.HTTP_400_BAD_REQUEST: {'model': NoDataResp}
-      }
+        status.HTTP_400_BAD_REQUEST: {'model': NoDataResp},
+      },
     )
     async def domains_lists_add(
-      data: Annotated[List[DomainsListsPostElementReq], Body(examples=self.__domains_lists_post_body_examples)],
-      background_tasks: BackgroundTasks
+      data: Annotated[list[DomainsListsPostElementReq], Body(examples=self.__domains_lists_post_body_examples)],
+      background_tasks: BackgroundTasks,
     ) -> JSONResponse:
-      logger.debug(f'Call API route: POST /domains/lists')
+      logger.debug('Call API route: POST /domains/lists')
       try:
-        if (len(data) < 1):
+        if len(data) < 1:
           return JSONResponse(NoDataResp().to_dict(), status.HTTP_400_BAD_REQUEST)
         background_tasks.add_task(db.put_add_domains_lists_to_queue, data)
         return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
-      except Exception as err:
+      except Exception as err:  # noqa: BLE001 - The shared API boundary logs and translates every exception.
         return self.errorResp(err)
 
     @router.delete(
@@ -141,19 +134,16 @@ class DomainsListsRouter(BaseRouter):
       name='Delete one Domains list',
       description='Delete one Domains list record',
       response_model=OkResp,
-      responses={
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
-      }
+      responses={status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}},
     )
     async def domains_list_delete(
-      id: Annotated[int, Path(gt=0, title='Domains list record ID')],
-      background_tasks: BackgroundTasks
+      id: Annotated[int, Path(gt=0, title='Domains list record ID')], background_tasks: BackgroundTasks
     ) -> JSONResponse:
       logger.debug(f'Call API route: DELETE /domains/lists/{id}')
       try:
         background_tasks.add_task(db.put_delete_domains_list_to_queue, id)
         return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
-      except Exception as err:
+      except Exception as err:  # noqa: BLE001 - The shared API boundary logs and translates every exception.
         return self.errorResp(err)
 
     @router.delete(
@@ -161,16 +151,14 @@ class DomainsListsRouter(BaseRouter):
       name='Delete all Domains lists records',
       description='Delete all Domains lists records',
       response_model=OkResp,
-      responses={
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}
-      }
+      responses={status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}},
     )
     async def domains_lists_delete_all(background_tasks: BackgroundTasks) -> JSONResponse:
-      logger.debug(f'Call API route: DELETE /domains/lists')
+      logger.debug('Call API route: DELETE /domains/lists')
       try:
         background_tasks.add_task(db.put_delete_domains_list_to_queue)
         return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
-      except Exception as err:
+      except Exception as err:  # noqa: BLE001 - The shared API boundary logs and translates every exception.
         return self.errorResp(err)
 
     return router

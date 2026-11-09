@@ -1,14 +1,17 @@
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from typing import Annotated, Self
 from datetime import datetime
 from enum import StrEnum
+from typing import Annotated, Self
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .base import DATE_FORMAT
+
 
 class GrowthEntity(StrEnum):
   DOMAINS = 'domains'
   LISTS = 'lists'
   IPS = 'ips'
+
 
 class GrowthGranularity(StrEnum):
   MINUTE = 'minute'
@@ -18,66 +21,70 @@ class GrowthGranularity(StrEnum):
   MONTH = 'month'
   YEAR = 'year'
 
+
 class GrowthDateField(StrEnum):
   CREATED_AT = 'created_at'
   UPDATED_AT = 'updated_at'
   LAST_RESOLVED_AT = 'last_resolved_at'
 
+
 class StatsGrowthQuery(BaseModel):
   model_config = ConfigDict(use_enum_values=True)
 
-  entity: GrowthEntity = Field(
-    description='Data entity to aggregate',
-    examples=['domains', 'lists', 'ips']
-  )
+  entity: GrowthEntity = Field(description='Data entity to aggregate', examples=['domains', 'lists', 'ips'])
   granularity: GrowthGranularity = Field(
     default=GrowthGranularity.DAY,
     description='Time grouping granularity',
-    examples=['minute', 'hour', 'day', 'week', 'month', 'year']
+    examples=['minute', 'hour', 'day', 'week', 'month', 'year'],
   )
-  start_date: Annotated[str | None, Field(
-    title='Start date',
-    description=f'Date from which you want to start sampling. Format {DATE_FORMAT!r}',
-    examples=['2024-10-01 15:00:00'],
-    min_length=19,
-    max_length=19
-  )] = None
-  end_date: Annotated[str | None, Field(
-    title='End date',
-    description=f'Date from which you want to end sampling. Format {DATE_FORMAT!r}',
-    examples=['2024-10-01 15:00:00'],
-    min_length=19,
-    max_length=19
-  )] = None
+  start_date: Annotated[
+    str | None,
+    Field(
+      title='Start date',
+      description=f'Date from which you want to start sampling. Format {DATE_FORMAT!r}',
+      examples=['2024-10-01 15:00:00'],
+      min_length=19,
+      max_length=19,
+    ),
+  ] = None
+  end_date: Annotated[
+    str | None,
+    Field(
+      title='End date',
+      description=f'Date from which you want to end sampling. Format {DATE_FORMAT!r}',
+      examples=['2024-10-01 15:00:00'],
+      min_length=19,
+      max_length=19,
+    ),
+  ] = None
   ip_subtype: int | None = Field(
-    default=None,
-    description='IP version filter, only for entity="ips". Allowed: 4 or 6',
-    examples=[4, 6]
+    default=None, description='IP version filter, only for entity="ips". Allowed: 4 or 6', examples=[4, 6]
   )
   date_filter_field: GrowthDateField = Field(
     default=GrowthDateField.CREATED_AT,
     description='Field to filter by date. "last_resolved_at" only for entity="domains"',
-    examples=['created_at', 'updated_at', 'last_resolved_at']
+    examples=['created_at', 'updated_at', 'last_resolved_at'],
   )
 
   @field_validator('start_date', mode='before')
   @classmethod
   def validate_start_date_format(cls: type[Self], value: str) -> str:
+    # The query format is timezone-free; retain the existing naive timestamp interpretation.
     try:
-      datetime.strptime(value, DATE_FORMAT)
-    except ValueError:
-      raise ValueError(f'Invalid start_date format. Expected: {DATE_FORMAT!r}')
+      datetime.strptime(value, DATE_FORMAT)  # noqa: DTZ007
+    except ValueError as exc:
+      raise ValueError(f'Invalid start_date format. Expected: {DATE_FORMAT!r}') from exc
     return value
-  
+
   @field_validator('end_date', mode='before')
   @classmethod
   def validate_end_date_format(cls: type[Self], value: str | None) -> str | None:
     if value is None:
       return value
     try:
-      datetime.strptime(value, DATE_FORMAT)
-    except ValueError:
-      raise ValueError(f'Invalid end_date format. Expected: {DATE_FORMAT!r}')
+      datetime.strptime(value, DATE_FORMAT)  # noqa: DTZ007
+    except ValueError as exc:
+      raise ValueError(f'Invalid end_date format. Expected: {DATE_FORMAT!r}') from exc
     return value
 
   @field_validator('ip_subtype', mode='before')
@@ -96,8 +103,8 @@ class StatsGrowthQuery(BaseModel):
   @model_validator(mode='after')
   def validate_date_range(self: Self) -> Self:
     if self.start_date and self.end_date:
-      start = datetime.strptime(self.start_date, DATE_FORMAT)
-      end = datetime.strptime(self.end_date, DATE_FORMAT)
+      start = datetime.strptime(self.start_date, DATE_FORMAT)  # noqa: DTZ007
+      end = datetime.strptime(self.end_date, DATE_FORMAT)  # noqa: DTZ007
       if start >= end:
         raise ValueError('start_date must be earlier than end_date')
     return self

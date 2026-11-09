@@ -27,6 +27,195 @@ pytestmark = pytest.mark.unit
 ROS_RETRY_METHODS = frozenset({'GET', 'POST', 'PATCH', 'DELETE'})
 
 
+@pytest.mark.parametrize('inside_root', [False, True])
+@pytest.mark.parametrize('branch', [False, True])
+def test_migration_coverage_merges_enrolled_copies_without_losing_contexts_or_originals(
+  tmp_path, request, inside_root, branch
+):
+  from coverage import CoverageData
+
+  root = tmp_path / 'project'
+  originals = root / 'migrations'
+  copies = (root / '.pytest_cache' if inside_root else tmp_path / 'external') / 'case' / 'migrations'
+  unregistered = tmp_path / 'unregistered' / 'migrations'
+  for directory in (originals, copies, unregistered):
+    directory.mkdir(parents=True)
+  source = 'if ready:\n  value = 1\nelse:\n  value = 2\n'
+  original = originals / 'migration_matching.py'
+  matching = copies / original.name
+  untouched_copy = unregistered / original.name
+  for path in (original, matching, untouched_copy):
+    path.write_text(source, encoding='utf-8')
+  changed_original = originals / 'migration_changed.py'
+  changed_original.write_text('pass\n', encoding='utf-8')
+  changed_copy = copies / changed_original.name
+  changed_copy.write_text('raise RuntimeError("synthetic fault")\n', encoding='utf-8')
+  deleted_copy = copies / 'migration_deleted_fault.py'
+  unexecuted = originals / 'migration_unexecuted.py'
+  unexecuted.write_text('pass\n', encoding='utf-8')
+  application = root / 'application.py'
+  application.write_text('pass\n', encoding='utf-8')
+  normalize = next(
+    plugin.normalize_migration_coverage
+    for plugin in request.config.pluginmanager.get_plugins()
+    if hasattr(plugin, 'normalize_migration_coverage')
+  )
+  data = CoverageData(basename=str(tmp_path / 'coverage-data'))
+  original_values = {(1, 2), (2, -1)} if branch else {1, 2}
+  copied_values = {(1, 4), (4, -1)} if branch else {1, 4}
+  add = data.add_arcs if branch else data.add_lines
+  read = data.arcs if branch else data.lines
+  try:
+    data.set_context('original-run')
+    add({str(original): original_values, str(application): original_values})
+    data.touch_files([str(unexecuted)])
+    data.set_context('copied-run')
+    add({str(path): copied_values for path in (matching, changed_copy, deleted_copy, untouched_copy)})
+    contexts = data.measured_contexts()
+    normalize(data, root, {copies})
+
+    assert data.has_arcs() == branch
+    assert data.measured_contexts() == contexts
+    assert data.measured_files() == {str(original), str(application), str(unexecuted), str(untouched_copy)}
+    assert set(read(str(original))) == original_values | copied_values
+    assert set(read(str(application))) == original_values
+    assert set(read(str(untouched_copy))) == copied_values
+    assert read(str(unexecuted)) == []
+    data.set_query_context('original-run')
+    assert set(read(str(original))) == original_values
+    data.set_query_context('copied-run')
+    assert set(read(str(original))) == copied_values
+    assert read(str(application)) == []
+    data.set_query_contexts(None)
+    # Repeated normalization must leave both the measurements and their contexts intact.
+    normalize(data, root, {copies})
+    assert set(read(str(original))) == original_values | copied_values
+    assert data.measured_contexts() == contexts
+  finally:
+    data.close()
+
+
+@pytest.mark.parametrize('model_name', ['pagination', 'statistics'])
+@pytest.mark.parametrize(
+  'dates',
+  [
+    {},
+    {'start_date': '2024-02-29 00:00:00'},
+    {'end_date': '2024-03-01 00:00:00'},
+    {'start_date': '2024-02-29 23:59:59', 'end_date': '2024-03-01 00:00:00'},
+  ],
+)
+async def test_date_query_preserves_optional_filters_and_ordered_leap_day(app, model_name, dates):
+  if model_name == 'pagination':
+    model = importlib.import_module('models.http.base').LimitOffsetQuery
+    query = model(**dates)
+  else:
+    model = importlib.import_module('models.http.statistics_req').StatsGrowthQuery
+    query = model(entity='domains', **dates)
+  assert query.start_date == dates.get('start_date')
+  assert query.end_date == dates.get('end_date')
+
+
+@pytest.mark.parametrize('model_name', ['pagination', 'statistics'])
+@pytest.mark.parametrize(
+  ('dates', 'message'),
+  [
+    ({'start_date': '2023-02-29 00:00:00'}, 'Invalid start_date format'),
+    ({'end_date': '2024-04-31 00:00:00'}, 'Invalid end_date format'),
+    ({'start_date': '2024/02/29 00:00:00'}, 'Invalid start_date format'),
+    ({'end_date': '2024-02-29 25:00:00'}, 'Invalid end_date format'),
+    ({'start_date': '2024-03-01 00:00:00', 'end_date': '2024-03-01 00:00:00'}, 'start_date must'),
+    ({'start_date': '2024-03-01 00:00:01', 'end_date': '2024-03-01 00:00:00'}, 'start_date must'),
+  ],
+)
+async def test_date_query_rejects_invalid_calendar_format_and_nonincreasing_range(app, model_name, dates, message):
+  from pydantic import ValidationError
+
+  if model_name == 'pagination':
+    model = importlib.import_module('models.http.base').LimitOffsetQuery
+    values = dates
+  else:
+    model = importlib.import_module('models.http.statistics_req').StatsGrowthQuery
+    values = {'entity': 'domains', **dates}
+  with pytest.raises(ValidationError, match=message):
+    model(**values)
+
+
+@pytest.mark.parametrize('configured', [False, True])
+async def test_router_update_completes_reads_and_releases_job_after_worker_exit(app, monkeypatch, configured):
+  from threading import Event
+
+  module = importlib.import_module('client.ros_updater_client')
+  dto = importlib.import_module('models.dto.ros_config_dto')
+  jobs = importlib.import_module('jobs.job_registry')
+  config = dto.RosConfigDto(1, 'router.example.test', 'test-user', 'test-password', 'test-routes')
+  boundary = SimpleNamespace(
+    get_all_configs_for_ros_update=AsyncMock(return_value=[config] if configured else []),
+    get_all_ips_for_update=AsyncMock(return_value=[]),
+  )
+  registry = jobs.JobRegistry()
+  entered, release = asyncio.Event(), asyncio.Event()
+  requests = []
+
+  async def upstream(request):
+    requests.append((request.method, request.url.path))
+    if request.url.path == '/rest/system/resource':
+      entered.set()
+      await release.wait()
+      payload = {}
+    elif request.url.path == '/rest/routing/table/print':
+      payload = [{'.id': '*1', 'name': 'test-routes'}]
+    elif request.url.path == '/rest/ip/route/print' and b'active=true' in request.content:
+      payload = [{'gateway': '192.0.2.1', 'routing-table': 'main', 'immediate-gw': '192.0.2.1%WAN'}]
+    else:
+      payload = []
+    return httpx.Response(200, json=payload)
+
+  instance = module.RosClient()
+  monkeypatch.setattr(module, 'db', boundary)
+  monkeypatch.setattr(module, 'job_registry', registry)
+  monkeypatch.setattr(instance, '_RosClient__client', app.make_http(upstream))
+  monkeypatch.setattr(instance, 'update_ros_queue', asyncio.Queue(maxsize=1))
+  monkeypatch.setattr(instance, '_RosClient__stop_update_ros_event', Event())
+  monkeypatch.setattr(instance, '_RosClient__queue_get_timeout', 0.01)
+  monkeypatch.setattr(instance, '_RosClient__queue_sleep_timeout', 0)
+  before = asyncio.all_tasks()
+  assert await registry.try_start(jobs.Jobs.ROS_UPDATE)
+  operation = asyncio.create_task(instance.update(addr_type=4))
+  try:
+    if configured:
+      await asyncio.wait_for(entered.wait(), timeout=1)
+      gc.collect()
+      assert await registry.is_active(jobs.Jobs.ROS_UPDATE)
+      assert not operation.done()
+      release.set()
+    await asyncio.wait_for(operation, timeout=1)
+    workers = [task for task in asyncio.all_tasks() - before if task is not asyncio.current_task()]
+    if workers:
+      await asyncio.wait_for(asyncio.gather(*workers), timeout=1)
+    assert not await registry.is_active(jobs.Jobs.ROS_UPDATE)
+    assert instance.update_ros_queue.empty()
+    if configured:
+      assert requests == [
+        ('GET', '/rest/system/resource'),
+        ('POST', '/rest/ip/route/print'),
+        ('POST', '/rest/routing/table/print'),
+        ('POST', '/rest/ip/firewall/address-list/print'),
+        ('POST', '/rest/ip/route/print'),
+        ('POST', '/rest/ipv6/route/print'),
+      ]
+      boundary.get_all_ips_for_update.assert_awaited_once_with(addr_type=4)
+    else:
+      assert requests == []
+      boundary.get_all_ips_for_update.assert_not_awaited()
+  finally:
+    release.set()
+    owned = asyncio.all_tasks() - before
+    for task in owned:
+      task.cancel()
+    await asyncio.gather(*owned, return_exceptions=True)
+
+
 async def scheduling_turn():
   """Allow scheduled owners to progress without a wall-clock delay."""
   reached = asyncio.Event()

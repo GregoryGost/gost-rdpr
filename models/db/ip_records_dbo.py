@@ -1,6 +1,7 @@
-from datetime import datetime
+from collections.abc import Sequence
+from datetime import UTC, datetime
 from itertools import batched
-from typing import Any, List, Optional, Self, Sequence, Tuple
+from typing import Any, Self
 
 from sqlalchemy import (
   BOOLEAN,
@@ -42,16 +43,16 @@ class IpRecordsDbo(Dbo):
   __tablename__ = 'ip_records'
 
   id: Mapped[int] = mapped_column(INTEGER, primary_key=True, autoincrement=True, nullable=False)
-  ip_list_id: Mapped[Optional[int]] = mapped_column(INTEGER, index=True, nullable=True)
-  domain_id: Mapped[Optional[int]] = mapped_column(INTEGER, index=True, nullable=True)
+  ip_list_id: Mapped[int | None] = mapped_column(INTEGER, index=True, nullable=True)
+  domain_id: Mapped[int | None] = mapped_column(INTEGER, index=True, nullable=True)
 
   addr_type: Mapped[int] = mapped_column(INTEGER, nullable=False)
   ip_address: Mapped[str] = mapped_column(TEXT, unique=True, index=True, nullable=False)
-  ros_comment: Mapped[Optional[str]] = mapped_column(TEXT, nullable=True)
+  ros_comment: Mapped[str | None] = mapped_column(TEXT, nullable=True)
   use_default_gw: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False, server_default=text('0'))
 
   created_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=func.now())
-  updated_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP, onupdate=func.now(), nullable=True)
+  updated_at: Mapped[datetime | None] = mapped_column(TIMESTAMP, onupdate=func.now(), nullable=True)
 
   __table_args__ = (
     CheckConstraint("ip_address != ''", name='ip_address_chk'),
@@ -68,17 +69,15 @@ class IpRecordsDbo(Dbo):
     db_session: AsyncSession,
     limit: int,
     offset: int,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    search_text: Optional[str] = None,
-    addr_type: Optional[int] = None,
-    use_default_gw: Optional[bool] = None,
-  ) -> Sequence[
-    Row[Tuple[int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None]]
-  ]:
+    start_date: str | None = None,
+    end_date: str | None = None,
+    search_text: str | None = None,
+    addr_type: int | None = None,
+    use_default_gw: bool | None = None,
+  ) -> Sequence[Row[int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None]]:
     try:
       select_stmt: Select[
-        Tuple[int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None]
+        int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None
       ] = (
         select(
           cls.id,
@@ -96,21 +95,21 @@ class IpRecordsDbo(Dbo):
         .join(IpsListsDbo, IpsListsDbo.id == cls.ip_list_id, isouter=True)
         .join(DomainsDbo, DomainsDbo.id == cls.domain_id, isouter=True)
       )
-      if use_default_gw != None:
+      if use_default_gw is not None:
         select_stmt = select_stmt.where(cls.use_default_gw == use_default_gw)
-      if addr_type != None:
+      if addr_type is not None:
         select_stmt = select_stmt.where(cls.addr_type == addr_type)
-      if start_date != None:
+      if start_date is not None:
         select_stmt = select_stmt.where(cls.created_at >= start_date)
-      if end_date != None:
+      if end_date is not None:
         select_stmt = select_stmt.where(cls.created_at <= end_date)
-      if search_text != None:
+      if search_text is not None:
         select_stmt = select_stmt.where(cls.ip_address.contains(search_text))
       select_limit_stmt: Select[
-        Tuple[int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None]
+        int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None
       ] = select_stmt.limit(limit).offset(offset)
       result: Result[
-        Tuple[int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None]
+        int, int | None, str, int | None, str, int, str, str | None, bool, datetime, datetime | None
       ] = await db_session.execute(select_limit_stmt)
       #
       return result.fetchall()
@@ -120,15 +119,15 @@ class IpRecordsDbo(Dbo):
   @classmethod
   async def get_ips_on_domain_id(
     cls: type[Self], db_session: AsyncSession, domain_id: int
-  ) -> Tuple[List[str], List[str]]:
+  ) -> tuple[list[str], list[str]]:
     try:
-      select_stmt: Select[Tuple[str, int]] = select(cls.ip_address, cls.addr_type).where(
+      select_stmt: Select[str, int] = select(cls.ip_address, cls.addr_type).where(
         cls.id.in_(select(IpSupportDbo.ip_record_id).where(IpSupportDbo.domain_id == domain_id))
       )
-      exec_result: Result[Tuple[str, int]] = await db_session.execute(select_stmt)
-      result: Sequence[Row[Tuple[str, int]]] = exec_result.fetchall()
-      ip_addr_v4: List[str] = [ip.ip_address for ip in result if ip.addr_type == 4]
-      ip_addr_v6: List[str] = [ip.ip_address for ip in result if ip.addr_type == 6]
+      exec_result: Result[str, int] = await db_session.execute(select_stmt)
+      result: Sequence[Row[str, int]] = exec_result.fetchall()
+      ip_addr_v4: list[str] = [ip.ip_address for ip in result if ip.addr_type == 4]
+      ip_addr_v6: list[str] = [ip.ip_address for ip in result if ip.addr_type == 6]
       return ip_addr_v4, ip_addr_v6
     except Exception as err:
       raise err
@@ -158,17 +157,17 @@ class IpRecordsDbo(Dbo):
     return result
 
   @classmethod
-  async def get_total_ips_on_ips_list(cls: type[Self], db_session: AsyncSession, ip_list_id: int) -> Tuple[int, int]:
+  async def get_total_ips_on_ips_list(cls: type[Self], db_session: AsyncSession, ip_list_id: int) -> tuple[int, int]:
     try:
       ip_v4_count: int = 0
       ip_v6_count: int = 0
-      select_stmt: Select[Tuple[int, int]] = (
+      select_stmt: Select[int, int] = (
         select(cls.addr_type, func.count())
         .where(cls.id.in_(select(IpSupportDbo.ip_record_id).where(IpSupportDbo.ip_list_id == ip_list_id)))
         .group_by(cls.addr_type)
       )
       exec_result = await db_session.execute(select_stmt)
-      result: Sequence[Row[Tuple[int, int]]] = exec_result.fetchall()
+      result: Sequence[Row[int, int]] = exec_result.fetchall()
       for type, count in result:
         if type == 4:
           ip_v4_count += count
@@ -181,10 +180,10 @@ class IpRecordsDbo(Dbo):
   @classmethod
   async def get_on_id(
     cls: type[Self], db_session: AsyncSession, id: int
-  ) -> Row[Tuple[int, int | None, str, int | None, str, str, int, str | None, bool, datetime, datetime | None]] | None:
+  ) -> Row[int, int | None, str, int | None, str, str, int, str | None, bool, datetime, datetime | None] | None:
     try:
       select_stmt: Select[
-        Tuple[int, int | None, str, int | None, str, str, int, str | None, bool, datetime, datetime | None]
+        int, int | None, str, int | None, str, str, int, str | None, bool, datetime, datetime | None
       ] = (
         select(
           cls.id,
@@ -204,20 +203,20 @@ class IpRecordsDbo(Dbo):
         .join(DomainsDbo, DomainsDbo.id == cls.domain_id, isouter=True)
       )
       exec_result: Result[
-        Tuple[int, int | None, str, int | None, str, str, int, str | None, bool, datetime, datetime | None]
+        int, int | None, str, int | None, str, str, int, str | None, bool, datetime, datetime | None
       ] = await db_session.execute(select_stmt)
       result: (
-        Row[Tuple[int, int | None, str, int | None, str, str, int, str | None, bool, datetime, datetime | None]] | None
+        Row[int, int | None, str, int | None, str, str, int, str | None, bool, datetime, datetime | None] | None
       ) = exec_result.fetchone()
       return result
     except Exception as err:
       raise err
 
   @classmethod
-  async def get_all_ids_and_addresses(cls: type[Self], db_session: AsyncSession) -> Sequence[Row[Tuple[int, str]]]:
+  async def get_all_ids_and_addresses(cls: type[Self], db_session: AsyncSession) -> Sequence[Row[int, str]]:
     try:
-      select_stmt: Select[Tuple[int, str]] = select(cls.id, cls.ip_address).order_by(cls.id)
-      result: Result[Tuple[int, str]] = await db_session.execute(select_stmt)
+      select_stmt: Select[int, str] = select(cls.id, cls.ip_address).order_by(cls.id)
+      result: Result[int, str] = await db_session.execute(select_stmt)
       return result.fetchall()
     except Exception as err:
       raise err
@@ -225,26 +224,24 @@ class IpRecordsDbo(Dbo):
   @classmethod
   async def get_ips_on_domain_id_extend(
     cls: type[Self], db_session: AsyncSession, domain_id: int
-  ) -> Sequence[Row[Tuple[int, str, int]]]:
+  ) -> Sequence[Row[int, str, int]]:
     try:
-      select_stmt: Select[Tuple[int, str, int]] = select(cls.id, cls.ip_address, cls.addr_type).where(
+      select_stmt: Select[int, str, int] = select(cls.id, cls.ip_address, cls.addr_type).where(
         cls.id.in_(select(IpSupportDbo.ip_record_id).where(IpSupportDbo.domain_id == domain_id))
       )
-      exec_result: Result[Tuple[int, str, int]] = await db_session.execute(select_stmt)
-      result: Sequence[Row[Tuple[int, str, int]]] = exec_result.fetchall()
+      exec_result: Result[int, str, int] = await db_session.execute(select_stmt)
+      result: Sequence[Row[int, str, int]] = exec_result.fetchall()
       return result
     except Exception as err:
       raise err
 
   @classmethod
-  async def get_all_on_ips_list(
-    cls: type[Self], db_session: AsyncSession, ip_list_id: int
-  ) -> Sequence[Row[Tuple[int, str]]]:
+  async def get_all_on_ips_list(cls: type[Self], db_session: AsyncSession, ip_list_id: int) -> Sequence[Row[int, str]]:
     try:
-      select_stmt: Select[Tuple[int, str]] = select(cls.id, cls.ip_address).where(
+      select_stmt: Select[int, str] = select(cls.id, cls.ip_address).where(
         cls.id.in_(select(IpSupportDbo.ip_record_id).where(IpSupportDbo.ip_list_id == ip_list_id))
       )
-      result: Result[Tuple[int, str]] = await db_session.execute(select_stmt)
+      result: Result[int, str] = await db_session.execute(select_stmt)
       #
       return result.fetchall()
     except Exception as err:
@@ -253,24 +250,24 @@ class IpRecordsDbo(Dbo):
   @classmethod
   async def get_all_for_update(
     cls: type[Self], db_session: AsyncSession, addr_type: int | None = None
-  ) -> Sequence[Row[Tuple[str, str, bool, int]]]:
+  ) -> Sequence[Row[str, str, bool, int]]:
     try:
-      select_stmt: Select[Tuple[str, str, bool, int]] = select(
+      select_stmt: Select[str, str, bool, int] = select(
         cls.ip_address,
         func.coalesce(cls.ros_comment, DomainsDbo.ros_comment, DomainsDbo.name).label('comment'),
         cls.use_default_gw,
         cls.addr_type,
       ).join(DomainsDbo, DomainsDbo.id == cls.domain_id, isouter=True)
-      if addr_type != None:
+      if addr_type is not None:
         select_stmt = select_stmt.where(cls.addr_type == addr_type)
-      result: Result[Tuple[str, str, bool, int]] = await db_session.execute(select_stmt)
+      result: Result[str, str, bool, int] = await db_session.execute(select_stmt)
       #
       return result.fetchall()
     except Exception as err:
       raise err
 
   @classmethod
-  async def get_stats(cls: type[Self], db_session: AsyncSession) -> Row[Tuple[int, int, int, int, int, int, Any]]:
+  async def get_stats(cls: type[Self], db_session: AsyncSession) -> Row[int, int, int, int, int, int, Any]:
     try:
       #
       # CTE 1
@@ -338,7 +335,7 @@ class IpRecordsDbo(Dbo):
       #
       # Final select
       #
-      select_stmt: Select[Tuple[int, int, int, int, int, int, Any]] = select(
+      select_stmt: Select[int, int, int, int, int, int, Any] = select(
         ip_stats_cte.c.total,
         ip_stats_cte.c.v4_total,
         ip_stats_cte.c.v6_total,
@@ -347,7 +344,7 @@ class IpRecordsDbo(Dbo):
         lists_total_scalar.label('lists_total'),
         per_list_json_scalar.label('per_list'),
       )
-      exec_result: Result[Tuple[int, int, int, int, int, int, Any]] = await db_session.execute(select_stmt)
+      exec_result: Result[int, int, int, int, int, int, Any] = await db_session.execute(select_stmt)
       return exec_result.one()
     except Exception as err:
       raise err
@@ -360,13 +357,13 @@ class IpRecordsDbo(Dbo):
     date_field: GrowthDateField,
     start_date: str | None = None,
     end_date: str | None = None,
-  ) -> Sequence[Row[Tuple[str, int]]]:
+  ) -> Sequence[Row[str, int]]:
     try:
       date_col: InstrumentedAttribute = getattr(cls, date_field)
       col_nullable: bool = sa_inspect(cls).columns[date_field].nullable
-      now: datetime = datetime.now()
-      start_dt: datetime = datetime.strptime(start_date, DATE_FORMAT) if start_date else now
-      end_dt: datetime = datetime.strptime(end_date, DATE_FORMAT) if end_date else now
+      now: datetime = datetime.now(UTC).astimezone().replace(tzinfo=None)
+      start_dt: datetime = datetime.strptime(start_date, DATE_FORMAT) if start_date else now  # noqa: DTZ007 - SQL uses naive timestamps.
+      end_dt: datetime = datetime.strptime(end_date, DATE_FORMAT) if end_date else now  # noqa: DTZ007 - SQL uses naive timestamps.
       raw_fmt, label_fmt, step = GRANULARITY_FORMAT[granularity]
       start_raw: str = start_dt.strftime(raw_fmt)
       end_raw: str = end_dt.strftime(raw_fmt)
@@ -384,7 +381,7 @@ class IpRecordsDbo(Dbo):
       # CTE 2
       #
       date_expr = func.strftime(label_fmt, date_col)
-      counts_stmt: Select[Tuple[Any, int]] = (
+      counts_stmt: Select[Any, int] = (
         select(date_expr.label('date_label'), func.count(cls.id).label('cnt'))
         .where(date_col >= start_dt)
         .where(date_col <= end_dt)
@@ -397,7 +394,7 @@ class IpRecordsDbo(Dbo):
       # Final: LEFT JOIN date series with domain counts
       #
       date_label_expr = func.strftime(label_fmt, date_series_cte.c.d)
-      select_stmt: Select[Tuple[str, int]] = (
+      select_stmt: Select[str, int] = (
         select(date_label_expr.label('date'), func.coalesce(ips_counts_cte.c.cnt, 0).label('count'))
         .outerjoin(
           ips_counts_cte,
@@ -406,7 +403,7 @@ class IpRecordsDbo(Dbo):
         .order_by(date_series_cte.c.d)
       )
       #
-      exec_result: Result[Tuple[str, int]] = await db_session.execute(select_stmt)
+      exec_result: Result[str, int] = await db_session.execute(select_stmt)
       return exec_result.all()
     except Exception as err:
       raise err

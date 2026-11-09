@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+
 @dataclass
 class RosFirewallIpAddDto:
   ip_address: str

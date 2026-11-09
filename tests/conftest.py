@@ -67,7 +67,8 @@ def normalize_migration_coverage(data, root, directories):
   paths = {}
   for filename in data.measured_files():
     source = Path(filename).resolve()
-    if source.is_relative_to(root) or source.parent not in directories:
+    # Fixture migration copies can also live under the repository with an explicit --basetemp.
+    if source.parent not in directories:
       paths[filename] = filename
       continue
     original = root / 'migrations' / source.name
