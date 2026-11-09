@@ -506,12 +506,12 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
   each endpoint's resolver is reused within that scope. DNS response caching remains disabled pending evidence of
   useful TTLs and repeated queries.
 - Saving resolution: one lifespan-owned coordinator shares a fixed pool limited by
-  `domains_resolve_worker_limit` (default `4`) across automatic NEW/STALE and explicit stored-ID operations.
+  `domains_resolve_worker_limit` (default `32`) across automatic NEW/STALE and explicit stored-ID operations.
   Accepted NEW demand pauses subsequent STALE dispatch; started STALE work finishes. Repeated NEW triggers coalesce
   into one pending successor, captured after the current NEW list finishes processing/admission without commit drain.
   Each accepted explicit request gets a fresh priority operation, serialized per ID through
   known writer outcome. Automatic passes use full finite lightweight snapshots, not the legacy 500/2000 total caps.
-  `domains_resolve_semaphore_limit` (default `20`) independently bounds classic DNS/DoH A/CNAME operations across all
+  `domains_resolve_semaphore_limit` (default `64`) independently bounds classic DNS/DoH A/CNAME operations across all
   entrypoints. Checks without saving bypass saving coordination. Both limits and `queue_max_size` must be positive.
   Explicit unstarted admission and writer queues apply backpressure. Heavy results/tasks are created lazily.
   Token ownership and generation/actual-attempt evidence survive SELECT/adoption and cancellation cleanup;

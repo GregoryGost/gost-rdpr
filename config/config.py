@@ -30,7 +30,7 @@ class Settings(BaseSettings):
   app_port: int = Field(default=4000)
   app_log_level: str = Field(default='error')
   # Queue section
-  queue_max_size: int = Field(default=1000, gt=0)
+  queue_max_size: int = Field(default=10000, gt=0)
   queue_get_timeout: float = Field(default=0.1)
   queue_sleep_timeout: float = Field(default=0.01)
   resolve_domains_log_every: int = Field(default=10)
@@ -41,7 +41,7 @@ class Settings(BaseSettings):
   db_file_name: str = Field(default='rdpr-db.sqlite')
   db_table_prefix: str = Field(default='rdpr_')
   db_save_batch_size: int = Field(default=1000)  # for while task save to db
-  db_save_batch_timeout: float = Field(default=5.0)  # 5 sec // recomend time.monotonic()
+  db_save_batch_timeout: float = Field(default=0.1)  # Flush partial batches after this many idle seconds.
   db_shutdown_timeout: float = Field(default=20.0, gt=0)
   db_pool_size: int = Field(default=5)
   db_pool_recycle: int = Field(default=1500)
@@ -74,8 +74,8 @@ class Settings(BaseSettings):
   req_timeout_read: float = Field(default=30.0, gt=0, allow_inf_nan=False)
   req_timeout_write: float | None = Field(default=None, gt=0, allow_inf_nan=False)
   req_timeout_pool: float | None = Field(default=None, gt=0, allow_inf_nan=False)
-  req_max_connections: int = Field(default=5, gt=0)
-  req_max_keepalive_connections: int = Field(default=30, ge=0)
+  req_max_connections: int = Field(default=32, gt=0)
+  req_max_keepalive_connections: int = Field(default=32, ge=0)
   req_ssl_verify: bool = Field(default=True)
   # DNS and DoH operation budgets include resource admission and response reads.
   dns_timeout: float = Field(default=2.0, gt=0, allow_inf_nan=False)
@@ -95,8 +95,8 @@ class Settings(BaseSettings):
   domains_update_interval: int = Field(default=172800)  # default 2 days
   domains_resolve_new_batch_size: int = Field(default=500)
   domains_resolve_stale_batch_size: int = Field(default=2000)
-  domains_resolve_worker_limit: int = Field(default=4, gt=0)
-  domains_resolve_semaphore_limit: int = Field(default=20, gt=0)
+  domains_resolve_worker_limit: int = Field(default=32, gt=0)
+  domains_resolve_semaphore_limit: int = Field(default=64, gt=0)
   domains_black_list: str = Field(default='')
   # Lists section
   lists_update_interval_sec: int = Field(default=604800)  # default 7 days
@@ -122,7 +122,7 @@ class Settings(BaseSettings):
   ros_rest_api_pool_timeout: float | None = Field(default=None, gt=0, allow_inf_nan=False)
   # RIPE
   ripe_stat_base_url: str = Field(default='https://stat.ripe.net')
-  ripe_stat_requests_semaphore_limit: int = Field(default=5, gt=0)
+  ripe_stat_requests_semaphore_limit: int = Field(default=16, gt=0)
   ripe_stat_timeout_connect: float = Field(default=3.0, gt=0, allow_inf_nan=False)
   ripe_stat_timeout_read: float = Field(default=5.0, gt=0, allow_inf_nan=False)
   ripe_stat_timeout_write: float = Field(default=3.0, gt=0, allow_inf_nan=False)

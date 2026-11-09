@@ -59,7 +59,7 @@ Available environment variables
 | `APP_HOST` | str | `0.0.0.0` | Listen on IP addr. `0.0.0.0` - Listen on all IP addresses |
 | `APP_PORT` | int | `4000` | Listen on TCP/IP specific port |
 | `APP_LOG_LEVEL` | str | `error` | Application level logging |
-| `QUEUE_MAX_SIZE` | int | `1000` | Positive writer queue capacity and maximum accepted, unstarted explicit domain operations; admission waits when full |
+| `QUEUE_MAX_SIZE` | int | `10000` | Positive capacity of each writer and RouterOS queue, and maximum accepted, unstarted explicit domain operations; producers wait when full |
 | `QUEUE_GET_TIMEOUT` | float | `0.1` | Maximum waiting time for a queue entry. 0.1s = 100ms |
 | `QUEUE_SLEEP_TIMEOUT` | float | `0.01` | The maximum wait time while the queue is empty. At the same time, the infinite loop should allow the scheduler to integrate other tasks into the overall flow. 0.01s = 10ms |
 | `RESOLVE_DOMAINS_LOG_EVERY` | int | `10` | Specifies the number of messages that will be logged during domain resolution. Distributes the total volume of domains to resolve among this number |
@@ -69,7 +69,7 @@ Available environment variables
 | `DB_FILE_NAME` | str | `rdpr-db.sqlite` | Database file name |
 | `DB_TABLE_PREFIX` | str | `rdpr_` | Prefix for database table names |
 | `DB_SAVE_BATCH_SIZE` | int | `1000` | Maximum queued commands in one writer transaction; independent of domain scan membership and IP row count |
-| `DB_SAVE_BATCH_TIMEOUT` | float | `5.0` | Maximum idle time in seconds between commands received by the writer from its queue; each received command restarts the timer |
+| `DB_SAVE_BATCH_TIMEOUT` | float | `0.1` | Maximum idle time in seconds between commands received by the writer from its queue; each received command restarts the timer |
 | `DB_SHUTDOWN_TIMEOUT` | float | `20.0` | Time in seconds to wait for the database writer during shutdown. Expiry reports unresolved writes; it does not imply a successful drain |
 | `DB_TUNE_JOURNAL_MODE` | str | `WAL` | SQLite journal mode: `WAL`, `DELETE`, `TRUNCATE`, `PERSIST` or `MEMORY`. `OFF` is rejected because transactions require rollback support |
 | `DB_TUNE_WAL_AUTOCHECKPOINT` | int | `1000` | Initiate a checkpoint approximately every 1000 WAL pages (choose experimentally: if WAL grows too quickly, decrease it; if checkpoints interfere, increase it) |
@@ -94,8 +94,8 @@ Available environment variables
 | `REQ_TIMEOUT_READ` | float | `30.0` | Individual timeout for `read` |
 | `REQ_TIMEOUT_WRITE` | float or null | `None` | HTTP write timeout; unset values inherit `REQ_TIMEOUT_DEFAULT` |
 | `REQ_TIMEOUT_POOL` | float or null | `None` | Pool-slot acquisition timeout; unset values inherit `REQ_TIMEOUT_DEFAULT` |
-| `REQ_MAX_CONNECTIONS` | int | `5` | Maximum open connections in each named client's transport pool |
-| `REQ_MAX_KEEPALIVE_CONNECTIONS` | int | `30` | Maximum idle connections per named pool, capped by `REQ_MAX_CONNECTIONS` |
+| `REQ_MAX_CONNECTIONS` | int | `32` | Maximum open connections in each named client's transport pool |
+| `REQ_MAX_KEEPALIVE_CONNECTIONS` | int | `32` | Maximum idle connections per named pool, capped by `REQ_MAX_CONNECTIONS` |
 | `REQ_SSL_VERIFY` | bool | `True` | When making a request over HTTPS, HTTPX needs to verify the identity of the requested host. To do this, it uses a bundle of SSL certificates (a.k.a. CA bundle) delivered by a trusted certificate authority (CA). You can disable SSL verification completely and allow insecure requests |
 | `REQ_DEFAULT_LIMIT` | int | `100` | Maximum number of records returned by a paginated API request |
 | `DNS_TIMEOUT` | float | `2.0` | Time in seconds for one ordinary DNS server response |
@@ -110,8 +110,8 @@ Available environment variables
 | `DOH_OPERATION_TIMEOUT` | float | `10.0` | Total budget for one DoH A or CNAME operation, including semaphore, pool, retry and response-body waits |
 | `DOMAINS_FILTERED_MIN_LEN` | int | `3` | The minimum domain length required to save it to the database. This is necessary to filter out empty domains that, for some reason, are generated in MikroTik scripts |
 | `DOMAINS_UPDATE_INTERVAL` | int | `172800` | Seconds after a complete resolution checkpoint before automatic stale eligibility; explicit saved-ID requests bypass this interval |
-| `DOMAINS_RESOLVE_WORKER_LIMIT` | int | `4` | Positive shared maximum of saving domain operations in DNS, preparation or writer admission across new, stale and explicit requests |
-| `DOMAINS_RESOLVE_SEMAPHORE_LIMIT` | int | `20` | Positive shared limit of concurrent classic DNS and DoH A/CNAME operations, including single-domain checks |
+| `DOMAINS_RESOLVE_WORKER_LIMIT` | int | `32` | Positive shared maximum of saving domain operations in DNS, preparation or writer admission across new, stale and explicit requests |
+| `DOMAINS_RESOLVE_SEMAPHORE_LIMIT` | int | `64` | Positive shared limit of concurrent classic DNS and DoH A/CNAME operations, including single-domain checks |
 | `DOMAINS_RESOLVE_NEW_BATCH_SIZE` | int | `500` | Legacy setting retained for configuration compatibility; automatic NEW scans now select their complete finite membership |
 | `DOMAINS_RESOLVE_STALE_BATCH_SIZE` | int | `2000` | Legacy setting retained for configuration compatibility; automatic STALE scans now select their complete finite membership |
 | `DOMAINS_BLACK_LIST` | str | `None` | Domains that should not be included in the database. Comma-separated list |
@@ -129,7 +129,7 @@ Available environment variables
 | `RIPE_STAT_CONNECTION_RETRIES` | int | `1` | Maximum additional RIPEstat HTTP attempts within the lookup budget |
 | `RIPE_STAT_RETRY_TOTAL_TIMEOUT` | float | `1.0` | Maximum cumulative RIPEstat retry sleep |
 | `RIPE_STAT_OPERATION_TIMEOUT` | float | `10.0` | Total budget for one prefix lookup, including cache, cache-lock, retry and response-body waits; resolver lookups also include semaphore admission |
-| `RIPE_STAT_REQUESTS_SEMAPHORE_LIMIT` | int | `5` | Maximum number of concurrent RIPEstat prefix lookups during domain resolving |
+| `RIPE_STAT_REQUESTS_SEMAPHORE_LIMIT` | int | `16` | Maximum number of concurrent RIPEstat prefix lookups during domain resolving |
 | `RIPE_STAT_CACHE_SIZE` | int | `10000` | Maximum number of RIPEstat prefix records in the in-memory cache |
 | `RIPE_STAT_PREFIX_CACHE_TTL_SEC` | int | `28800` | TTL in seconds for a RIPEstat result with a prefix |
 | `RIPE_STAT_EMPTY_PREFIX_CACHE_TTL_SEC` | int | `3600` | TTL in seconds for a RIPEstat result without a prefix |
@@ -139,7 +139,7 @@ Available environment variables
 
 `HttpClient` owns one reusable client and transport pool per name. Connection limits are passed to the base
 `AsyncHTTPTransport`; they do not limit requests per second or all clients together. With the defaults, each pool
-allows five open connections and at most five idle connections, despite the configured idle limit of thirty.
+allows 32 open connections and at most 32 idle connections.
 HTTPX retains its five-second idle connection expiry.
 
 `RetryTransport` is the only automatic retry owner; native transport retries are disabled. Ordinary clients retry
@@ -264,6 +264,13 @@ One application-owned coordinator shares `DOMAINS_RESOLVE_WORKER_LIMIT` workers 
 explicit saved-ID resolution. A worker handles DNS, address preparation and writer admission, then becomes available
 without waiting for commit. `DOMAINS_RESOLVE_SEMAPHORE_LIMIT` independently limits DNS/DoH A/CNAME operations across
 all entrypoints, including checks without saving. RIPEstat retains its separate shared limit.
+
+The default bundle uses 32 saving workers, 64 DNS/DoH operations, 16 RIPEstat lookups and 32 open/idle connections
+per named HTTP pool. Workers overlap provider waits while the network limits bound concurrent exchanges;
+these are not request-rate limits. Queue capacity 10000 buffers writer backlog, while transactions remain capped
+at 1000 commands and partial batches flush after 0.1 seconds of idle time. This bundle was tested together;
+the independent performance contribution of each value was not isolated. HTTP limits also apply to the RouterOS
+and file-loader pools, and queue capacity also applies to the sequential RouterOS updater.
 
 Accepting NEW demand pauses subsequent STALE dispatch, including during selection. Already started STALE operations
 finish normally; free workers take ready NEW work. Explicit saved-ID requests have the same priority, even for a
@@ -461,11 +468,11 @@ The smoke label describes incomplete acceptance evidence, even when its individu
 Custom-small full-profile branch checks and filtered replays are likewise labeled non-acceptance in the artifact.
 Retain identical source hashes, schedules and frozen API limits when comparing or combining diagnostic results.
 
-The finite whole-pass safety timeout is configurable and defaults to 14400 seconds for diagnostic/baseline runs.
-It does not override the 1800-second acceptance limit for full-size STALE passes; a slower candidate is ineligible.
-API request/maximum guards remain 5 seconds, with a frozen p99 limit of
-`min(5, max(1, idle_p99 * latency_factor + latency_slack))` seconds per route. Record raw measured delays as well as
-these conservative local guardrails. Longer source passes do not permit longer API requests.
+The finite whole-pass timeout defaults to 1800 seconds and cannot exceed that value, including diagnostic/baseline
+runs. A slower candidate is ineligible. API request/maximum guards remain 5 seconds, with a fixed empirical p99
+limit of 1 second per route. The idle API baseline is retained as reference; the legacy `latency_factor` and
+`latency_slack` fields do not change these guards. Record raw measured delays as well as these local guardrails.
+Longer source passes do not permit longer API requests.
 
 Measure each HTTP exchange independently, including domain reads, lists, statistics and write/job admission.
 Canary creation, resolution and deletion remain functional persistence checks under the finite pass budget;
