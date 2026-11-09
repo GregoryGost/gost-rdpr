@@ -5041,6 +5041,502 @@ async def test_http_pool_enforces_capacity_and_cancelled_stream_releases_connect
   )
 
 
+async def load_wait_writer_backlog(client, selected, timeout, *, all_admitted=False):
+  """Require observed accepted, unconfirmed STALE writes before injecting priority or shutdown."""
+  async with asyncio.timeout(timeout):
+    while True:
+      response = await client.get('/metrics')
+      assert response.status_code == 200
+      fields = run_fields(parse_samples(response.text), 'stale')
+      if fields.get('selected') == selected:
+        assert fields.get('unknown', 0) == fields.get('known_not_committed', 0) == 0, fields
+        if fields.get('pending', 0) > 0 and fields['admitted'] > fields['confirmed']:
+          if not all_admitted or (fields['admitted'] == selected and fields['processing_complete'] == 1):
+            return {'observed_at_monotonic': perf_counter(), 'run': fields}
+        assert not (fields.get('processing_complete') == 1 and fields.get('pending') == 0), (
+          'Source drained before the required backlog observation',
+          fields,
+        )
+      await asyncio.sleep(0.01)
+
+
+async def load_wait_priority_commit(client, observations, domain_id, addresses, mode, previous, timeout):
+  """Confirm the priority operation's own receipt and exact public result, rather than old bulk state."""
+  async with asyncio.timeout(timeout):
+    while True:
+      response = await client.get('/metrics')
+      assert response.status_code == 200
+      samples = parse_samples(response.text)
+      confirmed = sample_total(samples, 'resolution_run_events_total', mode=mode, event='confirmed') - previous
+      if confirmed:
+        assert confirmed == 1, (mode, confirmed)
+        fields = run_fields(samples, mode)
+        assert fields['attempted'] == fields['success'] == fields['admitted'] == fields['confirmed'] == 1, fields
+        assert fields['pending'] == fields['unknown'] == fields['known_not_committed'] == 0, fields
+        row = (await load_api_request(client, observations, 'read', 'GET', f'/domains/{domain_id}', timeout=5)).json()
+        assert row['resolved'] is True, row
+        assert row['last_resolved_at'] is not None, row
+        assert set(row['ips_v4'] or []) == set(addresses), row
+        assert not row['ips_v6'], row
+        return row
+      await asyncio.sleep(0.05)
+
+
+@pytest.mark.parametrize('outcome', ['backlog', 'drained', 'http_error', 'no_response', 'timeout'])
+async def test_load_writer_backlog_requires_real_pending_receipts_and_preserves_failures(outcome):
+  fields = {
+    'selected': 8192,
+    'admitted': 1000,
+    'confirmed': 0,
+    'pending': 1000,
+    'processing_complete': 0,
+    'unknown': 0,
+    'known_not_committed': 0,
+  }
+  if outcome == 'drained':
+    fields.update(admitted=8192, confirmed=8192, pending=0, processing_complete=1)
+  metrics = '\n'.join(f'resolution_run_snapshot{{mode="stale",field="{key}"}} {value}' for key, value in fields.items())
+  failure = httpx.ReadError('Synthetic metrics transport failure')
+  client = SimpleNamespace(
+    get=AsyncMock(return_value=httpx.Response(503 if outcome == 'http_error' else 200, text=metrics))
+  )
+  if outcome == 'no_response':
+    client.get.side_effect = failure
+  elif outcome == 'timeout':
+    client.get.return_value = httpx.Response(200, text='')
+  if outcome == 'backlog':
+    observed = await load_wait_writer_backlog(client, 8192, 1)
+    assert observed['run'] == fields
+    assert observed['observed_at_monotonic'] > 0
+  elif outcome == 'no_response':
+    with pytest.raises(httpx.ReadError) as raised:
+      await load_wait_writer_backlog(client, 8192, 1)
+    assert raised.value is failure
+  else:
+    with pytest.raises(TimeoutError if outcome == 'timeout' else AssertionError):
+      await load_wait_writer_backlog(client, 8192, 0.02)
+
+
+@pytest.mark.parametrize('outcome', ['committed', 'old_payload', 'no_receipt', 'http_error', 'no_response'])
+async def test_load_priority_commit_requires_own_confirmation_and_fresh_payload(outcome):
+  fields = dict.fromkeys(('attempted', 'success', 'admitted', 'confirmed'), 1)
+  fields.update(pending=0, unknown=0, known_not_committed=0)
+  metrics = '\n'.join(
+    f'resolution_run_snapshot{{mode="stored",field="{key}"}} {value}' for key, value in fields.items()
+  )
+  metrics += '\nresolution_run_events_total{mode="stored",event="confirmed"} ' + (
+    '5' if outcome == 'no_receipt' else '6'
+  )
+  row = {
+    'resolved': True,
+    'last_resolved_at': 123,
+    'ips_v4': ['8.8.4.4' if outcome == 'old_payload' else '1.1.1.1'],
+    'ips_v6': [],
+  }
+  failure = httpx.ReadError('Synthetic metrics transport failure')
+  client = SimpleNamespace(
+    get=AsyncMock(return_value=httpx.Response(503 if outcome == 'http_error' else 200, text=metrics)),
+    request=AsyncMock(return_value=httpx.Response(200, json=row)),
+  )
+  if outcome == 'no_response':
+    client.get.side_effect = failure
+    with pytest.raises(httpx.ReadError) as raised:
+      await load_wait_priority_commit(client, {}, 9, {'1.1.1.1'}, 'stored', 5, 1)
+    assert raised.value is failure
+  elif outcome == 'committed':
+    assert await load_wait_priority_commit(client, {}, 9, {'1.1.1.1'}, 'stored', 5, 1) == row
+  else:
+    with pytest.raises(TimeoutError if outcome == 'no_receipt' else AssertionError):
+      await load_wait_priority_commit(client, {}, 9, {'1.1.1.1'}, 'stored', 5, 0.02)
+    if outcome == 'no_receipt':
+      client.request.assert_not_awaited()
+
+
+def load_assert_api_limits(observations):
+  """Reject HTTP latency failures before a measured phase can become successful."""
+  quantiles = {key: load_quantiles(values) for key, values in observations.items()}
+  for label, values in quantiles.items():
+    assert values['max'] <= 5, (label, values)
+    assert values['p99'] <= 1, (label, values)
+  return quantiles
+
+
+@pytest.mark.parametrize('test_name', ['priority', 'shutdown'])
+async def test_load_backlog_setup_failure_is_preserved_in_artifact(tmp_path, monkeypatch, test_name):
+  """A failed startup must retain its original error and never publish a successful run."""
+  failure = RuntimeError('Synthetic startup failure')
+  events = []
+
+  @contextmanager
+  def cpu_profile(profile):
+    events.append(('enter', profile))
+    try:
+      yield
+    finally:
+      events.append(('exit', profile))
+
+  service = SimpleNamespace(
+    root=Path(__file__).resolve().parents[2],
+    start=AsyncMock(side_effect=failure),
+    cpu_profile=cpu_profile,
+    cpu_evidence={'profile': 'performance'},
+    startup_attempts=[],
+  )
+  monkeypatch.setenv('GOST_LOAD_CONFIG', json.dumps({'profile': 'smoke', 'n': 8192, 'cpu_profile': 'performance'}))
+  operation = (
+    test_resolution_load_priority_during_stale_writer_backlog
+    if test_name == 'priority'
+    else test_resolution_load_shutdown_drains_accepted_writer_backlog
+  )
+  arguments = (service, tmp_path, 'healthy') if test_name == 'priority' else (service, tmp_path)
+  with pytest.raises(RuntimeError) as raised:
+    await operation(*arguments)
+  assert raised.value is failure
+  filename = 'priority-backlog.json' if test_name == 'priority' else 'shutdown-backlog.json'
+  result = json.loads((tmp_path / filename).read_text(encoding='utf-8'))
+  assert result['status'] == 'failed'
+  assert result['stage'] == 'initial_startup'
+  assert result['failure'] == {'type': 'RuntimeError', 'message': 'Synthetic startup failure'}
+  assert events == [('enter', 'performance'), ('exit', 'performance')]
+
+
+@pytest.mark.parametrize('seconds', [0.2, 1.01, 5.01])
+def test_load_api_limits_reject_http_tail_and_maximum(seconds):
+  observations = {'stored_resolve': [0.01, seconds]}
+  if seconds <= 1:
+    result = load_assert_api_limits(observations)
+    assert result['stored_resolve']['count'] == 2
+    assert result['stored_resolve']['p99'] == seconds
+  else:
+    with pytest.raises(AssertionError, match='stored_resolve'):
+      load_assert_api_limits(observations)
+
+
+@pytest.mark.e2e
+@pytest.mark.e2e_load
+@pytest.mark.parametrize('schedule', ['healthy', 'degraded'])
+@pytest.mark.parametrize('e2e_service', [{'start': False, 'load': True}], indirect=True)
+async def test_resolution_load_priority_during_stale_writer_backlog(e2e_service, tmp_path, schedule):
+  """Measure missing NEW/stored lifecycles at 8192 without replaying historical performance matrices."""
+  service = e2e_service
+  configuration = resolution_load_configuration()
+  dataset = ResolutionLoadDataset(8192, configuration)
+  dataset.schedule = schedule
+  snapshot = load_source_evidence(service.root)
+  artifact = {
+    'status': 'in_progress',
+    'schedule': schedule,
+    'source_sha256': snapshot,
+    'phases': [],
+    'bounds': {'http_seconds': 5, 'route_p99_seconds': 1, 'source_and_lifecycle_seconds': 1800},
+  }
+  artifact_path = tmp_path / 'priority-backlog.json'
+  artifact['stage'] = 'cpu_profile'
+  try:
+    with service.cpu_profile(configuration['cpu_profile']):
+      artifact['stage'] = 'initial_startup'
+      await service.start()
+      artifact['stage'] = 'dns_setup'
+      await load_public_setup(service, 30)
+      artifact['stage'] = 'initial_stop'
+      await service.stop()
+      artifact['stage'] = 'offline_seed'
+      load_prepare_offline(service, dataset, stale=True)
+      service.environment['DOMAINS_UPDATE_INTERVAL'] = '0'
+      service.providers.response_factory = dataset.response
+      artifact['effective_settings'] = load_effective_settings(service)
+      artifact['stage'] = 'seeded_startup'
+      await service.start()
+      async with httpx.AsyncClient(base_url=service.url, timeout=5, trust_env=False) as client:
+        for cycle, temperature in enumerate(('cold', 'warm')):
+          await load_begin_provider_cycle(service.providers, cycle)
+          artifact['stage'] = f'{temperature}_phase'
+          phase = {'cache': temperature, 'status': 'in_progress', 'dataset': dataset.manifest()}
+          artifact['phases'].append(phase)
+          observations = LoadApiObservations(diagnostic=True)
+          finished = asyncio.Event()
+          tasks = []
+          name = f'priority-{cycle}.load.example.test'
+          try:
+            before = parse_samples((await client.get('/metrics')).text)
+            started = perf_counter()
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 1800
+            async with asyncio.timeout_at(deadline):
+              await load_api_request(client, observations, 'job', 'POST', '/commands/domains/resolve/stale', timeout=5)
+
+            async def source(before=before, started=started, phase=phase, deadline=deadline, loop=loop):
+              samples, fields = await load_wait_idle(
+                client,
+                'stale',
+                dataset.count,
+                sample_total(before, 'resolution_run_elapsed_seconds_count', mode='stale'),
+                max(0, deadline - loop.time()),
+              )
+              elapsed = perf_counter() - started
+              phase.update(wall_seconds_to_known_writer_outcomes=elapsed, run=fields)
+              assert elapsed <= 1800
+              expected = dataset.manifest()['categories']
+              assert fields['success'] == expected['success'] + expected['empty'], fields
+              assert fields['partial'] == expected['partial'], fields
+              assert fields['failure'] == expected['failure'], fields
+              assert fields['confirmed'] == dataset.count - expected['failure'], fields
+              phase['ripe_network_requests'] = sample_total(
+                samples, 'resolution_ripe_duration_seconds_count', phase='network'
+              ) - sample_total(before, 'resolution_ripe_duration_seconds_count', phase='network')
+
+            async def priority(
+              phase=phase,
+              observations=observations,
+              before=before,
+              name=name,
+              cycle=cycle,
+              deadline=deadline,
+              loop=loop,
+            ):
+              phase['creation_injection'] = await load_wait_writer_backlog(
+                client, dataset.count, max(0, deadline - loop.time())
+              )
+              created = perf_counter()
+              await load_api_request(
+                client, observations, 'write', 'POST', '/domains', timeout=5, json=[{'domain': name}]
+              )
+              async with asyncio.timeout_at(deadline):
+                while True:
+                  found = (
+                    await load_api_request(
+                      client,
+                      observations,
+                      'search',
+                      'GET',
+                      '/domains/search',
+                      timeout=5,
+                      params={'text': name},
+                    )
+                  ).json()['payload']
+                  if found:
+                    assert len(found) == 1, found
+                    assert found[0]['name'] == name, found
+                    assert found[0]['last_resolved_at'] is None, found
+                    domain_id = found[0]['id']
+                    break
+                  await asyncio.sleep(0.05)
+              phase.update(priority_domain_id=domain_id, creation_confirmed_seconds=perf_counter() - created)
+              phase['new_injection'] = await load_wait_writer_backlog(
+                client, dataset.count, max(0, deadline - loop.time())
+              )
+              assert phase['new_injection']['run']['not_started'] + phase['new_injection']['run']['active'] > 0
+              new_started = perf_counter()
+              await load_api_request(client, observations, 'new', 'POST', '/commands/domains/resolve/new', timeout=5)
+              new_row = await load_wait_priority_commit(
+                client,
+                observations,
+                domain_id,
+                {'8.8.4.4'},
+                'new',
+                sample_total(before, 'resolution_run_events_total', mode='new', event='confirmed'),
+                max(0, deadline - loop.time()),
+              )
+              phase.update(new_lifecycle_seconds=perf_counter() - new_started, new_result=new_row)
+              for transport in ('classic', 'doh'):
+                service.providers.schedule[(transport, name, dns.rdatatype.A, cycle)] = (
+                  {'kind': 'positive', 'addresses': ('1.1.1.1',)},
+                )
+              service.providers.schedule[('ripe', '1.1.1.1', None, cycle)] = ({'kind': 'empty'},)
+              phase['stored_injection'] = await load_wait_writer_backlog(
+                client, dataset.count, max(0, deadline - loop.time())
+              )
+              assert phase['stored_injection']['run']['not_started'] + phase['stored_injection']['run']['active'] > 0
+              stored_started = perf_counter()
+              await load_api_request(
+                client,
+                observations,
+                'stored_resolve',
+                'POST',
+                f'/domains/{domain_id}/resolve',
+                timeout=5,
+                statuses=(202,),
+              )
+              stored_row = await load_wait_priority_commit(
+                client,
+                observations,
+                domain_id,
+                {'1.1.1.1'},
+                'stored',
+                sample_total(before, 'resolution_run_events_total', mode='stored', event='confirmed'),
+                max(0, deadline - loop.time()),
+              )
+              phase.update(stored_lifecycle_seconds=perf_counter() - stored_started, stored_result=stored_row)
+              assert stored_row['last_resolved_at'] >= new_row['last_resolved_at']
+
+            async def monitor(
+              before=before,
+              phase=phase,
+              finished=finished,
+              observations=observations,
+            ):
+              pid = application_pid(before)
+              phase['resources'] = []
+              while not finished.is_set():
+                phase['resources'].append(service.resource_snapshot(pid))
+                for label, path in (
+                  ('read', f'/domains/{dataset.count + 1}'),
+                  ('list', '/domains?limit=10'),
+                  ('stats', '/stats'),
+                ):
+                  await load_api_request(client, observations, label, 'GET', path, timeout=5)
+                try:
+                  await asyncio.wait_for(finished.wait(), timeout=0.25)
+                except TimeoutError:
+                  pass
+
+            source_task = asyncio.create_task(source())
+            priority_task = asyncio.create_task(priority())
+            monitor_task = asyncio.create_task(monitor())
+            tasks = [source_task, priority_task, monitor_task]
+            async with asyncio.timeout_at(deadline):
+              while not (source_task.done() and priority_task.done()):
+                done, _ = await asyncio.wait(
+                  [task for task in tasks if not task.done()],
+                  return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                  await task
+              await source_task
+              await priority_task
+              finished.set()
+              await monitor_task
+            domain_id = phase['priority_domain_id']
+            phase['priority_before_restart'] = (await client.get(f'/domains/{domain_id}')).json()
+            resources = phase['resources']
+            assert max(row['peak_rss_bytes'] for row in resources) <= configuration['rss_limit_mb'] * 1024 * 1024
+            cpu_percent = (
+              100 * (resources[-1]['cpu_seconds'] - resources[0]['cpu_seconds']) / (perf_counter() - started)
+            )
+            phase['cpu_percent_one_core'] = cpu_percent
+            assert cpu_percent <= configuration['cpu_percent_limit']
+            # Retain the same process/cache across cold and warm phases, then verify the final probe after restart.
+            if temperature == 'warm':
+              await service.stop()
+              await service.start()
+              assert (await client.get(f'/domains/{domain_id}')).json() == phase['priority_before_restart']
+              phase['priority_restart_verified'] = True
+            await load_api_request(client, observations, 'delete', 'DELETE', f'/domains/{domain_id}', timeout=5)
+            async with asyncio.timeout(1800):
+              while True:
+                response = await load_api_request(
+                  client,
+                  observations,
+                  'read',
+                  'GET',
+                  f'/domains/{domain_id}',
+                  timeout=5,
+                  statuses=(200, 404),
+                )
+                if response.status_code == 404:
+                  break
+                await asyncio.sleep(0.05)
+            phase['verification'] = await load_verify_public(client, dataset, 1800)
+            phase['providers'] = service.providers.evidence()
+            phase['http'] = load_assert_api_limits(observations)
+            phase['status'] = 'passed'
+          except BaseException as error:
+            phase.update(status='failed', failure={'type': type(error).__name__, 'message': str(error)[:4000]})
+            raise
+          finally:
+            finished.set()
+            for task in tasks:
+              if not task.done():
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            phase['http'] = {key: load_quantiles(values) for key, values in observations.items()}
+            phase['http_exchanges'] = observations.requests
+            phase['http_failures'] = observations.failures
+            load_write_artifact(artifact_path, artifact)
+        assert load_source_evidence(service.root) == snapshot
+        artifact['stage'] = 'final_stop'
+        await service.stop()
+        artifact['status'] = 'passed'
+  except BaseException as error:
+    artifact.update(status='failed', failure={'type': type(error).__name__, 'message': str(error)[:4000]})
+    raise
+  finally:
+    artifact['cpu_profile'] = service.cpu_evidence
+    artifact['startup_attempts'] = service.startup_attempts
+    load_write_artifact(artifact_path, artifact)
+
+
+@pytest.mark.e2e
+@pytest.mark.e2e_load
+@pytest.mark.parametrize('e2e_service', [{'start': False, 'load': True}], indirect=True)
+async def test_resolution_load_shutdown_drains_accepted_writer_backlog(e2e_service, tmp_path):
+  """Stop only after every source command is admitted but real receipts remain pending."""
+  service = e2e_service
+  configuration = resolution_load_configuration()
+  dataset = ResolutionLoadDataset(8192, configuration)
+  snapshot = load_source_evidence(service.root)
+  artifact = {'status': 'in_progress', 'source_sha256': snapshot, 'dataset': dataset.manifest(), 'stage': 'cpu_profile'}
+  artifact_path = tmp_path / 'shutdown-backlog.json'
+  try:
+    with service.cpu_profile(configuration['cpu_profile']):
+      artifact['stage'] = 'initial_startup'
+      await service.start()
+      artifact['stage'] = 'dns_setup'
+      await load_public_setup(service, 30)
+      artifact['stage'] = 'initial_stop'
+      await service.stop()
+      artifact['stage'] = 'offline_seed'
+      load_prepare_offline(service, dataset, stale=True)
+      service.providers.response_factory = dataset.response
+      artifact['effective_settings'] = load_effective_settings(service)
+      assert float(artifact['effective_settings']['DB_SHUTDOWN_TIMEOUT']) == 20
+      artifact['stage'] = 'seeded_startup'
+      await service.start()
+      async with httpx.AsyncClient(base_url=service.url, timeout=5, trust_env=False) as client:
+        observations = LoadApiObservations(diagnostic=True)
+        started = perf_counter()
+        deadline = asyncio.get_running_loop().time() + 1800
+        artifact['stage'] = 'admission_and_shutdown'
+        async with asyncio.timeout_at(deadline):
+          await load_api_request(client, observations, 'job', 'POST', '/commands/domains/resolve/stale', timeout=5)
+          backlog = await load_wait_writer_backlog(
+            client,
+            dataset.count,
+            max(0, deadline - asyncio.get_running_loop().time()),
+            all_admitted=True,
+          )
+          # No file write or further HTTP request may turn this into an idle-stop test.
+          artifact['pre_signal'] = backlog
+          signalled = perf_counter()
+          try:
+            await service.stop()
+          finally:
+            artifact.update(
+              snapshot_to_stop_seconds=signalled - backlog['observed_at_monotonic'],
+              shutdown_seconds=perf_counter() - signalled,
+              admission_and_shutdown_seconds=perf_counter() - started,
+              http_exchanges=observations.requests,
+            )
+          assert artifact['admission_and_shutdown_seconds'] <= 1800
+          assert 'DatabaseShutdownError' not in service.diagnostics()
+          assert 'Application shutdown failed' not in service.diagnostics()
+        artifact['stage'] = 'restart'
+        await service.start()
+        artifact['restart_verification'] = await load_verify_public(client, dataset, 1800)
+        artifact['http'] = load_assert_api_limits(observations)
+        assert load_source_evidence(service.root) == snapshot
+        artifact['stage'] = 'final_stop'
+        await service.stop()
+        artifact['status'] = 'passed'
+  except BaseException as error:
+    artifact.update(status='failed', failure={'type': type(error).__name__, 'message': str(error)[:4000]})
+    raise
+  finally:
+    artifact['cpu_profile'] = service.cpu_evidence
+    artifact['startup_attempts'] = service.startup_attempts
+    load_write_artifact(artifact_path, artifact)
+
+
 def resolution_load_configuration():
   """Require explicit smoke selection; the normal load command uses the observed full scale."""
   supplied = json.loads(os.environ.get('GOST_LOAD_CONFIG', '{}'))
