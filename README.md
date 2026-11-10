@@ -383,6 +383,37 @@ Use the container's IP address on port `80` for the UI and `/api/` access.
 Port `4000` provides the direct API and Swagger UI.
 Keep its network address consistent with the RouterOS API user's allowed source address.
 
+#### RouterOS deployment example
+
+Before adding the container, choose an unused IP address on an existing trusted bridge. Replace `bridge-lan`,
+the address and gateway, and the `disk1` paths with values from your router. The mount maps the persistent
+database directory to `/app/db`.
+
+```text
+/interface/veth/add name=veth-rdpr-example address=192.168.50.20/24 gateway=192.168.50.1
+/interface/bridge/port/add bridge=bridge-lan interface=veth-rdpr-example
+/container/mounts/add list=rdpr-example-db src=disk1/rdpr-example-db dst=/app/db
+/container/envs/add list=rdpr-example-env key=ROOT_LOG_LEVEL value=info
+```
+
+If the router is configured to use a different registry, set the registry URL to Docker Hub.
+
+```text
+/container/config/set registry-url=https://registry-1.docker.io
+```
+
+```text
+/container/add remote-image=gregorygost/gost-rdpr:dev interface=veth-rdpr-example envlist=rdpr-example-env \
+  hostname=rdpr-example mountlists=rdpr-example-db root-dir=disk1/containers/rdpr-example \
+  logging=yes comment="RDPR example" start-on-boot=yes name=rdpr-example
+```
+
+Check `/container/print` and wait for `status=stopped` after the image is downloaded and extracted. Then start it.
+
+```text
+/container/start rdpr-example
+```
+
 ## Development
 
 The backend requires Python **3.15 or later** and Poetry. Dependency constraints and resolved versions are in
