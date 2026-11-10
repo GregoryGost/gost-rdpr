@@ -7,6 +7,7 @@
 # Build arguments:
 #   UI_REPO_URL - UI repository URL (default: https://github.com/GregoryGost/gost-rdpr-ui.git)
 #   UI_BRANCH - UI branch to clone (default: main)
+#   UI_COMMIT - Exact UI commit to build instead of the branch tip (optional)
 #   PYTHON_VERSION - Python base image version (default: 3.15-slim-trixie)
 #   NODE_VERSION - Node.js base image version (default: 24.13-alpine)
 #
@@ -29,10 +30,19 @@ WORKDIR /ui
 # Install git for cloning
 RUN apk add --no-cache git
 
-# Clone UI repository
+# Fetch the selected UI revision, preserving branch-based local builds.
 ARG UI_BRANCH=main
 ARG UI_REPO_URL=https://github.com/GregoryGost/gost-rdpr-ui.git
-RUN git clone --depth 1 --branch ${UI_BRANCH} ${UI_REPO_URL} .
+ARG UI_COMMIT=
+RUN if [ -n "${UI_COMMIT}" ]; then \
+      git init . \
+      && git remote add origin "${UI_REPO_URL}" \
+      && git fetch --depth 1 origin "${UI_COMMIT}" \
+      && git checkout --detach FETCH_HEAD \
+      && test "$(git rev-parse HEAD)" = "${UI_COMMIT}"; \
+    else \
+      git clone --depth 1 --branch "${UI_BRANCH}" "${UI_REPO_URL}" .; \
+    fi
 
 # Install pnpm
 ARG PNPM_VERSION=11.1.1
