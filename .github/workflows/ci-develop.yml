@@ -1,7 +1,9 @@
 name: Develop image
 
 on:
-  push:
+  pull_request:
+    types:
+      - closed
     branches:
       - develop
   workflow_dispatch:
@@ -10,45 +12,17 @@ permissions:
   contents: read
 
 env:
-  BACKEND_SHA: ${{ github.sha }}
+  BACKEND_SHA: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
 
 jobs:
-  release_source:
-    name: Verify development release commit
-    if: >-
-      github.ref == 'refs/heads/develop' &&
-      (github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && !github.event.created && !github.event.deleted && !github.event.forced))
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      pull-requests: read
-    outputs:
-      publish: ${{ steps.source.outputs.result }}
-    steps:
-      - name: Confirm the commit resulted from a merge into develop
-        id: source
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            if (context.eventName === 'workflow_dispatch') return true;
-
-            const candidates = await github.paginate(github.rest.repos.listPullRequestsAssociatedWithCommit, {
-              ...context.repo, commit_sha: context.sha,
-            });
-            for (const candidate of candidates) {
-              if (candidate.state !== 'closed' || candidate.base.ref !== 'develop') continue;
-              const {data: pull} = await github.rest.pulls.get({...context.repo, pull_number: candidate.number});
-              if (pull.merged && pull.base.ref === 'develop' && pull.merge_commit_sha === context.sha) return true;
-            }
-
-            core.notice('Skipping image publication because the commit is not a merged pull request result');
-            return false;
-
   publish:
     name: Tag and publish development image
-    needs: release_source
-    if: needs.release_source.outputs.publish == 'true'
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop') ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.merge_commit_sha != '')
     concurrency:
       group: develop-release
       cancel-in-progress: false
