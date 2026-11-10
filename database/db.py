@@ -2196,17 +2196,17 @@ class DataBase:
       result.dns = StatsDnsData(total=dns_stats.total, classic=dns_stats.classic, doh=dns_stats.doh)
       result.domains = StatsDomainsData(
         total=domains_stats.total,
-        resolved=domains_stats.resolved,
-        unresolved=domains_stats.unresolved,
+        resolved=domains_stats.resolved or 0,
+        unresolved=domains_stats.unresolved or 0,
         lists_total=domains_stats.lists_total,
         per_list=[StatsDomainsListItem(**item) for item in loads(domains_stats.per_list or '[]')],
       )
       result.ips = StatsIpsData(
         total=ips_stats.total,
-        v4_total=ips_stats.v4_total,
-        v6_total=ips_stats.v6_total,
-        linked_to_domain=ips_stats.linked_to_domain,
-        standalone=ips_stats.standalone,
+        v4_total=ips_stats.v4_total or 0,
+        v6_total=ips_stats.v6_total or 0,
+        linked_to_domain=ips_stats.linked_to_domain or 0,
+        standalone=ips_stats.standalone or 0,
         lists_total=ips_stats.lists_total,
         per_list=[StatsIpsListItem(**item) for item in loads(ips_stats.per_list or '[]')],
       )
@@ -2280,6 +2280,7 @@ class DataBase:
             start_date=start_date,
             end_date=end_date,
             date_field=date_field,
+            ip_subtype=ip_subtype,
           ),
         )
         result.payload = [StatsGrowthPoint(date=row[0], count=row[1]) for row in ips_stats_growth]

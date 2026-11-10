@@ -4,13 +4,16 @@ import asyncio
 import dataclasses
 import gc
 import importlib
+import json
 import logging
 import math
 import sys
 from base64 import urlsafe_b64decode
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from hashlib import sha256
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, mock_open
 
 import dns.asyncresolver
 import dns.exception
@@ -3674,3 +3677,923 @@ async def test_ripe_worker_cancellation_drains_started_requests_and_releases_glo
   finally:
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
+
+
+class ListDownloadStream(httpx.AsyncByteStream):
+  """Expose incomplete transfers and response cleanup at the HTTP boundary."""
+
+  def __init__(self, chunks, error=None):
+    self.chunks = chunks
+    self.error = error
+    self.closes = 0
+
+  async def __aiter__(self):
+    for chunk in self.chunks:
+      yield chunk
+    if self.error is not None:
+      raise self.error
+
+  async def aclose(self):
+    self.closes += 1
+
+
+@pytest.fixture
+def list_loader(app, monkeypatch):
+  module = importlib.import_module('client.file_loader_client')
+  domains = importlib.import_module('models.dto.domains_lists_dto')
+  ips = importlib.import_module('models.dto.ips_lists_dto')
+  instance = module.FileLoaderClient()
+
+  def make_list(kind, id=1, **values):
+    model = domains.DomainsListDto if kind == 'domains' else ips.IpsListDto
+    return model(
+      id=id,
+      name=f'source-{id}',
+      url=f'https://lists.example.test/{id}.txt',
+      created_at=datetime(2024, 1, 1, tzinfo=UTC),
+      attempts=2,
+      **values,
+    )
+
+  def install(handler):
+    monkeypatch.setattr(instance, '_FileLoaderClient__client', app.make_http(handler))
+
+  return SimpleNamespace(instance=instance, make_list=make_list, install=install)
+
+
+@pytest.mark.parametrize(
+  ('kind', 'body', 'expected'),
+  [
+    (
+      'domains',
+      b'example.com\nwww.example.org example.com\nno domain here\n',
+      {'example.com', 'www.example.org'},
+    ),
+    (
+      'ips',
+      b'8.8.8.8\n203.0.113.0/24 8.8.8.8\n2001:db8:0:0:0:0:0:1\n',
+      {'8.8.8.8', '203.0.113.0/24', '2001:db8:0:0:0:0:0:1'},
+    ),
+  ],
+)
+async def test_list_download_deduplicates_records_and_reuses_content_hash(list_loader, kind, body, expected):
+  streams, calls = [], []
+
+  def upstream(request):
+    calls.append((request.method, request.url.path))
+    if request.method == 'HEAD':
+      return httpx.Response(200)
+    stream = ListDownloadStream([body[:7], body[7:]])
+    streams.append(stream)
+    return httpx.Response(200, stream=stream)
+
+  list_loader.install(upstream)
+  source = list_loader.make_list(kind)
+  load = getattr(list_loader.instance, f'get_{kind}_from_lists')
+  assert await load([source]) is None
+  assert source.found_elements == expected
+  assert source.hash == sha256(body).hexdigest().upper()
+  assert source.attempts == 2
+  # A fresh DTO with the persisted digest must not trigger a replacement import.
+  unchanged = list_loader.make_list(kind, hash=source.hash)
+  await load([unchanged])
+  assert unchanged.found_elements is None
+  assert unchanged.hash == source.hash
+  assert calls == [('HEAD', '/1.txt'), ('GET', '/1.txt')] * 2
+  assert [stream.closes for stream in streams] == [1, 1]
+
+
+@pytest.mark.parametrize('kind', ['domains', 'ips'])
+@pytest.mark.parametrize('body', [b'', b'no usable records\n', b'\n\n'])
+async def test_empty_list_download_preserves_digest_and_does_not_publish_replacements(list_loader, kind, body):
+  stream = ListDownloadStream([body])
+  list_loader.install(
+    lambda request: httpx.Response(200) if request.method == 'HEAD' else httpx.Response(200, stream=stream)
+  )
+  source = list_loader.make_list(kind, hash='previous-content-digest', found_elements={'old-record'})
+  await getattr(list_loader.instance, f'get_{kind}_from_lists')([source])
+  assert source.found_elements is None
+  assert source.hash == 'previous-content-digest'
+  assert source.attempts == 2
+  assert stream.closes == 1
+
+
+@pytest.mark.parametrize('kind', ['domains', 'ips'])
+@pytest.mark.parametrize('status', [301, 404, 503])
+async def test_unavailable_list_head_counts_attempt_without_get_and_continues(list_loader, kind, status):
+  calls = []
+  body = b'example.com\n' if kind == 'domains' else b'8.8.8.8\n'
+
+  def upstream(request):
+    calls.append((request.method, request.url.path))
+    if request.url.path == '/1.txt':
+      return httpx.Response(status, headers={'Location': 'https://other.example.test/list'})
+    return httpx.Response(200, content=body if request.method == 'GET' else b'')
+
+  list_loader.install(upstream)
+  failed, healthy = list_loader.make_list(kind, hash='old'), list_loader.make_list(kind, id=2)
+  await getattr(list_loader.instance, f'get_{kind}_from_lists')([failed, healthy])
+  assert failed.attempts == 3
+  assert failed.hash == 'old'
+  assert failed.found_elements is None
+  assert healthy.found_elements == ({'example.com'} if kind == 'domains' else {'8.8.8.8'})
+  assert calls == [('HEAD', '/1.txt'), ('HEAD', '/2.txt'), ('GET', '/2.txt')]
+
+
+@pytest.mark.parametrize('kind', ['domains', 'ips'])
+@pytest.mark.parametrize('failure', ['head-network', 'get-status', 'body-network'])
+async def test_failed_list_transfer_discards_partial_results_and_continues(list_loader, kind, failure):
+  body = b'example.com\n' if kind == 'domains' else b'8.8.8.8\n'
+  streams, calls = [], []
+
+  def upstream(request):
+    calls.append((request.method, request.url.path))
+    if request.url.path == '/1.txt':
+      if request.method == 'HEAD' and failure == 'head-network':
+        raise httpx.ConnectError('Synthetic unavailable list', request=request)
+      if request.method == 'GET':
+        error = httpx.ReadError('Synthetic truncated list', request=request) if failure == 'body-network' else None
+        stream = ListDownloadStream([body], error=error)
+        streams.append(stream)
+        return httpx.Response(403 if failure == 'get-status' else 200, stream=stream)
+    return httpx.Response(200, content=body if request.method == 'GET' else b'')
+
+  list_loader.install(upstream)
+  failed, healthy = list_loader.make_list(kind, hash='old'), list_loader.make_list(kind, id=2)
+  await getattr(list_loader.instance, f'get_{kind}_from_lists')([failed, healthy])
+  assert failed.hash == 'old'
+  assert failed.found_elements is None
+  assert healthy.found_elements == ({'example.com'} if kind == 'domains' else {'8.8.8.8'})
+  assert calls[-2:] == [('HEAD', '/2.txt'), ('GET', '/2.txt')]
+  assert all(stream.closes == 1 for stream in streams)
+
+
+@pytest.mark.parametrize('kind', ['domains', 'ips'])
+async def test_list_transfer_cancellation_closes_stream_and_stops_later_sources(list_loader, kind):
+  calls = []
+  stream = ListDownloadStream([b'example.com\n8.8.8.8\n'], error=asyncio.CancelledError())
+
+  def upstream(request):
+    calls.append((request.method, request.url.path))
+    return httpx.Response(200) if request.method == 'HEAD' else httpx.Response(200, stream=stream)
+
+  list_loader.install(upstream)
+  sources = [list_loader.make_list(kind, hash='old'), list_loader.make_list(kind, id=2)]
+  with pytest.raises(asyncio.CancelledError):
+    await getattr(list_loader.instance, f'get_{kind}_from_lists')(sources)
+  assert [(source.hash, source.found_elements) for source in sources] == [('old', None), (None, None)]
+  assert calls == [('HEAD', '/1.txt'), ('GET', '/1.txt')]
+  assert stream.closes == 1
+
+
+@pytest.mark.parametrize('kind', ['domains', 'ips'])
+async def test_list_content_digest_is_independent_of_http_line_endings(list_loader, kind):
+  content = b'example.com\nexample.org\n' if kind == 'domains' else b'8.8.8.8\n1.1.1.1\n'
+  bodies = [content, content.replace(b'\n', b'\r\n')]
+
+  def upstream(request):
+    return httpx.Response(200, content=bodies.pop(0) if request.method == 'GET' else b'')
+
+  list_loader.install(upstream)
+  sources = [list_loader.make_list(kind, id=id) for id in (1, 2)]
+  await getattr(list_loader.instance, f'get_{kind}_from_lists')(sources)
+  assert sources[0].found_elements == sources[1].found_elements
+  assert sources[0].hash == sources[1].hash == sha256(content).hexdigest().upper()
+
+
+@pytest.mark.parametrize(
+  ('values', 'expected'),
+  [
+    ({'domain': '  www.example.test.  '}, {'domain': 'www.example.test', 'id': None, 'dns_server_ids': None}),
+    ({'domain': None, 'id': 1}, {'domain': None, 'id': 1, 'dns_server_ids': None}),
+    (
+      {'domain': 'example.test', 'dns_server_ids': [0, 2]},
+      {'domain': 'example.test', 'id': None, 'dns_server_ids': [0, 2]},
+    ),
+  ],
+)
+async def test_domain_resolve_request_normalizes_one_source_and_preserves_explicit_dns_selection(app, values, expected):
+  model = importlib.import_module('models.http.domains_req').DomainResolveReq
+  assert model(**values).model_dump() == expected
+
+
+@pytest.mark.parametrize(
+  ('values', 'message'),
+  [
+    ({}, 'Specify exactly one'),
+    ({'domain': 'example.test', 'id': 1}, 'Specify exactly one'),
+    ({'domain': '   '}, 'must not be empty'),
+    ({'domain': '.'}, 'must not be empty'),
+    ({'domain': ''}, 'at least 1 character'),
+    ({'domain': 'a' * 254}, 'at most 253 characters'),
+    ({'id': 0}, 'greater than 0'),
+    ({'id': -1}, 'greater than 0'),
+    ({'id': 1, 'dns_server_ids': []}, 'at least 1 item'),
+    ({'id': 1, 'dns_server_ids': [-1]}, 'greater than or equal to 0'),
+    ({'id': 1, 'dns_server_ids': [2, 2]}, 'must be unique'),
+  ],
+)
+async def test_domain_resolve_request_rejects_ambiguous_empty_and_invalid_selection(app, values, message):
+  from pydantic import ValidationError
+
+  model = importlib.import_module('models.http.domains_req').DomainResolveReq
+  with pytest.raises(ValidationError, match=message):
+    model(**values)
+
+
+@pytest.mark.parametrize(
+  ('values', 'expected'),
+  [
+    ({'address': ' 8.8.8.8 '}, {'address': '8.8.8.8', 'id': None}),
+    ({'address': None, 'id': 7}, {'address': None, 'id': 7}),
+    ({'address': '0.0.0.0'}, {'address': '0.0.0.0', 'id': None}),  # noqa: S104 - Parsing never binds a socket.
+    ({'address': '255.255.255.255'}, {'address': '255.255.255.255', 'id': None}),
+  ],
+)
+async def test_ripe_check_request_accepts_exactly_one_ipv4_or_record_id(app, values, expected):
+  model = importlib.import_module('models.http.ripe_stat_req').RipeStatPrefixCheckReq
+  assert model(**values).model_dump() == expected
+
+
+@pytest.mark.parametrize(
+  ('values', 'message'),
+  [
+    ({}, 'Specify exactly one'),
+    ({'address': '8.8.8.8', 'id': 1}, 'Specify exactly one'),
+    ({'address': '2001:db8::1'}, 'Only IPv4'),
+    ({'address': '::ffff:8.8.8.8'}, 'Only IPv4'),
+    ({'address': '8.8.8.0/24'}, 'Invalid IPv4'),
+    ({'address': '999.8.8.8'}, 'Invalid IPv4'),
+    ({'address': 'example.test'}, 'Invalid IPv4'),
+    ({'address': '  '}, 'Invalid IPv4'),
+    ({'id': 0}, 'greater than 0'),
+    ({'id': -1}, 'greater than 0'),
+  ],
+)
+async def test_ripe_check_request_rejects_non_ipv4_and_ambiguous_sources(app, values, message):
+  from pydantic import ValidationError
+
+  model = importlib.import_module('models.http.ripe_stat_req').RipeStatPrefixCheckReq
+  with pytest.raises(ValidationError, match=message):
+    model(**values)
+
+
+@pytest.mark.parametrize('addr_type', [None, 4, 6])
+async def test_ip_query_preserves_optional_family_and_gateway_filter(app, addr_type):
+  model = importlib.import_module('models.http.ips_req').IpsQueryReq
+  query = model(type=addr_type, default_gw=False)
+  assert query.type == addr_type
+  assert query.default_gw is False
+
+
+@pytest.mark.parametrize('addr_type', [0, 5, -1])
+async def test_ip_query_rejects_unknown_address_family(app, addr_type):
+  from pydantic import ValidationError
+
+  model = importlib.import_module('models.http.ips_req').IpsQueryReq
+  with pytest.raises(ValidationError, match='either 4 or 6'):
+    model(type=addr_type)
+
+
+@pytest.mark.parametrize('address', ['8.8.8.8', '8.8.8.0/24', '2001:db8::1', '2001:db8::/32'])
+async def test_ip_create_request_preserves_valid_host_or_network_and_ownership(app, address):
+  model = importlib.import_module('models.http.ips_req').IpsPostElementReq
+  record = model(addr=address, list_id=2, domain_id=3, ros_comment='managed address', use_default_gw=True)
+  assert record.model_dump() == {
+    'addr': address,
+    'list_id': 2,
+    'domain_id': 3,
+    'ros_comment': 'managed address',
+    'use_default_gw': True,
+  }
+
+
+@pytest.mark.parametrize('address', ['example.test', '8.8.8.999', '8.8.8.8/33', '8.8.8.8/24', '2001:db8::/129', None])
+async def test_ip_create_request_rejects_invalid_address_or_noncanonical_network(app, address):
+  from pydantic import ValidationError
+
+  model = importlib.import_module('models.http.ips_req').IpsPostElementReq
+  with pytest.raises(ValidationError, match='Invalid IP address type'):
+    model(addr=address)
+
+
+@pytest.mark.parametrize(
+  'values',
+  [{'server': '8.8.8.8'}, {'doh_server': 'https://dns.example.test/dns-query'}, {'server': '::1', 'doh_server': 'url'}],
+)
+async def test_dns_create_request_accepts_classic_doh_or_both_sources(app, values):
+  model = importlib.import_module('models.http.dns_servers_req').DnsPostElementReq
+  record = model(**values)
+  assert record.server == values.get('server')
+  assert record.doh_server == values.get('doh_server')
+
+
+@pytest.mark.parametrize('values', [{}, {'server': None, 'doh_server': None}])
+async def test_dns_create_request_requires_at_least_one_server(app, values):
+  from pydantic import ValidationError
+
+  model = importlib.import_module('models.http.dns_servers_req').DnsPostElementReq
+  with pytest.raises(ValidationError, match='One of server or doh_server'):
+    model(**values)
+
+
+@pytest.mark.parametrize(
+  'address', ['8.8.8.8', '8.8.8.8/32', '8.8.8.0/24', '2001:db8::1', '2001:db8::/64', '2001:db8::/32']
+)
+async def test_router_response_models_normalize_host_route_without_losing_network_prefix(app, address):
+  module = importlib.import_module('models.http.ros_rest_api_resp')
+  firewall = module.RosFirewallIpResp(**{'.id': '*1', 'address': address, 'list': 'managed'})
+  route = module.RosRoutingIpResp(**{'.id': '*2', 'dst-address': address, 'gateway': '192.0.2.1'})
+  expected = '8.8.8.8' if address == '8.8.8.8/32' else address
+  assert firewall.address == address
+  assert route.address == expected
+  assert firewall.type == route.type == (6 if ':' in address else 4)
+  assert firewall.id == '*1'
+  assert firewall.list_name == 'managed'
+  assert route.id == '*2'
+
+
+async def test_router_deduplication_keeps_first_record_and_separates_firewall_list_memberships(app):
+  module = importlib.import_module('models.http.ros_rest_api_resp')
+  firewall = [
+    module.RosFirewallIpResp(**{'.id': id, 'address': '8.8.8.8', 'list': name})
+    for id, name in [('*1', 'managed'), ('*2', 'managed-strict'), ('*3', 'managed'), ('*4', 'managed-strict')]
+  ]
+  routes = [
+    module.RosRoutingIpResp(**{'.id': id, 'dst-address': address, 'gateway': '192.0.2.1'})
+    for id, address in [('*1', '8.8.8.8/32'), ('*2', '1.1.1.1'), ('*3', '8.8.8.8')]
+  ]
+  duplicate_fw, unique_fw = module.RosFirewallIpResp.separate_duplicates(firewall)
+  duplicate_routes, unique_routes = module.RosRoutingIpResp.separate_duplicates(routes)
+  assert [record.id for record in duplicate_fw] == ['*3', '*4']
+  assert [record.id for record in unique_fw] == ['*1', '*2']
+  assert [record.id for record in duplicate_routes] == ['*3']
+  assert [record.id for record in unique_routes] == ['*1', '*2']
+  assert module.RosFirewallIpResp.separate_duplicates([]) == ([], [])
+  assert module.RosRoutingIpResp.separate_duplicates([]) == ([], [])
+
+
+@pytest.mark.parametrize(
+  ('address', 'network', 'version', 'without_prefix'),
+  [
+    ('8.8.8.8/32', '8.8.8.8', 4, '8.8.8.8'),
+    ('192.0.2.0/24', '192.0.2.0', 4, '192.0.2.0/24'),
+    ('2001:db8::1', '2001:db8::1', 6, '2001:db8::1'),
+    ('2001:db8::/64', '2001:db8::', 6, '2001:db8::/64'),
+    ('2001:db8::/32', '2001:db8::', 6, '2001:db8::/32'),
+  ],
+)
+async def test_ip_utilities_preserve_network_meaning_and_remove_only_ipv4_host_prefix(
+  app, address, network, version, without_prefix
+):
+  module = importlib.import_module('utils.utils')
+  assert module.get_ip_version(address) == version
+  assert module.get_ip_network_address(address) == network
+  assert module.get_ip_without_prefix(address) == without_prefix
+
+
+@pytest.mark.parametrize('function', ['get_ip_version', 'get_ip_network_address', 'get_ip_without_prefix'])
+@pytest.mark.parametrize('address', ['not-an-ip', '8.8.8.8/33', '2001:db8::/129'])
+async def test_ip_utilities_reject_invalid_addresses_without_silent_fallback(app, function, address):
+  module = importlib.import_module('utils.utils')
+  with pytest.raises(ValueError, match='does not appear to be'):
+    getattr(module, function)(address)
+
+
+@pytest.mark.parametrize('ip_subtype', [4, 6, '4', '6', None])
+async def test_statistics_query_accepts_numeric_http_ip_filter_and_explicit_nullable_dates(app, ip_subtype):
+  model = importlib.import_module('models.http.statistics_req').StatsGrowthQuery
+  query = model(entity='ips', ip_subtype=ip_subtype, start_date=None, end_date=None)
+  assert query.ip_subtype == (None if ip_subtype is None else int(ip_subtype))
+  assert query.start_date is None
+  assert query.end_date is None
+
+
+@pytest.mark.parametrize('ip_subtype', [0, 5, -1, '0', '5', '-1', 'IPv4', '4.5', ''])
+async def test_statistics_query_rejects_unsupported_ip_filter_values(app, ip_subtype):
+  from pydantic import ValidationError
+
+  model = importlib.import_module('models.http.statistics_req').StatsGrowthQuery
+  with pytest.raises(ValidationError, match='ip_subtype'):
+    model(entity='ips', ip_subtype=ip_subtype)
+
+
+@pytest.mark.parametrize('entity', ['domains', 'lists'])
+async def test_statistics_query_rejects_ip_filter_on_non_ip_entity(app, entity):
+  from pydantic import ValidationError
+
+  model = importlib.import_module('models.http.statistics_req').StatsGrowthQuery
+  with pytest.raises(ValidationError, match='ip_subtype is only applicable'):
+    model(entity=entity, ip_subtype=4)
+
+
+@pytest.mark.parametrize('entity', ['ips', 'lists'])
+async def test_statistics_query_rejects_last_resolved_filter_on_non_domain_entity(app, entity):
+  from pydantic import ValidationError
+
+  model = importlib.import_module('models.http.statistics_req').StatsGrowthQuery
+  with pytest.raises(ValidationError, match='date_filter_field is only applicable'):
+    model(entity=entity, date_filter_field='last_resolved_at')
+
+
+@pytest.mark.parametrize('granularity', ['minute', 'hour', 'day', 'week', 'month', 'year'])
+async def test_statistics_query_preserves_supported_granularity_and_domain_checkpoint_filter(app, granularity):
+  model = importlib.import_module('models.http.statistics_req').StatsGrowthQuery
+  query = model(entity='domains', granularity=granularity, date_filter_field='last_resolved_at')
+  assert query.entity == 'domains'
+  assert query.granularity == granularity
+  assert query.date_filter_field == 'last_resolved_at'
+
+
+@pytest.fixture
+def router_sync(app, monkeypatch):
+  from threading import Event
+
+  module = importlib.import_module('client.ros_updater_client')
+  dto = importlib.import_module('models.dto.ros_config_dto')
+  models = importlib.import_module('models.http.ros_rest_api_resp')
+  jobs = importlib.import_module('jobs.job_registry')
+  instance = module.RosClient()
+  config = dto.RosConfigDto(1, 'router.example.test', 'test-user', 'test-password', 'managed')
+  registry = jobs.JobRegistry()
+  monkeypatch.setattr(instance, 'update_ros_queue', asyncio.Queue(maxsize=2))
+  monkeypatch.setattr(instance, '_RosClient__stop_update_ros_event', Event())
+  monkeypatch.setattr(instance, '_RosClient__queue_get_timeout', 0.01)
+  monkeypatch.setattr(instance, '_RosClient__update_tasks', set())
+  monkeypatch.setattr(module, 'job_registry', registry)
+
+  # Pacing is an external clock boundary; each call still yields to the queue owner.
+  async def no_pause(delay):
+    await scheduling_turn()
+
+  monkeypatch.setattr(module, 'sleep', no_pause)
+  requests = []
+
+  def install(handler):
+    def upstream(request):
+      requests.append(request)
+      return handler(request)
+
+    monkeypatch.setattr(instance, '_RosClient__client', app.make_http(upstream))
+
+  async def run(records, configs=None):
+    repository = SimpleNamespace(
+      get_all_configs_for_ros_update=AsyncMock(return_value=configs if configs is not None else [config]),
+      get_all_ips_for_update=AsyncMock(return_value=records),
+    )
+    monkeypatch.setattr(module, 'db', repository)
+    assert await registry.try_start(jobs.Jobs.ROS_UPDATE)
+    try:
+      await asyncio.wait_for(instance.update(addr_type=4), timeout=2)
+      tasks = tuple(instance._RosClient__update_tasks)
+      if tasks:
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+      assert not await registry.is_active(jobs.Jobs.ROS_UPDATE)
+      assert instance.update_ros_queue.empty()
+      return repository
+    finally:
+      tasks = tuple(instance._RosClient__update_tasks)
+      for task in tasks:
+        task.cancel()
+      await asyncio.gather(*tasks, return_exceptions=True)
+
+  return SimpleNamespace(
+    instance=instance, config=config, dto=dto, models=models, install=install, run=run, requests=requests
+  )
+
+
+@pytest.mark.parametrize('already_synchronized', [False, True])
+async def test_router_sync_reconciles_managed_memberships_routes_and_duplicate_records(
+  app, router_sync, already_synchronized
+):
+  firewall = [
+    {'.id': '*fw8', 'address': '8.8.8.8', 'list': 'managed'},
+    {'.id': '*fw1', 'address': '1.1.1.1', 'list': 'managed'},
+  ]
+  routes = [
+    {'.id': '*r8', 'dst-address': '8.8.8.8/32', 'gateway': '192.0.2.1'},
+    {'.id': '*r1', 'dst-address': '1.1.1.1/32', 'gateway': '192.0.2.1' if already_synchronized else '192.0.2.99'},
+  ]
+  if already_synchronized:
+    firewall.extend(
+      [
+        {'.id': '*fw1s', 'address': '1.1.1.1', 'list': 'managed-strict'},
+        {'.id': '*fw9', 'address': '9.9.9.9', 'list': 'managed'},
+      ]
+    )
+    routes.append({'.id': '*r9', 'dst-address': '9.9.9.9/32', 'gateway': '192.0.2.1'})
+  else:
+    firewall.extend(
+      [
+        {'.id': '*fw8dup', 'address': '8.8.8.8', 'list': 'managed'},
+        {'.id': '*fwold', 'address': '4.4.4.4', 'list': 'managed'},
+        {'.id': '*fw8s', 'address': '8.8.8.8', 'list': 'managed-strict'},
+      ]
+    )
+    routes.extend(
+      [
+        {'.id': '*r8dup', 'dst-address': '8.8.8.8/32', 'gateway': '192.0.2.1'},
+        {'.id': '*rold', 'dst-address': '4.4.4.4/32', 'gateway': '192.0.2.1'},
+      ]
+    )
+
+  def upstream(request):
+    if request.method == 'GET':
+      return httpx.Response(200, json={})
+    if request.method != 'POST':
+      return httpx.Response(204)
+    if request.url.path == '/rest/ip/route/print':
+      data = json.loads(request.content)
+      if 'active=true' in data['.query']:
+        return httpx.Response(
+          200, json=[{'gateway': '192.0.2.1', 'routing-table': 'main', 'immediate-gw': '192.0.2.1%WAN'}]
+        )
+      return httpx.Response(200, json=routes)
+    payloads = {
+      '/rest/routing/table/print': [{'.id': '*table', 'name': 'managed'}] if already_synchronized else [],
+      '/rest/ip/firewall/address-list/print': firewall,
+      '/rest/ipv6/route/print': [],
+    }
+    return httpx.Response(200, json=payloads[request.url.path])
+
+  router_sync.install(upstream)
+  records = [
+    app.Ip('8.8.8.8', comment='normal', addr_type=4),
+    app.Ip('1.1.1.1', comment='default gateway', addr_type=4, use_default_gw=True),
+    app.Ip('9.9.9.9', comment='new address', addr_type=4),
+  ]
+  repository = await router_sync.run(records)
+  repository.get_all_ips_for_update.assert_awaited_once_with(addr_type=4)
+  assert all(request.url.host == 'router.example.test' for request in router_sync.requests)
+  assert all(
+    urlsafe_b64decode(request.headers['Authorization'].split()[1]).decode() == 'test-user:test-password'
+    for request in router_sync.requests
+  )
+  changes = [request for request in router_sync.requests if request.method not in {'GET', 'POST'}]
+  if already_synchronized:
+    assert changes == []
+    return
+  assert sorted((request.method, request.url.path) for request in changes) == sorted(
+    [
+      ('PUT', '/rest/routing/table'),
+      ('PATCH', '/rest/ip/route/*r1'),
+      ('DELETE', '/rest/ip/firewall/address-list/*fwold'),
+      ('DELETE', '/rest/ip/firewall/address-list/*fw8s'),
+      ('DELETE', '/rest/ip/firewall/address-list/*fw8dup'),
+      ('DELETE', '/rest/ip/route/*rold'),
+      ('DELETE', '/rest/ip/route/*r8dup'),
+      ('PUT', '/rest/ip/firewall/address-list'),
+      ('PUT', '/rest/ip/firewall/address-list'),
+      ('PUT', '/rest/ip/route'),
+    ]
+  )
+  expected_payloads = [
+    (
+      '/rest/routing/table',
+      {'name': 'managed', 'disabled': False, 'fib': 'yes', 'comment': 'Routing table for bgp list managed'},
+    ),
+    ('/rest/ip/route/*r1', {'gateway': '192.0.2.1'}),
+    (
+      '/rest/ip/firewall/address-list',
+      {'address': '1.1.1.1', 'disabled': False, 'list': 'managed-strict', 'comment': 'default gateway'},
+    ),
+    (
+      '/rest/ip/firewall/address-list',
+      {'address': '9.9.9.9', 'disabled': False, 'list': 'managed', 'comment': 'new address'},
+    ),
+    (
+      '/rest/ip/route',
+      {
+        'routing-table': 'managed',
+        'dst-address': '9.9.9.9',
+        'disabled': False,
+        'comment': 'new address',
+        'gateway': '192.0.2.1',
+      },
+    ),
+  ]
+  # Object order is irrelevant; each mutation must carry the correct endpoint payload.
+  assert sorted(
+    (request.url.path, json.dumps(json.loads(request.content), sort_keys=True))
+    for request in changes
+    if request.content
+  ) == sorted((path, json.dumps(payload, sort_keys=True)) for path, payload in expected_payloads)
+
+
+@pytest.mark.parametrize('failure', ['missing-gateway', 'ambiguous-gateway', 'ambiguous-table', 'check-unavailable'])
+async def test_router_sync_stops_before_mutations_when_prerequisite_reads_fail(router_sync, failure, caplog):
+  gateway = {'gateway': '192.0.2.1', 'routing-table': 'main', 'immediate-gw': '192.0.2.1%WAN'}
+
+  def upstream(request):
+    if request.method == 'GET':
+      return httpx.Response(503 if failure == 'check-unavailable' else 200, json={})
+    if request.url.path == '/rest/ip/route/print':
+      return httpx.Response(
+        200, json=[] if failure == 'missing-gateway' else [gateway] * (2 if failure == 'ambiguous-gateway' else 1)
+      )
+    if request.url.path == '/rest/routing/table/print':
+      return httpx.Response(200, json=[{'.id': '*1', 'name': 'managed'}, {'.id': '*2', 'name': 'managed'}])
+    raise AssertionError(f'Unexpected request after invalid prerequisite: {request.method} {request.url.path}')
+
+  router_sync.install(upstream)
+  await router_sync.run([])
+  assert all(request.method in {'GET', 'POST'} for request in router_sync.requests)
+  assert 'Unexpected error in flow' in caplog.text
+  assert (
+    len(router_sync.requests)
+    == {'check-unavailable': 1, 'missing-gateway': 2, 'ambiguous-gateway': 2, 'ambiguous-table': 3}[failure]
+  )
+
+
+async def test_router_sync_continues_to_next_config_after_protocol_failure(router_sync):
+  second = router_sync.dto.RosConfigDto(2, 'healthy-router.example.test', 'test-user', 'test-password', 'managed')
+
+  def upstream(request):
+    if request.url.host == 'router.example.test':
+      raise httpx.RemoteProtocolError('Synthetic unavailable router', request=request)
+    if request.method == 'GET':
+      return httpx.Response(200, json={})
+    if request.url.path == '/rest/ip/route/print' and 'active=true' in json.loads(request.content)['.query']:
+      return httpx.Response(
+        200, json=[{'gateway': '192.0.2.1', 'routing-table': 'main', 'immediate-gw': '192.0.2.1%WAN'}]
+      )
+    if request.url.path == '/rest/routing/table/print':
+      return httpx.Response(200, json=[{'.id': '*1', 'name': 'managed'}])
+    return httpx.Response(200, json=[])
+
+  router_sync.install(upstream)
+  repository = await router_sync.run([], configs=[router_sync.config, second])
+  repository.get_all_ips_for_update.assert_awaited_once_with(addr_type=4)
+  assert [request.url.host for request in router_sync.requests] == ['router.example.test'] + [
+    'healthy-router.example.test'
+  ] * 6
+
+
+@pytest.mark.parametrize('action', ['FIREWALL_ADD', 'ROUTING_ADD'])
+@pytest.mark.parametrize('gateway', [False, True])
+async def test_router_add_payloads_preserve_comments_strict_membership_and_optional_gateway(
+  app, router_sync, action, gateway
+):
+  router_sync.install(lambda request: httpx.Response(201))
+  record = app.Ip('8.8.8.8', comment='managed address', addr_type=4, use_default_gw=True)
+  default = router_sync.models.RosIpRouteDefaultGatewayResp(
+    **{'gateway': '192.0.2.1', 'routing-table': 'main', 'immediate-gw': '192.0.2.1%WAN'}
+  )
+  await router_sync.instance._RosClient__add_to_ros(
+    router_sync.config,
+    getattr(router_sync.dto.RosAction, action),
+    [record],
+    route_gateway=default if gateway else None,
+  )
+  if action == 'FIREWALL_ADD':
+    expected = [
+      {'address': '8.8.8.8', 'disabled': False, 'list': name, 'comment': 'managed address'}
+      for name in ['managed', 'managed-strict']
+    ]
+    path = '/rest/ip/firewall/address-list'
+  else:
+    expected = [{'routing-table': 'managed', 'dst-address': '8.8.8.8', 'disabled': False, 'comment': 'managed address'}]
+    if gateway:
+      expected[0]['gateway'] = '192.0.2.1'
+    path = '/rest/ip/route'
+  assert [(request.method, request.url.path) for request in router_sync.requests] == [('PUT', path)] * len(expected)
+  assert [json.loads(request.content) for request in router_sync.requests] == expected
+
+
+async def test_router_firewall_add_skips_ipv6_and_continues_after_failed_ipv4(app, router_sync, caplog):
+  router_sync.install(lambda request: httpx.Response(500 if len(router_sync.requests) == 1 else 201))
+  records = [
+    app.Ip('2001:db8::1', addr_type=6),
+    app.Ip('8.8.8.8', comment='first', addr_type=4),
+    app.Ip('1.1.1.1', comment='second', addr_type=4),
+  ]
+  await router_sync.instance._RosClient__add_to_ros(router_sync.config, router_sync.dto.RosAction.FIREWALL_ADD, records)
+  assert [json.loads(request.content)['address'] for request in router_sync.requests] == ['8.8.8.8', '1.1.1.1']
+  assert 'Adding failed' in caplog.text
+
+
+async def test_router_gateway_update_uses_family_endpoint_and_continues_after_failure(router_sync, caplog):
+  router_sync.install(lambda request: httpx.Response(403 if len(router_sync.requests) == 1 else 204))
+  records = [
+    router_sync.models.RosRoutingIpResp(**{'.id': id, 'dst-address': address, 'gateway': 'old'})
+    for id, address in [('*v4', '8.8.8.8'), ('*v6', '2001:db8::1')]
+  ]
+  default = router_sync.models.RosIpRouteDefaultGatewayResp(
+    **{'gateway': '192.0.2.1', 'routing-table': 'main', 'immediate-gw': '192.0.2.1%WAN'}
+  )
+  await router_sync.instance._RosClient__update_wrong_route_gateway(router_sync.config, default, records)
+  assert [(request.method, request.url.path) for request in router_sync.requests] == [
+    ('PATCH', '/rest/ip/route/*v4'),
+    ('PATCH', '/rest/ipv6/route/*v6'),
+  ]
+  assert [json.loads(request.content) for request in router_sync.requests] == [{'gateway': '192.0.2.1'}] * 2
+  assert 'Update wrong gateway failed' in caplog.text
+
+
+@pytest.mark.parametrize(
+  'domain',
+  [
+    'service.technology',
+    'xn--e1afmkfd.xn--p1ai',
+    'api-service.example.technology',
+    'API-SERVICE.EXAMPLE.TECHNOLOGY',
+    'XN--E1AFMKFD.XN--P1AI',
+  ],
+)
+async def test_domain_list_download_preserves_complete_long_and_punycode_top_level_domain(list_loader, domain):
+  body = f'{domain}\n'.encode()
+  list_loader.install(lambda request: httpx.Response(200, content=body if request.method == 'GET' else b''))
+  source = list_loader.make_list('domains')
+  await list_loader.instance.get_domains_from_lists([source])
+  assert source.found_elements == {domain}
+
+
+@pytest.mark.parametrize(
+  'address',
+  [
+    '2001:4860:4860::8888',
+    '2001:4860::/32',
+    '2001:4860:0:0:0:0:0:8888',
+    '2001:db8:0:0:0:0:0:1/128',
+    '2001:4860::',
+    '2001:DB8::ABCD',
+    '::ffff:808:808',
+    '::1:2:3:4:5:6:7',
+    '2001:db8:1:2::3:4:5',
+    '::ffff:192.0.2.1',
+    '::ffff:192.0.2.0/120',
+    '::1',
+    '::',
+    '::/128',
+    '8.8.8.8/32',
+  ],
+)
+async def test_ip_list_download_preserves_complete_compressed_address_and_prefix(list_loader, address):
+  list_loader.install(
+    lambda request: httpx.Response(200, content=f'{address}\n'.encode() if request.method == 'GET' else b'')
+  )
+  source = list_loader.make_list('ips')
+  await list_loader.instance.get_ips_from_lists([source])
+  assert source.found_elements == {address}
+
+
+async def test_ip_list_download_skips_invalid_ipv6_tokens_and_keeps_valid_neighbors(list_loader):
+  body = b':::1 a:::b 2001:db8::1/129\n[2001:db8::2]:443 8.8.8.8:53 9.9.9.0/24\n'
+  list_loader.install(lambda request: httpx.Response(200, content=body if request.method == 'GET' else b''))
+  source = list_loader.make_list('ips')
+
+  await list_loader.instance.get_ips_from_lists([source])
+
+  assert source.found_elements == {'2001:db8::2', '8.8.8.8', '9.9.9.0/24'}
+
+
+@pytest.mark.parametrize('transport', ['classic', 'doh'])
+async def test_domain_lookup_accumulates_only_address_records_by_ip_family(app, transport):
+  domain = app.dto.DomainResult(id=1, name='www.example.test')
+  rrsets = [
+    dns.rrset.from_text('www.example.test.', 60, 'IN', 'A', '8.8.8.8', '1.1.1.1'),
+    dns.rrset.from_text('www.example.test.', 60, 'IN', 'AAAA', '2001:4860:4860::8888'),
+    dns.rrset.from_text('www.example.test.', 60, 'IN', 'TXT', '"not an address"'),
+  ]
+  if transport == 'classic':
+    domain.append_lookup([record for rrset in rrsets for record in rrset])
+  else:
+    domain.append_doh_lookup(rrsets)
+  assert domain.result.A == ['8.8.8.8', '1.1.1.1']
+  assert domain.result.AAAA == ['2001:4860:4860::8888']
+  assert domain.insert.ips_insert == []
+  assert domain.insert.ips_delete == []
+
+
+async def test_domain_insert_filter_blocks_overlapping_networks_and_delete_requires_persisted_id(app, monkeypatch):
+  monkeypatch.setattr(app.settings, 'ip_not_allowed', '127.0.0.0/8, 2001:db8::/32')
+  domain = app.dto.DomainResult(id=1, name='www.example.test')
+  records = [
+    app.Ip('8.8.8.8', id=1),
+    app.Ip('127.0.0.1', id=2),
+    app.Ip('2001:db8::1', id=3),
+    app.Ip('1.1.1.1'),
+  ]
+  domain.append_ips_to_insert(records)
+  domain.append_ips_to_delete(records)
+  assert domain.insert.ips_insert == [records[0], records[3]]
+  assert domain.insert.ips_delete == [1, 2, 3]
+  # Mutable lookup and writer buffers belong to one domain, including nested defaults.
+  untouched = app.dto.DomainResult(id=2, name='other.example.test')
+  domain.result.A.append('8.8.8.8')
+  assert untouched.result.A == untouched.result.AAAA == []
+  assert untouched.insert.ips_insert == untouched.insert.ips_delete == []
+
+
+@pytest.mark.parametrize(
+  ('address', 'blocked', 'allowed'),
+  [
+    ('8.8.8.8', '', True),
+    ('127.0.0.1', '127.0.0.0/8', False),
+    ('126.255.255.255', '127.0.0.0/8', True),
+    ('127.255.255.255', '127.0.0.0/8', False),
+    ('126.0.0.0/7', '127.0.0.0/8', False),
+    ('2001:db8::1', '127.0.0.0/8, 2001:db8::/32', False),
+    ('2001:4860:4860::8888', '2001:db8::/32', True),
+  ],
+)
+async def test_ip_policy_rejects_any_overlap_but_keeps_other_family_and_neighboring_networks(
+  app, monkeypatch, address, blocked, allowed
+):
+  monkeypatch.setattr(app.settings, 'ip_not_allowed', blocked)
+  module = importlib.import_module('utils.utils')
+  assert module.check_ip_allow(address) is allowed
+
+
+@pytest.mark.parametrize('source', ['blank-name', 'no-servers', 'missing-selected-address'])
+async def test_one_shot_resolution_rejects_missing_source_before_network_or_storage(app, resolver, repository, source):
+  if source == 'blank-name':
+    name, selected, error, message = ' . ', None, ValueError, 'must not be empty'
+  elif source == 'no-servers':
+    name, selected, error, message = 'www.example.test', None, RuntimeError, 'DNS servers for resolve not found'
+    repository.get_dns_servers_for_resolve.return_value = ([], [])
+  else:
+    name = 'www.example.test'
+    selected = [SimpleNamespace(id=12, server=None, doh_server=None)]
+    error, message = RuntimeError, 'does not contain a server address'
+  with pytest.raises(error, match=message):
+    await resolver.resolve_once(name, selected_dns_servers=selected)
+  repository.put_domain_after_resolve.assert_not_awaited()
+  repository.get_all_ips_for_domain.assert_not_awaited()
+  assert repository.get_dns_servers_for_resolve.await_count == (1 if source == 'no-servers' else 0)
+
+
+async def test_saving_dns_snapshot_requires_available_configuration(app, resolver, repository):
+  repository.get_dns_servers_for_resolve.return_value = ([], [])
+  with pytest.raises(app.database.DnsConfigurationReadError, match='Cannot read DNS configuration'):
+    await resolver.saving_dns_snapshot()
+  repository.put_domain_after_resolve.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+  ('exists', 'regular_file', 'metadata', 'expected'),
+  [
+    (False, False, None, 'unknown'),
+    (True, False, None, 'unknown'),
+    (True, True, {}, 'unknown'),
+    (True, True, {'project': {}}, 'unknown'),
+    (True, True, {'project': {'version': '2.3.0'}}, '2.3.0'),
+  ],
+)
+async def test_settings_version_uses_project_metadata_only_when_regular_manifest_exists(
+  app, monkeypatch, exists, regular_file, metadata, expected
+):
+  module = importlib.import_module('config.config')
+  paths, reads = [], []
+
+  def fake_path(path):
+    paths.append(path)
+    return SimpleNamespace(exists=lambda: exists, is_file=lambda: regular_file)
+
+  def load(path):
+    reads.append(path)
+    return metadata
+
+  monkeypatch.setattr(module, 'Path', fake_path)
+  monkeypatch.setattr(module, 'load', load)
+  configuration = module.Settings(_env_file=None, root_path='synthetic-project')
+  assert configuration.app_version == expected
+  assert len(paths) == 1
+  assert paths[0].endswith('pyproject.toml')
+  assert len(reads) == int(exists and regular_file)
+
+
+@pytest.mark.parametrize(
+  ('configured', 'matching', 'nonmatching'),
+  [
+    ('example.com', 'www.EXAMPLE.com', 'www.exampleXcom'),
+    ('example.com,other.test', 'other.test', 'another.test'),
+    ('test+literal.example', 'test+literal.example', 'testttliteral.example'),
+  ],
+)
+async def test_domain_block_pattern_matches_literal_case_insensitive_configured_names(
+  app, monkeypatch, configured, matching, nonmatching
+):
+  monkeypatch.setattr(app.settings, 'domains_black_list', configured)
+  pattern = app.settings.domains_not_allowed_pattern
+  assert pattern is not None
+  assert pattern.search(matching) is not None
+  assert pattern.search(nonmatching) is None
+
+
+async def test_empty_domain_block_list_has_no_pattern_and_metrics_title_is_normalized(app, monkeypatch):
+  monkeypatch.setattr(app.settings, 'domains_black_list', '')
+  monkeypatch.setattr(app.settings, 'app_title', '  GOST RDPR (API) / 2.3  ')
+  assert app.settings.domains_not_allowed_pattern is None
+  assert app.settings.app_title_metrics == 'gost-rdpr-api-2-3'
+
+
+async def test_file_checksum_hashes_utf8_content_with_sha256(app, monkeypatch):
+  from pathlib import Path
+
+  module = importlib.import_module('utils.utils')
+  opened = mock_open(read_data='abc')
+  monkeypatch.setattr(module, 'open', opened, raising=False)
+  path = Path('synthetic-list.txt')
+  assert module.calculate_checksum(path) == 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+  opened.assert_called_once_with(path, encoding='utf-8')

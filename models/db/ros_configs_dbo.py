@@ -96,7 +96,7 @@ class RosConfigsDbo(Dbo):
   @classmethod
   async def get_stats(cls: type[Self], db_session: AsyncSession) -> Row[int]:
     try:
-      select_stmt: Select[int] = select(func.count().label('total'))
+      select_stmt: Select[int] = select(func.count().label('total')).select_from(cls)
       exec_result: Result[int] = await db_session.execute(select_stmt)
       return exec_result.one()
     except Exception as err:

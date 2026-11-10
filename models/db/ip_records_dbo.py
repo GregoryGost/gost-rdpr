@@ -357,6 +357,7 @@ class IpRecordsDbo(Dbo):
     date_field: GrowthDateField,
     start_date: str | None = None,
     end_date: str | None = None,
+    ip_subtype: int | None = None,
   ) -> Sequence[Row[str, int]]:
     try:
       date_col: InstrumentedAttribute = getattr(cls, date_field)
@@ -374,9 +375,14 @@ class IpRecordsDbo(Dbo):
       match granularity:
         case GrowthGranularity.MINUTE | GrowthGranularity.HOUR:
           next_d = func.datetime(date_series_cte.c.d, literal(step))
+        case GrowthGranularity.WEEK:
+          # Calendar week labels change on Mondays and at the start of each year.
+          next_monday = func.date(date_series_cte.c.d, '+1 day', 'weekday 1')
+          next_year = func.date(date_series_cte.c.d, 'start of year', '+1 year')
+          next_d = func.min(next_monday, func.coalesce(next_year, next_monday))
         case _:
           next_d = func.date(date_series_cte.c.d, literal(step))
-      date_series_cte = date_series_cte.union_all(select(next_d.label('d')).where(date_series_cte.c.d < end_raw))
+      date_series_cte = date_series_cte.union_all(select(next_d.label('d')).where(next_d <= end_raw))
       #
       # CTE 2
       #
@@ -389,6 +395,8 @@ class IpRecordsDbo(Dbo):
       )
       if col_nullable:
         counts_stmt = counts_stmt.where(date_col.is_not(None))
+      if ip_subtype is not None:
+        counts_stmt = counts_stmt.where(cls.addr_type == ip_subtype)
       ips_counts_cte: CTE = counts_stmt.cte('ips_counts')
       #
       # Final: LEFT JOIN date series with domain counts

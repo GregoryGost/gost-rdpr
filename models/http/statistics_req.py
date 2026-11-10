@@ -68,8 +68,10 @@ class StatsGrowthQuery(BaseModel):
 
   @field_validator('start_date', mode='before')
   @classmethod
-  def validate_start_date_format(cls: type[Self], value: str) -> str:
+  def validate_start_date_format(cls: type[Self], value: str | None) -> str | None:
     # The query format is timezone-free; retain the existing naive timestamp interpretation.
+    if value is None:
+      return value
     try:
       datetime.strptime(value, DATE_FORMAT)  # noqa: DTZ007
     except ValueError as exc:
@@ -87,7 +89,7 @@ class StatsGrowthQuery(BaseModel):
       raise ValueError(f'Invalid end_date format. Expected: {DATE_FORMAT!r}') from exc
     return value
 
-  @field_validator('ip_subtype', mode='before')
+  @field_validator('ip_subtype', mode='after')
   @classmethod
   def validate_subtype(cls: type[Self], value: int | None) -> int | None:
     if value is not None and value not in (4, 6):
