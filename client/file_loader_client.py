@@ -1,4 +1,5 @@
 from hashlib import sha256
+from ipaddress import IPv6Network
 from re import Pattern, compile
 from typing import Self
 
@@ -13,17 +14,14 @@ from .http_base_client import HttpClient
 
 class FileLoaderClient:
   __ips_pattern: Pattern[str] = compile(
-    r'(\b((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|'
-    r'[1-9]?[0-9])(/([0-9]|[1-2][0-9]|3[0-2]))?\b)|(\b(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|'
-    r'([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|'
-    r'::([0-9a-fA-F]{1,4}:){1,5}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,2}|'
-    r'::([0-9a-fA-F]{1,4}:){1,3}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,2}|'
-    r'::([0-9a-fA-F]{1,4}:){1,2}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,4}:[0-9a-fA-F]{1,4}|'
-    r'::([0-9a-fA-F]{1,4}:){1,1}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}:[0-9a-fA-F]{1,4}|::[0-9a-fA-F]{1,4}|'
-    r'::(:[0-9a-fA-F]{1,4}){1,7})(/([0-9]|[1-9][0-9]|1[0-1][0-9]|12[0-8]))?\b)'
+    r'(?<![\w:])(?P<ipv6>[0-9a-fA-F]*:[0-9a-fA-F]*:(?:[0-9a-fA-F:.]*[0-9a-fA-F:])?'
+    r'(?:/[0-9]+)?)(?![\w:/])|'
+    r'(?P<ipv4>\b(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}'
+    r'(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?:/(?:[0-9]|[1-2][0-9]|3[0-2]))?\b)'
   )
   __domains_pattern: Pattern[str] = compile(
-    r'(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.){1,}(?:[a-zA-Z]{2,6}|xn--[a-z0-9]+)'
+    r'(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.){1,}'
+    r'(?:[xX][nN]--[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,57}[a-zA-Z0-9])?|[a-zA-Z]{2,63})(?![a-zA-Z0-9-])'
   )
   __client: AsyncClient = HttpClient.get_client('file_loader')
 
@@ -96,15 +94,17 @@ class FileLoaderClient:
               hasher.update(line_bytes)
               hasher.update(b'\n')
               #
-              found_ips: list[tuple[str, str]] = [
-                (element[0], element[6]) for element in self.__ips_pattern.findall(line)
-              ]
-              found_elements.update(
-                [entry[0] for entry in found_ips if entry[0] is not None and entry[0] != '']
-              )  # ipv4
-              found_elements.update(
-                [entry[1] for entry in found_ips if entry[1] is not None and entry[1] != '']
-              )  # ipv6
+              for match in self.__ips_pattern.finditer(line):
+                if ipv4 := match['ipv4']:
+                  found_elements.add(ipv4)
+                  continue
+                ipv6 = match['ipv6']
+                try:
+                  IPv6Network(ipv6)
+                except ValueError:
+                  logger.debug('Skipping an invalid IPv6 token in an IP list')
+                  continue
+                found_elements.add(ipv6)
           hash: str = hasher.hexdigest().upper()
           if hash == file.hash:
             continue

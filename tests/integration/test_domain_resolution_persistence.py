@@ -43,6 +43,861 @@ pytestmark = pytest.mark.integration
 STALE_CHECKPOINT = datetime(2000, 1, 1, tzinfo=UTC).replace(tzinfo=None)
 
 
+@pytest.fixture
+async def resource_api(app, store, monkeypatch):
+  """Wire HTTP handlers to the same isolated real database used by repository tests."""
+  api = FastAPI()
+  for module_name, class_name in (
+    ('domains_lists_router', 'DomainsListsRouter'),
+    ('ips_lists_router', 'IpsListsRouter'),
+    ('dns_servers_router', 'DnsServersRouter'),
+    ('domains_router', 'DomainsRouter'),
+    ('ips_router', 'IpsRouter'),
+    ('ros_configs_router', 'RosConfigsRouter'),
+    ('statistics_router', 'StatisticsRouter'),
+  ):
+    module = importlib.import_module(f'routers.{module_name}')
+    monkeypatch.setattr(module, 'db', store)
+    api.include_router(getattr(module, class_name)().get_router())
+  transport = httpx.ASGITransport(app=api, raise_app_exceptions=False)
+  async with httpx.AsyncClient(transport=transport, base_url='http://service.test', trust_env=False) as client:
+    yield client
+
+
+@pytest.mark.parametrize('count', [0, 1, 3])
+async def test_statistics_routeros_total_counts_real_configurations(app, store, resource_api, count):
+  if count:
+    async with store._DataBase__write_engine.begin() as connection:
+      await connection.execute(
+        insert(app.database.RosConfigsDbo),
+        [
+          {
+            'host': f'router-{index}.example.test',
+            'user': 'dummy-user',
+            'passwd': 'dummy-password',
+            'bgp_list_name': 'routes',
+          }
+          for index in range(count)
+        ],
+      )
+  async with AsyncSession(store._DataBase__read_engine) as session:
+    assert (await app.database.RosConfigsDbo.get_stats(session)).total == count
+  response = await resource_api.get('/stats')
+  assert response.status_code == 200
+  payload = response.json()
+  assert payload['ros'] == {'total': count}
+  assert payload['dns'] == {'total': 0, 'classic': 0, 'doh': 0}
+  assert payload['domains'] == {'total': 0, 'resolved': 0, 'unresolved': 0, 'lists_total': 0, 'per_list': []}
+  assert payload['ips'] == {
+    'total': 0,
+    'v4_total': 0,
+    'v6_total': 0,
+    'linked_to_domain': 0,
+    'standalone': 0,
+    'lists_total': 0,
+    'per_list': [],
+  }
+  assert (await store.stats()).ros.total == count
+
+
+@pytest.mark.parametrize(('subtype', 'expected'), [(None, 3), (4, 2), (6, 1)])
+async def test_statistics_ip_growth_filters_version_in_real_sql(app, store, resource_api, subtype, expected):
+  timestamp = datetime(2024, 1, 2, 12, tzinfo=UTC).replace(tzinfo=None)
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.IpRecordsDbo),
+      [
+        {'addr_type': version, 'ip_address': address, 'created_at': timestamp}
+        for version, address in [(4, '8.8.8.8'), (4, '9.9.9.9'), (6, '2001:4860:4860::8888')]
+      ],
+    )
+  query = {'entity': 'ips', 'start_date': '2024-01-01 00:00:00', 'end_date': '2024-01-03 23:59:59'}
+  direct = await store.stats_growth(
+    before_time=perf_counter(),
+    entity='ips',
+    granularity='day',
+    date_field='created_at',
+    start_date=query['start_date'],
+    end_date=query['end_date'],
+    ip_subtype=subtype,
+  )
+  assert direct.total_in_period == expected
+  if subtype is not None:
+    query['ip_subtype'] = subtype
+  response = await resource_api.get('/stats/growth', params=query)
+  assert response.status_code == 200
+  payload = response.json()
+  assert payload['ip_subtype'] == subtype
+  assert payload['total_in_period'] == expected
+  assert payload['payload'] == [
+    {'date': '2024-01-01', 'count': 0},
+    {'date': '2024-01-02', 'count': expected},
+    {'date': '2024-01-03', 'count': 0},
+  ]
+  assert [point.to_dict() for point in direct.payload] == payload['payload']
+
+
+@pytest.mark.parametrize(
+  ('path', 'records', 'field', 'search'),
+  [
+    (
+      '/domains/lists',
+      [
+        {'name': 'first-domain-list', 'url': 'https://lists.example.test/first'},
+        {'name': 'second-domain-list', 'url': 'https://lists.example.test/second', 'description': 'Second list'},
+      ],
+      'name',
+      'second-domain',
+    ),
+    (
+      '/ips/lists',
+      [
+        {'name': 'first-ip-list', 'url': 'https://lists.example.test/first'},
+        {'name': 'second-ip-list', 'url': 'https://lists.example.test/second', 'description': 'Second list'},
+      ],
+      'name',
+      'second-ip',
+    ),
+    ('/dns', [{'server': '8.8.8.8'}, {'doh_server': 'https://dns.example.test/second'}], 'doh_server', 'second'),
+    (
+      '/ros',
+      [
+        {
+          'host': f'router-{name}.example.test',
+          'user': 'dummy-user',
+          'user_password': 'dummy-password',
+          'bgp_list_name': 'routes',
+        }
+        for name in ('first', 'second')
+      ],
+      'host',
+      'router-second',
+    ),
+    (
+      '/domains',
+      [{'domain': 'first.example.test'}, {'domain': 'second.example.test', 'ros_comment': 'Second domain'}],
+      'name',
+      'second',
+    ),
+    (
+      '/ips',
+      [{'addr': '8.8.8.8'}, {'addr': '9.9.9.9', 'use_default_gw': True, 'ros_comment': 'Second address'}],
+      'addr',
+      '9.9.9',
+    ),
+  ],
+)
+async def test_resource_http_crud_reaches_real_writer_and_committed_reads(
+  app, store, resource_api, monkeypatch, path, records, field, search
+):
+  """HTTP success acknowledges admission; queue.join supplies the commit boundary for reads."""
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(insert(app.database.DomainsDbo).values(id=0, name='default'))
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+  await store.start_writer()
+  empty = await resource_api.get(path)
+  assert empty.status_code == 200
+  assert empty.json()['count'] == (1 if path == '/domains' else 0)
+  response = await resource_api.post(path, json=records)
+  assert (response.status_code, response.json()) == (200, {'result': 'OK'})
+  await asyncio.wait_for(store.db_save_queue.join(), timeout=2)
+  response = await resource_api.get(f'{path}/search', params={'text': search})
+  assert response.status_code == 200
+  found = response.json()
+  assert found['count'] == 1
+  record = found['payload'][0]
+  assert record[field] == (records[1].get(field) or records[1]['domain'])
+  assert record['id'] > 0
+  assert record['updated_at'] is None
+  assert record['updated_at_hum'] is None
+  assert isinstance(record['created_at'], (int, float))
+  created = datetime.strptime(record['created_at_hum'], '%Y-%m-%d %H:%M:%S')  # noqa: DTZ007
+  assert created.strftime('%Y-%m-%d %H:%M:%S') == record['created_at_hum']
+  detail = await resource_api.get(f'{path}/{record["id"]}')
+  assert (detail.status_code, detail.json()) == (200, record)
+  page = await resource_api.get(path, params={'limit': 1, 'offset': 1})
+  assert page.status_code == 200
+  assert (page.json()['limit'], page.json()['offset'], page.json()['count']) == (1, 1, 1)
+  assert page.json()['total'] == (3 if path == '/domains' else 2)
+  removed = await resource_api.delete(f'{path}/{record["id"]}')
+  assert (removed.status_code, removed.json()) == (200, {'result': 'OK'})
+  await asyncio.wait_for(store.db_save_queue.join(), timeout=2)
+  missing = await resource_api.get(f'{path}/{record["id"]}')
+  assert missing.status_code == 404
+  assert missing.json()['error'] == 'NOT_FOUND'
+  cleared = await resource_api.delete(path)
+  assert (cleared.status_code, cleared.json()) == (200, {'result': 'OK'})
+  await asyncio.wait_for(store.db_save_queue.join(), timeout=2)
+  remaining = (await resource_api.get(path)).json()
+  assert remaining['count'] == (1 if path == '/domains' else 0)
+  assert store.writer_failure is None
+  assert store._DataBase__read_engine.pool.checkedout() == 0
+
+
+@pytest.mark.parametrize('path', ['/domains/lists', '/ips/lists', '/dns', '/ros', '/domains', '/ips'])
+async def test_resource_http_rejects_empty_or_invalid_writes_before_queue_admission(store, resource_api, path):
+  response = await resource_api.post(path, json=[])
+  assert (response.status_code, response.json()) == (400, {'status': 'No Data'})
+  response = await resource_api.post(path, json=[{}])
+  assert response.status_code == 422
+  assert response.json()['detail'][0]['loc'][0] == 'body'
+  assert store.db_save_queue.qsize() == 0
+
+
+@pytest.mark.parametrize('path', ['/domains/lists', '/ips/lists', '/dns', '/ros', '/domains', '/ips'])
+@pytest.mark.parametrize('params', [{'limit': 0}, {'offset': -1}, {'start_date': '2024-02-30 00:00:00'}])
+async def test_resource_http_validates_query_boundaries(resource_api, path, params):
+  response = await resource_api.get(path, params=params)
+  assert response.status_code == 422
+  assert response.json()['detail'][0]['loc'][0] == 'query'
+
+
+@pytest.mark.parametrize('path', ['/domains/lists', '/ips/lists', '/dns', '/ros', '/domains', '/ips'])
+async def test_resource_http_reports_unknown_records_and_invalid_identifiers(resource_api, path):
+  response = await resource_api.get(f'{path}/987654')
+  assert response.status_code == 404
+  assert response.json()['error'] == 'NOT_FOUND'
+  assert '987654' in response.json()['resolution']
+  response = await resource_api.get(f'{path}/not-an-id')
+  assert response.status_code == 422
+  assert response.json()['detail'][0]['loc'] == ['path', 'id']
+
+
+@pytest.fixture
+async def catalog_store(app, store):
+  """Fixed dates and mixed nullable metadata make SQL filter results independently predictable."""
+  first = datetime(2024, 1, 1, 12, tzinfo=UTC).replace(tzinfo=None)
+  second = datetime(2024, 1, 2, 12, tzinfo=UTC).replace(tzinfo=None)
+  last = datetime(2024, 1, 4, 12, tzinfo=UTC).replace(tzinfo=None)
+  async with store._DataBase__write_engine.begin() as connection:
+    for model in (app.database.DomainsListsDbo, app.database.IpsListsDbo):
+      await connection.execute(
+        insert(model),
+        [
+          {
+            'id': index,
+            'name': f'list-{index}',
+            'url': f'https://lists.example.test/source-{index}',
+            'description': None if index == 1 else f'Description {index}',
+            'attempts': index - 1,
+            'created_at': timestamp,
+            'updated_at': None if index == 1 else last,
+            'hash': None if index == 1 else 'known-hash',
+          }
+          for index, timestamp in [(1, first), (2, second), (3, last)]
+        ],
+      )
+    await connection.execute(
+      insert(app.database.DomainsDbo),
+      [
+        {
+          'id': index,
+          'name': f'domain-{index}.example.test',
+          'domain_list_id': 2 if index else None,
+          'resolved': index == 2,
+          'created_at': timestamp,
+          'updated_at': None if index == 1 else last,
+          'last_resolved_at': last if index == 2 else None,
+          'ros_comment': 'Domain comment' if index == 2 else None,
+        }
+        for index, timestamp in [(0, first), (1, first), (2, second), (3, last)]
+      ],
+    )
+    await connection.execute(
+      insert(app.database.IpRecordsDbo),
+      [
+        {
+          'id': index,
+          'ip_address': address,
+          'addr_type': version,
+          'domain_id': 2,
+          'ip_list_id': 2,
+          'use_default_gw': index == 2,
+          'created_at': timestamp,
+          'updated_at': None if index == 1 else last,
+          'ros_comment': 'IP comment' if index == 1 else None,
+        }
+        for index, address, version, timestamp in [
+          (1, '8.8.8.8', 4, first),
+          (2, '9.9.9.9', 4, second),
+          (3, '2001:4860:4860::8888', 6, last),
+        ]
+      ],
+    )
+    await connection.execute(
+      insert(app.database.IpSupportDbo),
+      [{'ip_record_id': index, 'domain_id': 2, 'ip_list_id': 2} for index in (1, 2, 3)],
+    )
+    await connection.execute(
+      insert(app.database.DnsServersDbo),
+      [
+        {
+          'id': index,
+          'server': server,
+          'doh_server': doh,
+          'created_at': timestamp,
+          'updated_at': None if index == 1 else last,
+        }
+        for index, server, doh, timestamp in [
+          (0, '1.1.1.1', None, first),
+          (1, '8.8.8.8', None, first),
+          (2, None, 'https://dns.example.test/source-2', second),
+        ]
+      ],
+    )
+    await connection.execute(
+      insert(app.database.RosConfigsDbo),
+      [
+        {
+          'id': index,
+          'host': f'router-{index}.example.test',
+          'user': f'dummy-user-{index}',
+          'passwd': 'dummy-password',
+          'bgp_list_name': f'routes-{index}',
+          'created_at': timestamp,
+          'updated_at': None if index == 1 else last,
+        }
+        for index, timestamp in [(0, first), (1, first), (2, second), (3, last)]
+      ],
+    )
+  return store
+
+
+@pytest.mark.parametrize(
+  ('path', 'params', 'expected_ids'),
+  [
+    ('/domains/lists', {'attempts': 1}, {2}),
+    ('/ips/lists', {'attempts': 1}, {2}),
+    ('/domains/lists/search', {'text': 'source-2'}, {2}),
+    ('/ips/lists/search', {'text': 'source-2'}, {2}),
+    ('/domains/lists/search', {'text': 'list-3', 'attempts': 1}, set()),
+    ('/ips/lists/search', {'text': 'list-3', 'attempts': 1}, set()),
+    ('/ips', {'type': 6}, {3}),
+    ('/ips', {'type': 4, 'default_gw': 'true'}, {2}),
+    ('/ips', {'type': 4, 'default_gw': 'false'}, {1}),
+    ('/ips/search', {'text': '8.8'}, {1}),
+    ('/domains', {'resolved': 'true'}, {2}),
+    ('/domains/search', {'text': 'domain-1', 'resolved': 'false'}, {1}),
+    ('/dns', {'default': 'false'}, {1, 2}),
+    ('/dns', {'default': 'true'}, {0, 1, 2}),
+    ('/dns/search', {'text': 'source-2'}, {2}),
+    ('/ros/search', {'text': 'router-2'}, {2}),
+    ('/ros/search', {'text': 'dummy-user-2'}, {2}),
+    ('/ros/search', {'text': 'routes-2'}, {2}),
+  ],
+)
+async def test_catalog_http_filters_select_only_matching_sql_rows(
+  catalog_store, resource_api, path, params, expected_ids
+):
+  response = await resource_api.get(path, params=params)
+  assert response.status_code == 200
+  payload = response.json()
+  assert payload['count'] == len(expected_ids)
+  assert {item['id'] for item in payload['payload']} == expected_ids
+  assert catalog_store._DataBase__read_engine.pool.checkedout() == 0
+
+
+@pytest.mark.parametrize('path', ['/domains/lists', '/ips/lists', '/dns', '/ros', '/domains', '/ips'])
+@pytest.mark.parametrize('mode', ['start', 'end', 'both'])
+async def test_catalog_http_date_filters_preserve_timestamp_metadata(catalog_store, resource_api, path, mode):
+  query = {}
+  if mode in {'start', 'both'}:
+    query['start_date'] = '2024-01-02 00:00:00'
+  if mode in {'end', 'both'}:
+    query['end_date'] = '2024-01-03 23:59:59'
+  response = await resource_api.get(path, params=query)
+  assert response.status_code == 200
+  rows = response.json()['payload']
+  expected = {2, 3} if mode == 'start' else {1, 2}
+  if path == '/dns' and mode == 'start':
+    expected = {2}
+  if path in {'/dns', '/ros', '/domains'} and mode == 'end':
+    expected.add(0)
+  if mode == 'both':
+    expected = {2}
+  assert {row['id'] for row in rows} == expected
+  for row in rows:
+    detail = await resource_api.get(f'{path}/{row["id"]}')
+    if path == '/ros' and row['id'] == 0:
+      # The repository supports default exclusion; individual HTTP configurations start at ID 1.
+      assert detail.status_code == 422
+      continue
+    assert (detail.status_code, detail.json()) == (200, row)
+    if row['id'] == 2:
+      assert row['created_at_hum'] == '2024-01-02 12:00:00'
+      assert row['updated_at_hum'] == '2024-01-04 12:00:00'
+
+
+@pytest.mark.parametrize('kind', ['domains', 'ips'])
+@pytest.mark.parametrize('forced', [False, True])
+async def test_list_refresh_selection_honors_attempt_limit_and_force(app, store, monkeypatch, kind, forced):
+  monkeypatch.setattr(app.settings, 'attempts_limit', 3)
+  monkeypatch.setattr(app.settings, 'lists_update_interval_sec', 3600)
+  model = app.database.DomainsListsDbo if kind == 'domains' else app.database.IpsListsDbo
+  past = datetime(2000, 1, 1, tzinfo=UTC).replace(tzinfo=None)
+  future = datetime(2999, 1, 1, tzinfo=UTC).replace(tzinfo=None)
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(model),
+      [
+        {
+          'id': index,
+          'name': f'list-{index}',
+          'url': f'https://lists.example.test/{index}',
+          'attempts': attempts,
+          'updated_at': timestamp,
+        }
+        for index, attempts, timestamp in [(1, 0, None), (2, 2, past), (3, 0, future), (4, 3, None), (5, 4, past)]
+      ],
+    )
+  async with AsyncSession(store._DataBase__read_engine) as session:
+    selected = await model.get_for_update(session, forced=forced)
+  assert {row.id for row in selected} == ({1, 2, 3} if forced else {1, 2})
+  assert {row.id: row.attempts for row in selected} == ({1: 0, 2: 2, 3: 0} if forced else {1: 0, 2: 2})
+  assert next(row for row in selected if row.id == 1).updated_at is None
+  assert next(row for row in selected if row.id == 2).updated_at == past
+
+
+async def test_catalog_related_counts_and_router_update_projections(app, catalog_store):
+  domain_list = await catalog_store.get_domains_list_on_id(2)
+  ip_list = await catalog_store.get_ips_list_on_id(2)
+  assert domain_list.elements_count == 3
+  assert (ip_list.ip_v4_count, ip_list.ip_v6_count) == (2, 1)
+  assert (await catalog_store.get_domains_list_on_id(1)).elements_count == 0
+  empty = await catalog_store.get_ips_list_on_id(1)
+  assert (empty.ip_v4_count, empty.ip_v6_count) == (0, 0)
+  assert {item.name for item in await catalog_store.get_all_domains_on_domains_list(2)} == {
+    'domain-1.example.test',
+    'domain-2.example.test',
+    'domain-3.example.test',
+  }
+  assert {item.ip_address for item in await catalog_store.get_all_ips_on_ips_list(2)} == {
+    '8.8.8.8',
+    '9.9.9.9',
+    '2001:4860:4860::8888',
+  }
+  for version, expected in [
+    (None, {'8.8.8.8', '9.9.9.9', '2001:4860:4860::8888'}),
+    (4, {'8.8.8.8', '9.9.9.9'}),
+    (6, {'2001:4860:4860::8888'}),
+  ]:
+    records = await catalog_store.get_all_ips_for_update(addr_type=version)
+    assert {item.ip_address for item in records} == expected
+    assert {item.ip_address: item.comment for item in records} == {
+      address: ('IP comment' if address == '8.8.8.8' else 'Domain comment') for address in expected
+    }
+  configs = await catalog_store.get_all_configs_for_ros_update()
+  assert {item.host for item in configs} == {f'router-{index}.example.test' for index in range(4)}
+  assert all(item.passwd == 'dummy-password' for item in configs)
+
+
+@pytest.mark.parametrize('entity', ['domains', 'ips', 'lists'])
+@pytest.mark.parametrize('date_field', ['created_at', 'updated_at'])
+async def test_growth_daily_series_zero_fills_gaps_and_ignores_null_dates(
+  catalog_store, resource_api, entity, date_field
+):
+  response = await resource_api.get(
+    '/stats/growth',
+    params={
+      'entity': entity,
+      'date_filter_field': date_field,
+      'start_date': '2024-01-01 00:00:00',
+      'end_date': '2024-01-05 23:59:59',
+    },
+  )
+  assert response.status_code == 200
+  expected = {
+    ('domains', 'created_at'): [2, 1, 0, 1, 0],
+    ('ips', 'created_at'): [1, 1, 0, 1, 0],
+    ('lists', 'created_at'): [2, 2, 0, 2, 0],
+    ('domains', 'updated_at'): [0, 0, 0, 3, 0],
+    ('ips', 'updated_at'): [0, 0, 0, 2, 0],
+    ('lists', 'updated_at'): [0, 0, 0, 4, 0],
+  }[entity, date_field]
+  payload = response.json()
+  assert payload['total_in_period'] == sum(expected)
+  assert payload['payload'] == [
+    {'date': f'2024-01-0{index}', 'count': count} for index, count in enumerate(expected, start=1)
+  ]
+  assert payload['entity'] == entity
+  assert payload['granularity'] == 'day'
+
+
+@pytest.mark.parametrize('entity', ['domains', 'ips', 'lists'])
+@pytest.mark.parametrize('granularity', ['minute', 'hour', 'week', 'month', 'year'])
+async def test_growth_supported_granularities_group_actual_rows(catalog_store, resource_api, entity, granularity):
+  ranges = {
+    'minute': (
+      '2024-01-02 12:00:00',
+      '2024-01-02 12:02:00',
+      ['2024-01-02 12:00', '2024-01-02 12:01', '2024-01-02 12:02'],
+    ),
+    'hour': ('2024-01-02 12:00:00', '2024-01-02 14:00:00', ['2024-01-02 12', '2024-01-02 13', '2024-01-02 14']),
+    'week': ('2024-01-01 00:00:00', '2024-01-15 00:00:00', ['2024-01', '2024-02', '2024-03']),
+    'month': ('2024-01-01 00:00:00', '2024-03-01 00:00:00', ['2024-01', '2024-02', '2024-03']),
+    'year': ('2024-01-01 00:00:00', '2026-01-01 00:00:00', ['2024', '2025', '2026']),
+  }
+  start, end, labels = ranges[granularity]
+  count = (
+    (2 if entity == 'lists' else 1)
+    if granularity in {'minute', 'hour'}
+    else {'domains': 4, 'ips': 3, 'lists': 6}[entity]
+  )
+  response = await resource_api.get(
+    '/stats/growth',
+    params={
+      'entity': entity,
+      'granularity': granularity,
+      'start_date': start,
+      'end_date': end,
+    },
+  )
+  assert response.status_code == 200
+  payload = response.json()
+  assert payload['payload'] == [
+    {'date': label, 'count': count if index == 0 else 0} for index, label in enumerate(labels)
+  ]
+  assert payload['total_in_period'] == count
+
+
+async def test_growth_resolution_checkpoints_use_their_own_date_field(catalog_store, resource_api):
+  response = await resource_api.get(
+    '/stats/growth',
+    params={
+      'entity': 'domains',
+      'date_filter_field': 'last_resolved_at',
+      'start_date': '2024-01-03 00:00:00',
+      'end_date': '2024-01-05 23:59:59',
+    },
+  )
+  assert response.status_code == 200
+  assert response.json()['total_in_period'] == 1
+  assert response.json()['payload'] == [
+    {'date': '2024-01-03', 'count': 0},
+    {'date': '2024-01-04', 'count': 1},
+    {'date': '2024-01-05', 'count': 0},
+  ]
+
+
+@pytest.mark.parametrize('entity', ['domains', 'ips', 'lists'])
+async def test_growth_weekly_series_stays_within_requested_bucket_range(catalog_store, resource_api, entity):
+  response = await resource_api.get(
+    '/stats/growth',
+    params={
+      'entity': entity,
+      'granularity': 'week',
+      'start_date': '2024-01-01 00:00:00',
+      'end_date': '2024-01-10 23:59:59',
+    },
+  )
+  assert response.status_code == 200
+  assert response.json()['payload'] == [
+    {'date': '2024-01', 'count': {'domains': 4, 'ips': 3, 'lists': 6}[entity]},
+    {'date': '2024-02', 'count': 0},
+  ]
+
+
+@pytest.mark.parametrize('entity', ['domains', 'ips', 'lists'])
+@pytest.mark.parametrize(
+  ('dates', 'expected'),
+  [
+    (['2024-01-03', '2024-01-07', '2024-01-08'], [('2024-01', 2), ('2024-02', 1)]),
+    (
+      ['2024-12-30', '2025-01-01', '2025-01-06', '2025-01-07'],
+      [('2024-53', 1), ('2025-00', 1), ('2025-01', 2)],
+    ),
+  ],
+)
+async def test_growth_weekly_series_covers_partial_weeks_and_calendar_year_boundaries(
+  app, store, resource_api, entity, dates, expected
+):
+  """The established %Y-%W labels split a calendar week at January 1."""
+  model = {
+    'domains': app.database.DomainsDbo,
+    'ips': app.database.IpRecordsDbo,
+    'lists': app.database.DomainsListsDbo,
+  }[entity]
+  records = []
+  for index, date in enumerate(dates, start=1):
+    row = {'created_at': datetime.fromisoformat(f'{date}T12:00:00+00:00').replace(tzinfo=None)}
+    if entity == 'ips':
+      row.update(addr_type=4, ip_address=f'8.8.8.{index}')
+    else:
+      row['name'] = f'record-{index}.example.test'
+      if entity == 'lists':
+        row['url'] = f'https://lists.example.test/{index}'
+    records.append(row)
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(insert(model), records)
+  response = await resource_api.get(
+    '/stats/growth',
+    params={
+      'entity': entity,
+      'granularity': 'week',
+      'start_date': f'{dates[0]} 00:00:00',
+      'end_date': f'{dates[-1]} 23:59:59',
+    },
+  )
+  assert response.status_code == 200
+  assert response.json()['total_in_period'] == len(dates)
+  assert response.json()['payload'] == [{'date': date, 'count': count} for date, count in expected]
+
+
+@pytest.mark.parametrize(
+  'query',
+  [
+    {'entity': 'unknown'},
+    {'entity': 'domains', 'ip_subtype': 4},
+    {'entity': 'ips', 'ip_subtype': 5},
+    {'entity': 'lists', 'date_filter_field': 'last_resolved_at'},
+    {'entity': 'ips', 'granularity': 'second'},
+    {'entity': 'domains', 'start_date': '2024-01-03 00:00:00', 'end_date': '2024-01-01 00:00:00'},
+  ],
+)
+async def test_growth_http_rejects_invalid_filter_combinations(resource_api, query):
+  response = await resource_api.get('/stats/growth', params=query)
+  assert response.status_code == 422
+  assert response.json()['detail'][0]['loc'][0] == 'query'
+
+
+async def test_catalog_statistics_aggregate_all_resources_and_per_list_counts(catalog_store, resource_api):
+  response = await resource_api.get('/stats')
+  assert response.status_code == 200
+  payload = response.json()
+  assert payload['dns'] == {'total': 3, 'classic': 2, 'doh': 1}
+  assert payload['ros'] == {'total': 4}
+  assert {key: value for key, value in payload['domains'].items() if key != 'per_list'} == {
+    'total': 4,
+    'resolved': 1,
+    'unresolved': 3,
+    'lists_total': 3,
+  }
+  assert {key: value for key, value in payload['ips'].items() if key != 'per_list'} == {
+    'total': 3,
+    'v4_total': 2,
+    'v6_total': 1,
+    'linked_to_domain': 3,
+    'standalone': 0,
+    'lists_total': 3,
+  }
+  assert sorted(payload['domains']['per_list'], key=lambda row: row['list_id']) == [
+    {
+      'list_id': index,
+      'list_name': f'list-{index}',
+      'attempts': index - 1,
+      'total': 3 if index == 2 else 0,
+      'resolved': 1 if index == 2 else 0,
+      'unresolved': 2 if index == 2 else 0,
+    }
+    for index in (1, 2, 3)
+  ]
+  assert sorted(payload['ips']['per_list'], key=lambda row: row['list_id']) == [
+    {
+      'list_id': index,
+      'list_name': f'list-{index}',
+      'attempts': index - 1,
+      'total': 3 if index == 2 else 0,
+      'v4_count': 2 if index == 2 else 0,
+      'v6_count': 1 if index == 2 else 0,
+    }
+    for index in (1, 2, 3)
+  ]
+
+
+@pytest.mark.parametrize('method', ['get_all_domains', 'get_all_dns_servers', 'get_all_ros_configs'])
+@pytest.mark.parametrize('default', [None, False, True])
+async def test_catalog_repository_default_filters_preserve_public_totals(catalog_store, method, default):
+  response = await getattr(catalog_store, method)(before_time=perf_counter(), limit=10, offset=0, default=default)
+  expected = {0, 1, 2} if method == 'get_all_dns_servers' else {0, 1, 2, 3}
+  assert response.total == len(expected)
+  if default is False:
+    expected.remove(0)
+  assert {row.id for row in response.payload} == expected
+
+
+@pytest.mark.parametrize('kind', ['domains', 'ips'])
+async def test_list_loader_reconciles_changed_hashes_and_retires_unavailable_lists(app, store, monkeypatch, kind):
+  """Use the real downloader/parser and SQL writer; only the upstream HTTP transport is synthetic."""
+  monkeypatch.setattr(app.settings, 'attempts_limit', 3)
+  registry_module = importlib.import_module('jobs.job_registry')
+  registry = registry_module.JobRegistry()
+  monkeypatch.setattr(app.database, 'job_registry', registry)
+  assert await registry.try_start(registry_module.Jobs.LISTS_LOAD)
+  model = app.database.DomainsListsDbo if kind == 'domains' else app.database.IpsListsDbo
+  content = 'retained.example.test\nadded.example.test\n' if kind == 'domains' else '8.8.8.8\n8.8.4.4\n'
+  unchanged = 'unchanged.example.test\n' if kind == 'domains' else '1.1.1.1\n'
+  requests = []
+
+  def upstream(request):
+    requests.append((request.method, request.url.path))
+    if request.url.path in {'/3', '/4'}:
+      return httpx.Response(404)
+    assert request.url.host == 'lists.example.test'
+    return httpx.Response(200, text=unchanged if request.url.path == '/2' else content)
+
+  monkeypatch.setattr(store.file_loader_client, '_FileLoaderClient__client', app.make_http(upstream))
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(model),
+      [
+        {
+          'id': index,
+          'name': f'list-{index}',
+          'url': f'https://lists.example.test/{index}',
+          'attempts': 2 if index == 3 else 0,
+          'hash': sha256(unchanged.encode()).hexdigest().upper() if index == 2 else None,
+        }
+        for index in (1, 2, 3, 4)
+      ],
+    )
+    await connection.execute(insert(app.database.DomainsDbo).values(id=0, name='default'))
+    if kind == 'domains':
+      await connection.execute(
+        insert(app.database.DomainsDbo),
+        [
+          {'id': index, 'name': name, 'domain_list_id': list_id}
+          for index, name, list_id in [
+            (1, 'retained.example.test', 1),
+            (2, 'obsolete.example.test', 1),
+            (3, 'unchanged.example.test', 2),
+            (4, 'retired.example.test', 3),
+          ]
+        ],
+      )
+    else:
+      await connection.execute(
+        insert(app.database.IpRecordsDbo),
+        [
+          {'id': index, 'ip_address': address, 'addr_type': 4, 'domain_id': 0, 'ip_list_id': list_id}
+          for index, address, list_id in [(1, '8.8.8.8', 1), (2, '9.9.9.9', 1), (3, '1.1.1.1', 2), (4, '4.4.4.4', 3)]
+        ],
+      )
+      await connection.execute(
+        insert(app.database.IpSupportDbo),
+        [
+          {'ip_record_id': index, 'domain_id': 0, 'ip_list_id': list_id}
+          for index, list_id in [(1, 1), (2, 1), (3, 2), (4, 3)]
+        ],
+      )
+  await store.lists_load(forced=True)
+  assert not await registry.is_active(registry_module.Jobs.LISTS_LOAD)
+  assert requests == [('HEAD', '/1'), ('GET', '/1'), ('HEAD', '/2'), ('GET', '/2'), ('HEAD', '/3'), ('HEAD', '/4')]
+  await flush_queue(store)
+  getter = store.get_domains_list_on_id if kind == 'domains' else store.get_ips_list_on_id
+  assert await getter(3) is None
+  assert (await getter(1)).hash == sha256(content.encode()).hexdigest().upper()
+  assert (await getter(2)).hash == sha256(unchanged.encode()).hexdigest().upper()
+  assert (await getter(4)).attempts == 1
+  assert (await getter(4)).updated_at is not None
+  if kind == 'domains':
+    rows = await store.get_all_domains(before_time=perf_counter(), limit=10, offset=0)
+    assert {row.name for row in rows.payload} == {
+      'default',
+      'retained.example.test',
+      'added.example.test',
+      'unchanged.example.test',
+    }
+    assert next(row for row in rows.payload if row.name == 'retained.example.test').id == 1
+  else:
+    rows = await store.get_all_ips(before_time=perf_counter(), limit=10, offset=0)
+    assert {row.addr for row in rows.payload} == {'8.8.8.8', '8.8.4.4', '1.1.1.1'}
+    assert next(row for row in rows.payload if row.addr == '8.8.8.8').id == 1
+
+
+@pytest.mark.parametrize('path', ['/domains/lists', '/ips/lists', '/dns', '/ros', '/domains', '/ips'])
+async def test_catalog_empty_search_and_out_of_range_page_do_not_change_storage(catalog_store, resource_api, path):
+  response = await resource_api.get(f'{path}/search', params={'text': "' OR 1=1 --"})
+  assert response.status_code == 200
+  assert response.json()['payload'] == []
+  assert response.json()['count'] == 0
+  page = await resource_api.get(path, params={'limit': 1, 'offset': 999})
+  assert page.status_code == 200
+  assert page.json()['payload'] == []
+  assert page.json()['count'] == 0
+  all_rows = await resource_api.get(path)
+  assert all_rows.status_code == 200
+  assert all_rows.json()['count'] == all_rows.json()['total']
+  assert all_rows.json()['count'] == (4 if path in {'/domains', '/ros'} else 3)
+
+
+@pytest.mark.parametrize(
+  ('path', 'method'),
+  [
+    ('/domains/lists', 'get_all_domains_lists'),
+    ('/domains/lists/search?text=known', 'get_all_domains_lists'),
+    ('/domains/lists/1', 'get_domains_list_on_id'),
+    ('/ips/lists', 'get_all_ips_lists'),
+    ('/ips/lists/search?text=known', 'get_all_ips_lists'),
+    ('/ips/lists/1', 'get_ips_list_on_id'),
+    ('/dns', 'get_all_dns_servers'),
+    ('/dns/search?text=known', 'get_all_dns_servers'),
+    ('/dns/1', 'get_dns_server_on_id'),
+    ('/ros', 'get_all_ros_configs'),
+    ('/ros/search?text=known', 'get_all_ros_configs'),
+    ('/ros/1', 'get_ros_config_on_id'),
+    ('/ips', 'get_all_ips'),
+    ('/ips/search?text=known', 'get_all_ips'),
+    ('/ips/1', 'get_ip_record_on_id'),
+    ('/domains', 'get_all_domains'),
+    ('/domains/search?text=known', 'get_all_domains'),
+    ('/domains/1', 'get_domain_on_id'),
+    ('/stats', 'stats'),
+    ('/stats/growth?entity=domains', 'stats_growth'),
+  ],
+)
+async def test_resource_http_maps_repository_failure_to_json_error(app, store, resource_api, monkeypatch, path, method):
+  """The repository boundary fails here; these assertions cover HTTP error mapping, not SQL execution."""
+  failure = app.database.DatabaseReadError('Cannot read domain records')
+  monkeypatch.setattr(store, method, AsyncMock(side_effect=failure))
+  response = await resource_api.get(path)
+  assert response.status_code == 500
+  assert response.headers['content-type'].startswith('application/json')
+  assert response.json() == {'error': 'Cannot read domain records'}
+  assert store.db_save_queue.qsize() == 0
+
+
+@pytest.mark.parametrize(
+  ('path', 'body', 'status_code', 'message'),
+  [
+    ('/domains/resolve/check', {'id': 999}, 404, "Domain with ID '999' not found in local db"),
+    ('/domains/resolve/check', {'id': 2, 'dns_server_ids': [999]}, 404, "DNS server ID '999' not found in local db"),
+    ('/ips/ripe/check', {'id': 999}, 404, "IP address with ID '999' not found in local db"),
+    ('/ips/ripe/check', {'id': 3}, 422, 'Only IPv4 addresses are supported by this check'),
+  ],
+)
+async def test_catalog_lookup_checks_reject_missing_or_incompatible_records_without_network(
+  catalog_store, resource_api, path, body, status_code, message
+):
+  response = await resource_api.post(path, json=body)
+  assert response.status_code == status_code
+  assert response.json() == (
+    {'error': 'NOT_FOUND', 'resolution': message} if status_code == 404 else {'error': message, 'resolution': None}
+  )
+  assert catalog_store.db_save_queue.qsize() == 0
+
+
+async def test_lists_command_runs_real_empty_job_and_respects_existing_reservation(app, store, monkeypatch):
+  module = importlib.import_module('routers.commands_router')
+  registry_module = importlib.import_module('jobs.job_registry')
+  registry = registry_module.JobRegistry()
+  monkeypatch.setattr(module, 'db', store)
+  monkeypatch.setattr(module, 'job_registry', registry)
+  monkeypatch.setattr(app.database, 'job_registry', registry)
+  api = FastAPI()
+  api.include_router(module.CommandsRouter().get_router())
+  async with httpx.AsyncClient(
+    transport=httpx.ASGITransport(app=api), base_url='http://service.test', trust_env=False
+  ) as client:
+    response = await client.post('/commands/lists/load', params={'forced': True})
+    assert (response.status_code, response.json()) == (200, {'result': 'OK'})
+    assert not await registry.is_active(registry_module.Jobs.LISTS_LOAD)
+    assert await registry.try_start(registry_module.Jobs.LISTS_LOAD)
+    response = await client.post('/commands/lists/load')
+    assert (response.status_code, response.json()) == (200, {'result': 'Job lists_load is Run'})
+    assert await registry.is_active(registry_module.Jobs.LISTS_LOAD)
+  assert store.db_save_queue.qsize() == 0
+
+
 def sqlite_snapshot(path):
   """Capture physical schema and data, including every historical row."""
   with closing(sqlite3.connect(path)) as connection:

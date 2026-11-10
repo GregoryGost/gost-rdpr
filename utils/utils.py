@@ -25,10 +25,10 @@ def check_ip_allow(ip: str) -> bool:
 
 def get_ip_without_prefix(ip_address: str) -> str:
   try:
-    ipPefix = ip_network(ip_address).prefixlen
-    if ipPefix != 32:
+    network = ip_network(ip_address)
+    if network.version != 4 or network.prefixlen != 32:
       return ip_address
-    ip = ip_network(ip_address, strict=False).network_address
+    ip = network.network_address
     return str(ip)
   except Exception as err:
     raise err

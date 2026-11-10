@@ -1,0 +1,60 @@
+name: PR checks
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+    branches:
+      - develop
+
+permissions:
+  contents: read
+
+env:
+  BACKEND_SHA: ${{ github.sha }}
+
+jobs:
+  checks:
+    name: Lint, types and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: python:3.15-slim-trixie
+      options: --user 0:0
+    env:
+      POETRY_VIRTUALENVS_IN_PROJECT: 'true'
+      POETRY_NO_INTERACTION: '1'
+      PYTHON_DOTENV_DISABLED: '1'
+    steps:
+      - name: Checkout tested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BACKEND_SHA }}
+          persist-credentials: false
+
+      - name: Install build and type-check prerequisites
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends build-essential git nodejs
+
+      - name: Install locked dependencies
+        run: |
+          python -m pip install --no-cache-dir poetry==2.5.1
+          poetry install --with dev --no-ansi
+
+      - name: Ruff lint
+        run: .venv/bin/python -m ruff check .
+
+      - name: Ruff format check
+        run: .venv/bin/python -m ruff format --check .
+
+      - name: Pyright
+        run: .venv/bin/python -m pyright --project pyproject.toml
+
+      - name: Unit, integration and service E2E tests with coverage
+        run: >-
+          .venv/bin/python -m pytest -n 0 -m "not e2e_load"
+          --cov --cov-config=pyproject.toml
+          --cov-report=term-missing --cov-report=html

@@ -1,9 +1,7 @@
 name: Develop image
 
 on:
-  pull_request_target:
-    types:
-      - closed
+  push:
     branches:
       - develop
   workflow_dispatch:
@@ -12,70 +10,49 @@ permissions:
   contents: read
 
 env:
-  BACKEND_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || github.sha }}
-
-concurrency:
-  group: develop-release
-  cancel-in-progress: false
-  queue: max
+  BACKEND_SHA: ${{ github.sha }}
 
 jobs:
-  checks:
-    name: Lint, types and tests
+  release_source:
+    name: Verify development release commit
     if: >-
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop') ||
-      (github.event_name == 'pull_request_target' && github.event.action == 'closed' &&
-      github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'develop' &&
-      github.event.pull_request.merge_commit_sha)
+      github.ref == 'refs/heads/develop' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && !github.event.created && !github.event.deleted && !github.event.forced))
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    container:
-      image: python:3.15-slim-trixie
-      options: --user 0:0
-    env:
-      POETRY_VIRTUALENVS_IN_PROJECT: 'true'
-      POETRY_NO_INTERACTION: '1'
-      PYTHON_DOTENV_DISABLED: '1'
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      publish: ${{ steps.source.outputs.result }}
     steps:
-      - name: Checkout tested commit
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Confirm the commit resulted from a merge into develop
+        id: source
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
-          ref: ${{ env.BACKEND_SHA }}
-          persist-credentials: false
+          script: |
+            if (context.eventName === 'workflow_dispatch') return true;
 
-      - name: Install build and type-check prerequisites
-        run: |
-          apt-get update
-          apt-get install --yes --no-install-recommends build-essential git nodejs
+            const candidates = await github.paginate(github.rest.repos.listPullRequestsAssociatedWithCommit, {
+              ...context.repo, commit_sha: context.sha,
+            });
+            for (const candidate of candidates) {
+              if (candidate.state !== 'closed' || candidate.base.ref !== 'develop') continue;
+              const {data: pull} = await github.rest.pulls.get({...context.repo, pull_number: candidate.number});
+              if (pull.merged && pull.base.ref === 'develop' && pull.merge_commit_sha === context.sha) return true;
+            }
 
-      - name: Install locked dependencies
-        run: |
-          python -m pip install --no-cache-dir poetry==2.5.1
-          poetry install --with dev --no-ansi
-
-      - name: Ruff lint
-        run: .venv/bin/python -m ruff check .
-
-      - name: Ruff format check
-        run: .venv/bin/python -m ruff format --check .
-
-      - name: Pyright
-        run: .venv/bin/python -m pyright --project pyproject.toml
-
-      - name: Unit, integration and service E2E tests with coverage
-        run: >-
-          .venv/bin/python -m pytest -n 0 -m "not e2e_load"
-          --cov --cov-config=pyproject.toml
-          --cov-report=term-missing --cov-report=html
+            core.notice('Skipping image publication because the commit is not a merged pull request result');
+            return false;
 
   publish:
     name: Tag and publish development image
-    needs: checks
-    if: >-
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop') ||
-      (github.event_name == 'pull_request_target' && github.event.action == 'closed' &&
-      github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'develop' &&
-      github.event.pull_request.merge_commit_sha)
+    needs: release_source
+    if: needs.release_source.outputs.publish == 'true'
+    concurrency:
+      group: develop-release
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
