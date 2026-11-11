@@ -29,6 +29,7 @@ jobs:
       queue: max
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    cache-mode: write
     permissions:
       contents: write
     env:
@@ -260,7 +261,7 @@ jobs:
             index:org.opencontainers.image.version=${{ steps.release.outputs.tag }}
             index:io.github.gregorygost.gost-rdpr.ui.revision=${{ steps.ui.outputs.sha }}
           cache-from: type=gha,scope=develop
-          cache-to: type=gha,scope=develop,mode=max
+          cache-to: type=gha,scope=develop,mode=max,ignore-error=true
 
       - name: Check whether this release may update dev
         id: current
