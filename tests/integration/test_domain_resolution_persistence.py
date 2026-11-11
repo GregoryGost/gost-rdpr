@@ -3674,6 +3674,33 @@ async def test_public_empty_startup_and_restart_preserve_schema_defaults_and_his
   assert service.providers.requests == []
 
 
+IP_REFERENCE_REPAIR_MIGRATION = 'migration_202618042122_repair_ip_references.py'
+IP_OWNERSHIP_MIGRATION = 'migration_202618042123.py'
+CHECKSUM_REFRESH_MIGRATION = 'migration_202618042124.py'
+IP_SUPPORT_LOOKUP_INDEX = 'ix__rdpr_ip_supports__ip_record_id_ip_list_id_domain_id'
+
+
+def replace_with_previous_ip_schema(connection, prefix, unique_form):
+  connection.execute(f'DROP TABLE {prefix}ip_supports')
+  connection.execute(f'DROP TABLE {prefix}ip_records')
+  unique = ' UNIQUE' if unique_form == 'inline' else ''
+  connection.execute(f"""
+    CREATE TABLE {prefix}ip_records (
+      id INTEGER NOT NULL PRIMARY KEY, ip_list_id INTEGER, domain_id INTEGER NOT NULL,
+      addr_type INTEGER NOT NULL, ip_address TEXT NOT NULL{unique}, ros_comment TEXT,
+      use_default_gw BOOLEAN DEFAULT 0 NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+      updated_at TIMESTAMP, CHECK (ip_address != ''),
+      FOREIGN KEY (domain_id) REFERENCES {prefix}domains(id) ON DELETE CASCADE,
+      FOREIGN KEY (ip_list_id) REFERENCES {prefix}ips_lists(id) ON DELETE CASCADE
+    )
+  """)
+  for column in ('domain_id', 'ip_list_id', 'ip_address'):
+    if column == 'ip_address' and unique_form == 'inline':
+      continue
+    index_unique = 'UNIQUE ' if column == 'ip_address' and unique_form == 'index' else ''
+    connection.execute(f'CREATE {index_unique}INDEX ix_{prefix}ip_records_{column} ON {prefix}ip_records ({column})')
+
+
 @pytest.mark.e2e
 @pytest.mark.parametrize('e2e_service', [False], indirect=True)
 @pytest.mark.parametrize('prefix', ['rdpr_', ''])
@@ -3686,45 +3713,27 @@ async def test_public_current_schema_upgrade_backfills_source_and_preserves_rows
   service.environment['DB_TABLE_PREFIX'] = prefix
   queries = {
     'rdpr_': (
-      'DELETE FROM rdpr_migrations WHERE name=?',
+      'DELETE FROM rdpr_migrations WHERE name IN (?,?)',
       'SELECT * FROM rdpr_migrations ORDER BY id',
       'INSERT INTO rdpr_ip_records VALUES (17,NULL,0,4,?,?,?,?,?)',
       'SELECT * FROM rdpr_ip_records',
-      'SELECT * FROM rdpr_migrations WHERE name!=? ORDER BY id',
       'SELECT ip_record_id,domain_id,ip_list_id FROM rdpr_ip_supports',
     ),
     '': (
-      'DELETE FROM migrations WHERE name=?',
+      'DELETE FROM migrations WHERE name IN (?,?)',
       'SELECT * FROM migrations ORDER BY id',
       'INSERT INTO ip_records VALUES (17,NULL,0,4,?,?,?,?,?)',
       'SELECT * FROM ip_records',
-      'SELECT * FROM migrations WHERE name!=? ORDER BY id',
       'SELECT ip_record_id,domain_id,ip_list_id FROM ip_supports',
     ),
   }[prefix]
+  pending = (IP_REFERENCE_REPAIR_MIGRATION, IP_OWNERSHIP_MIGRATION)
   await service.start()
   await service.stop()
   with closing(sqlite3.connect(service.db_path)) as connection, connection:
-    connection.execute(queries[0], ('migration_202618042123.py',))
+    connection.execute(queries[0], pending)
     old_history = connection.execute(queries[1]).fetchall()
-    connection.execute(f'DROP TABLE {prefix}ip_supports')
-    connection.execute(f'DROP TABLE {prefix}ip_records')
-    unique = ' UNIQUE' if unique_form == 'inline' else ''
-    connection.execute(f"""
-      CREATE TABLE {prefix}ip_records (
-        id INTEGER NOT NULL PRIMARY KEY, ip_list_id INTEGER, domain_id INTEGER NOT NULL,
-        addr_type INTEGER NOT NULL, ip_address TEXT NOT NULL{unique}, ros_comment TEXT,
-        use_default_gw BOOLEAN DEFAULT 0 NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
-        updated_at TIMESTAMP, CHECK (ip_address != ''),
-        FOREIGN KEY (domain_id) REFERENCES {prefix}domains(id) ON DELETE CASCADE,
-        FOREIGN KEY (ip_list_id) REFERENCES {prefix}ips_lists(id) ON DELETE CASCADE
-      )
-    """)
-    for column in ('domain_id', 'ip_list_id', 'ip_address'):
-      if column == 'ip_address' and unique_form == 'inline':
-        continue
-      index_unique = 'UNIQUE ' if column == 'ip_address' and unique_form == 'index' else ''
-      connection.execute(f'CREATE {index_unique}INDEX ix_{prefix}ip_records_{column} ON {prefix}ip_records ({column})')
+    replace_with_previous_ip_schema(connection, prefix, unique_form)
     connection.execute(
       queries[2],
       ('8.8.8.0/24', 'preserved legacy metadata', 1, '2001-02-03 04:05:06', '2002-03-04 05:06:07'),
@@ -3734,13 +3743,297 @@ async def test_public_current_schema_upgrade_backfills_source_and_preserves_rows
   await service.stop()
   with closing(sqlite3.connect(service.db_path)) as connection:
     assert connection.execute(queries[3]).fetchall() == before_ip
-    assert connection.execute(queries[4], ('migration_202618042123.py',)).fetchall() == old_history
-    assert connection.execute(queries[5]).fetchall() == [(17, 0, None)]
+    history = connection.execute(queries[1]).fetchall()
+    assert history[: len(old_history)] == old_history
+    assert tuple(row[1] for row in history[len(old_history) :]) == pending
+    assert connection.execute(queries[4]).fetchall() == [(17, 0, None)]
     assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
   upgraded = sqlite_snapshot(service.db_path)
   await service.start()
   await service.stop()
   assert sqlite_snapshot(service.db_path) == upgraded
+
+
+async def seed_previous_ip_volume(service, *, keep_default):
+  """Create a previous-release volume with both missing and valid foreign-key targets."""
+  await service.start()
+  await service.stop()
+  created = '2001-02-03 04:05:06'
+  updated = '2002-03-04 05:06:07'
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    objects = connection.execute('SELECT type,name FROM sqlite_master ORDER BY type,name').fetchall()
+    connection.execute(
+      'DELETE FROM rdpr_migrations WHERE name IN (?,?,?)',
+      (IP_REFERENCE_REPAIR_MIGRATION, IP_OWNERSHIP_MIGRATION, CHECKSUM_REFRESH_MIGRATION),
+    )
+    replace_with_previous_ip_schema(connection, 'rdpr_', 'index')
+    if keep_default:
+      connection.execute(
+        "UPDATE rdpr_domains SET ros_comment='existing standalone domain',updated_at=? WHERE id=0",
+        (updated,),
+      )
+    else:
+      connection.execute('DELETE FROM rdpr_domains WHERE id=0')
+    connection.execute("""
+      INSERT INTO rdpr_domains_lists (id,name,url,description,hash,attempts)
+      VALUES (5,'domain list','https://provider.example.test/domains','domain list metadata','domain hash',2)
+    """)
+    connection.execute("""
+      INSERT INTO rdpr_ips_lists (id,name,url,description,hash,attempts)
+      VALUES (6,'IP list','https://provider.example.test/ips','IP list metadata','IP hash',3)
+    """)
+    connection.executemany(
+      'INSERT INTO rdpr_domains VALUES (?,?,?,?,?,?,?,?)',
+      [
+        (-1, None, 1, 'existing-negative.example.test', 'valid negative ID', created, updated, updated),
+        (7, 5, 1, 'listed.example.test', 'valid list', created, updated, updated),
+        (8, 50, 0, 'missing-list.example.test', 'missing list', created, updated, None),
+      ],
+    )
+    connection.executemany(
+      'INSERT INTO rdpr_ip_records VALUES (?,?,?,?,?,?,?,?,?)',
+      [
+        (17, 6, 71, 4, '192.0.2.0/24', 'valid IP list', 1, created, updated),
+        (18, 60, 72, 6, '2001:db8::18', 'both targets missing', 0, created, None),
+        (19, 61, -1, 4, '198.51.100.19', 'valid negative owner', 1, created, updated),
+        (20, 6, 7, 4, '198.51.100.20', 'both targets valid', 0, created, updated),
+        (21, None, 8, 4, '198.51.100.21', 'retained domain', 0, created, None),
+        (22, None, 0, 4, '198.51.100.22', None, 0, created, updated),
+      ],
+    )
+  return objects
+
+
+def previous_ip_volume_rows(connection):
+  return (
+    connection.execute('SELECT * FROM rdpr_ip_records ORDER BY id').fetchall(),
+    connection.execute('SELECT * FROM rdpr_domains ORDER BY id').fetchall(),
+    connection.execute('SELECT * FROM rdpr_ips_lists ORDER BY id').fetchall(),
+    connection.execute('SELECT * FROM rdpr_domains_lists ORDER BY id').fetchall(),
+    connection.execute('SELECT * FROM rdpr_migrations ORDER BY id').fetchall(),
+  )
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+@pytest.mark.parametrize('keep_default', [True, False], ids=['preserve-standalone-domain', 'seed-standalone-domain'])
+async def test_public_previous_ip_volume_repairs_dangling_references_and_restarts(e2e_service, keep_default):
+  service = e2e_service
+  expected_objects = await seed_previous_ip_volume(service, keep_default=keep_default)
+  with closing(sqlite3.connect(service.db_path)) as connection:
+    before_ips, before_domains, before_ip_lists, before_domain_lists, before_history = previous_ip_volume_rows(
+      connection
+    )
+    assert {(row[0], row[1], row[2]) for row in connection.execute('PRAGMA foreign_key_check')} == {
+      ('rdpr_ip_records', 17, 'rdpr_domains'),
+      ('rdpr_ip_records', 18, 'rdpr_domains'),
+      ('rdpr_ip_records', 18, 'rdpr_ips_lists'),
+      ('rdpr_ip_records', 19, 'rdpr_ips_lists'),
+      ('rdpr_domains', 8, 'rdpr_domains_lists'),
+    } | (set() if keep_default else {('rdpr_ip_records', 22, 'rdpr_domains')})
+
+  async def assert_public_standalone_ips():
+    async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+      assert (await client.get('/health')).status_code == 200
+      response = await client.get('/domains/0')
+      assert response.status_code == 200, response.text
+      assert set(response.json()['ips_v4']) == {'192.0.2.0/24', '198.51.100.22'}
+      assert response.json()['ips_v6'] == ['2001:db8::18']
+
+  await service.start()
+  await assert_public_standalone_ips()
+  await service.stop()
+  with closing(sqlite3.connect(service.db_path)) as connection:
+    ips, domains, ip_lists, domain_lists, history = previous_ip_volume_rows(connection)
+    expected_supports = [(17, 0, 6), (18, 0, None), (19, -1, None), (20, 7, 6), (21, 8, None), (22, 0, None)]
+    assert ips == [
+      (ip_id, ip_list_id, domain_id, *row[3:])
+      for (ip_id, domain_id, ip_list_id), row in zip(expected_supports, before_ips, strict=True)
+    ]
+    assert (
+      connection.execute(
+        'SELECT ip_record_id,domain_id,ip_list_id FROM rdpr_ip_supports ORDER BY ip_record_id'
+      ).fetchall()
+      == expected_supports
+    )
+    assert [row for row in domains if keep_default or row[0] != 0] == [
+      (row[0], None if row[0] == 8 else row[1], *row[2:]) for row in before_domains
+    ]
+    if not keep_default:
+      standalone = next(row for row in domains if row[0] == 0)
+      assert standalone[:5] == (0, None, 1, 'default', 'Default Domain')
+      assert standalone[5] == standalone[7]
+      assert standalone[5]
+      assert standalone[6] is None
+    assert ip_lists == before_ip_lists
+    assert domain_lists == before_domain_lists
+    assert history[: len(before_history)] == before_history
+    added = history[len(before_history) :]
+    assert [row[1] for row in added] == [
+      IP_REFERENCE_REPAIR_MIGRATION,
+      IP_OWNERSHIP_MIGRATION,
+      CHECKSUM_REFRESH_MIGRATION,
+    ]
+    for _, name, checksum, created_at, applied_at in added:
+      assert checksum == sha256((service.root / 'migrations' / name).read_text(encoding='utf-8').encode()).hexdigest()
+      assert created_at is not None
+      assert applied_at is not None
+    assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
+    assert connection.execute('PRAGMA integrity_check').fetchall() == [('ok',)]
+    assert connection.execute('SELECT type,name FROM sqlite_master ORDER BY type,name').fetchall() == expected_objects
+  upgraded = sqlite_snapshot(service.db_path)
+  # A completed migration must be skipped even when importing its source would fail.
+  (service.directory / 'migrations' / IP_REFERENCE_REPAIR_MIGRATION).write_text(
+    'raise RuntimeError("completed reference repair was imported again")\n', encoding='utf-8'
+  )
+  await service.start()
+  await assert_public_standalone_ips()
+  await service.stop()
+  assert sqlite_snapshot(service.db_path) == upgraded
+  assert service.providers.requests == []
+  assert service.providers.http_requests == []
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+@pytest.mark.parametrize('failure', ['ip-trigger', 'domain-trigger', 'default-name-conflict', 'later-migration'])
+async def test_public_previous_ip_volume_leaves_database_intact_on_failed_upgrade(e2e_service, failure):
+  service = e2e_service
+  await seed_previous_ip_volume(service, keep_default=False)
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    if failure == 'ip-trigger':
+      connection.execute("""
+        CREATE TRIGGER ip_domain_change AFTER UPDATE OF domain_id ON "RDPR_IP_RECORDS"
+        BEGIN
+          UPDATE rdpr_ip_records SET ros_comment='trigger changed metadata' WHERE id=NEW.id;
+        END
+      """)
+      assert connection.execute("SELECT tbl_name FROM sqlite_master WHERE name='ip_domain_change'").fetchone() == (
+        'RDPR_IP_RECORDS',
+      )
+    elif failure == 'domain-trigger':
+      connection.execute("""
+        CREATE TRIGGER domain_list_change AFTER UPDATE OF domain_list_id ON "RDPR_DOMAINS"
+        BEGIN
+          UPDATE rdpr_domains SET ros_comment='trigger changed metadata' WHERE id=NEW.id;
+        END
+      """)
+      assert connection.execute("SELECT tbl_name FROM sqlite_master WHERE name='domain_list_change'").fetchone() == (
+        'RDPR_DOMAINS',
+      )
+    elif failure == 'default-name-conflict':
+      connection.execute("UPDATE rdpr_domains SET name='default' WHERE id=7")
+  later = service.directory / 'migrations' / 'migration_999999999999.py'
+  if failure == 'later-migration':
+    later.write_text(
+      '\n'.join(
+        (
+          'from sqlalchemy import text',
+          'async def upgrade(conn):',
+          '  query = text("SELECT domain_id,ip_list_id FROM rdpr_ip_supports WHERE ip_record_id=17")',
+          '  refs = await conn.execute(query)',
+          '  assert refs.one() == (0, 6)',
+          '  query = text("SELECT name FROM rdpr_migrations WHERE name IN (:repair,:owner) ORDER BY id")',
+          f'  stamps = await conn.execute(query, {{"repair": {IP_REFERENCE_REPAIR_MIGRATION!r},',
+          f'                                      "owner": {IP_OWNERSHIP_MIGRATION!r}}})',
+          f'  assert list(stamps.scalars()) == {[IP_REFERENCE_REPAIR_MIGRATION, IP_OWNERSHIP_MIGRATION]!r}',
+          '  raise RuntimeError("synthetic failure after reference repair was stamped")',
+          '',
+        )
+      ),
+      encoding='utf-8',
+    )
+
+  before = sqlite_snapshot(service.db_path)
+  with pytest.raises(AssertionError, match='Application exited before readiness'):
+    await service.start()
+  assert service.process is None
+  assert sqlite_snapshot(service.db_path) == before
+  diagnostic = {
+    'ip-trigger': 'RuntimeError: Legacy IP upgrade cannot safely repair references with table triggers',
+    'domain-trigger': 'RuntimeError: Legacy IP upgrade cannot safely repair references with table triggers',
+    'default-name-conflict': 'UNIQUE constraint failed: rdpr_domains.name',
+    'later-migration': 'RuntimeError: synthetic failure after reference repair was stamped',
+  }[failure]
+  assert diagnostic in service.diagnostics()
+  if failure == 'later-migration':
+    later.unlink()
+    await service.start()
+    async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+      assert (await client.get('/health')).status_code == 200
+    await service.stop()
+    with closing(sqlite3.connect(service.db_path)) as connection:
+      assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
+      assert connection.execute('PRAGMA integrity_check').fetchall() == [('ok',)]
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+async def test_public_upgraded_ip_volume_records_reference_repair_without_data_changes(e2e_service):
+  service = e2e_service
+  await service.start()
+  await service.stop()
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    connection.execute('DELETE FROM rdpr_migrations WHERE name=?', (IP_REFERENCE_REPAIR_MIGRATION,))
+    connection.execute(f'DROP INDEX {IP_SUPPORT_LOOKUP_INDEX}')
+    connection.execute(
+      'INSERT INTO rdpr_ip_records (id,domain_id,addr_type,ip_address,ros_comment,use_default_gw,updated_at) '
+      "VALUES (17,0,4,'198.51.100.17','preserved metadata',1,'2002-03-04 05:06:07')"
+    )
+    connection.execute('INSERT INTO rdpr_ip_supports (ip_record_id,domain_id) VALUES (17,0)')
+    before_history = connection.execute('SELECT * FROM rdpr_migrations ORDER BY id').fetchall()
+
+  def business_snapshot():
+    return tuple(
+      line
+      for line in sqlite_snapshot(service.db_path)
+      if not line.startswith(('INSERT INTO "rdpr_migrations"', f'CREATE INDEX {IP_SUPPORT_LOOKUP_INDEX} '))
+    )
+
+  before = business_snapshot()
+  await service.start()
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    assert (await client.get('/health')).status_code == 200
+    response = await client.get('/domains/0')
+    assert response.status_code == 200, response.text
+    assert response.json()['ips_v4'] == ['198.51.100.17']
+  await service.stop()
+  assert business_snapshot() == before
+  with closing(sqlite3.connect(service.db_path)) as connection:
+    assert connection.execute(
+      'SELECT name FROM pragma_index_info(?) ORDER BY seqno', (IP_SUPPORT_LOOKUP_INDEX,)
+    ).fetchall() == [('ip_record_id',), ('ip_list_id',), ('domain_id',)]
+    assert connection.execute(
+      'SELECT "unique", partial FROM pragma_index_list(?) WHERE name=?',
+      ('rdpr_ip_supports', IP_SUPPORT_LOOKUP_INDEX),
+    ).fetchone() == (0, 0)
+    history = connection.execute('SELECT * FROM rdpr_migrations ORDER BY id').fetchall()
+    assert history[:-1] == before_history
+    _, name, checksum, created_at, applied_at = history[-1]
+    assert name == IP_REFERENCE_REPAIR_MIGRATION
+    assert checksum == sha256((service.root / 'migrations' / name).read_text(encoding='utf-8').encode()).hexdigest()
+    assert created_at is not None
+    assert applied_at is not None
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+async def test_public_upgraded_ip_volume_rejects_incompatible_support_lookup_index_atomically(e2e_service):
+  service = e2e_service
+  await service.start()
+  await service.stop()
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    connection.execute('DELETE FROM rdpr_migrations WHERE name=?', (IP_REFERENCE_REPAIR_MIGRATION,))
+    connection.execute(f'DROP INDEX {IP_SUPPORT_LOOKUP_INDEX}')
+    connection.execute(f'CREATE INDEX {IP_SUPPORT_LOOKUP_INDEX.upper()} ON rdpr_ip_supports (domain_id, ip_record_id)')
+  before = sqlite_snapshot(service.db_path)
+
+  with pytest.raises(AssertionError, match='Application exited before readiness'):
+    await service.start()
+
+  assert service.process is None
+  assert 'RuntimeError: IP support lookup index is incompatible' in service.diagnostics()
+  assert sqlite_snapshot(service.db_path) == before
 
 
 @pytest.mark.e2e
@@ -3749,7 +4042,7 @@ async def test_public_current_schema_upgrade_backfills_source_and_preserves_rows
 async def test_public_checksum_refresh_preserves_history_and_data_across_failure_and_restart(e2e_service, prefix):
   service = e2e_service
   service.environment['DB_TABLE_PREFIX'] = prefix
-  refresh_name = 'migration_202618042124.py'
+  refresh_name = CHECKSUM_REFRESH_MIGRATION
   # These persisted checksums were independently verified against the previous release sources.
   old_checksums = {
     'migration_202511031501.py': '293ddda35db4553c0174d8ecb07902add5bb664a7137e0ce6f36a05899b83fa7',
@@ -3940,7 +4233,13 @@ async def test_public_historical_gateway_upgrade_preserves_old_data_and_all_hist
       '9.9.9.9',
       'custom',
     )
-    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations').fetchone() == (8,)
+    assert connection.execute('SELECT name FROM rdpr_migrations WHERE id>34 ORDER BY id').fetchall() == [
+      ('migration_202602192245.py',),
+      ('migration_202618042122.py',),
+      (IP_REFERENCE_REPAIR_MIGRATION,),
+      (IP_OWNERSHIP_MIGRATION,),
+      (CHECKSUM_REFRESH_MIGRATION,),
+    ]
   before = sqlite_snapshot(service.db_path)
   await service.start()
   await service.stop()
@@ -3987,7 +4286,9 @@ async def test_public_legacy_import_failure_rolls_back_and_fresh_process_recover
   assert_legacy_import(service.db_path)
   with closing(sqlite3.connect(service.db_path)) as connection:
     assert connection.execute('SELECT * FROM rdpr_migrations WHERE id<=42 ORDER BY id').fetchall() == old_history
-    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations').fetchone() == (7,)
+    assert connection.execute('SELECT name FROM rdpr_migrations WHERE id>42 ORDER BY id').fetchall() == [
+      (path.name,) for path in sorted((service.root / 'migrations').glob('migration_*.py'))
+    ]
   recovered = sqlite_snapshot(service.db_path)
   await service.start()
   await service.stop()
@@ -4422,7 +4723,9 @@ async def test_startup_error_after_physical_commit_keeps_writer_stopped_and_allo
   assert startup_store.writer_state == 'FAILED'
   path = Path(app.settings.db_path)
   with closing(sqlite3.connect(path)) as connection:
-    assert connection.execute('SELECT COUNT(*) FROM rdpr_migrations WHERE applied_at IS NOT NULL').fetchone() == (5,)
+    assert connection.execute(
+      'SELECT name FROM rdpr_migrations WHERE applied_at IS NOT NULL ORDER BY id'
+    ).fetchall() == [(source.name,) for source in sorted((path.parent / 'migrations').glob('migration_*.py'))]
     assert connection.execute('SELECT id, name FROM rdpr_domains').fetchall() == [(0, 'default')]
   committed = sqlite_snapshot(path)
   recovered = app.database.DataBase()

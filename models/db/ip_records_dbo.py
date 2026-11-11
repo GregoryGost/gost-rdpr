@@ -431,6 +431,7 @@ class IpSupportDbo(Dbo):
     ForeignKeyConstraint(['ip_record_id'], [IpRecordsDbo.id], ondelete='CASCADE'),
     ForeignKeyConstraint(['domain_id'], [DomainsDbo.id], ondelete='CASCADE'),
     ForeignKeyConstraint(['ip_list_id'], [IpsListsDbo.id], ondelete='CASCADE'),
+    Index(None, 'ip_record_id', 'ip_list_id', 'domain_id'),
     Index(None, 'ip_record_id', 'domain_id', unique=True, sqlite_where=text('ip_list_id IS NULL')),
     Index(None, 'ip_record_id', 'domain_id', 'ip_list_id', unique=True, sqlite_where=text('ip_list_id IS NOT NULL')),
   )
