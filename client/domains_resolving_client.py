@@ -849,34 +849,60 @@ class _SavingPass:
   error: BaseException | None = None
 
 
+@dataclass(slots=True)
+class _MembershipCompletion:
+  """Expose only completion state across selection, without retaining tasks, errors or DNS payloads."""
+
+  # finished records the physical processing/admission endpoint, including attempted cancellation.
+  finished: bool = False
+  # runs contains observer-only pass subscriptions, removed when the physical operation ends.
+  runs: list[ResolutionRun] = field(default_factory=list)
+
+
 @dataclass(eq=False, slots=True)
 class _SavingOperation:
+  """Retain one physical operation and optional pass observers without transferring write ownership."""
+
+  # token identifies this reservation; domain_id is its stored domain key; resolver performs its DNS work.
   token: int
   domain_id: int
   resolver: DomainsResolver
+  # candidate freezes automatic membership; source supplies its original DNS context and metric run.
   candidate: DomainCandidate | None = None
   source: _SavingPass | None = None
+  # interests controls existing pass lifetimes; completion observes already-attempted shared work only.
   interests: list[_SavingPass] = field(default_factory=list)
+  completion: _MembershipCompletion = field(default_factory=_MembershipCompletion)
+  # explicit identifies stored demand; capacity_reserved owns one bounded explicit admission slot.
   explicit: bool = False
   capacity_reserved: bool = False
+  # stored selects fresh saved-ID lookup; detached preserves demand without a waiting caller.
   stored: bool = False
   detached: bool = False
+  # priority controls dispatch; started records dispatch; attempted records actual resolution entry.
   priority: bool = False
   started: bool = False
   attempted: bool = False
+  # processed closes physical work once; cancelled prevents further unnecessary dispatch.
   processed: bool = False
   cancelled: bool = False
+  # task owns running work; receipt retains independent database truth; done wakes an explicit caller.
   task: Task[None] | None = None
   receipt: WriteReceipt | None = None
   done: Event | None = None
+  # error retains operation failure; queued_at measures the current queue residence in monotonic seconds.
   error: BaseException | None = None
   queued_at: float | None = None
 
 
 @dataclass(slots=True)
 class _SelectionTicket:
+  """Retain attempted operation identities while one membership query and adoption are in flight."""
+
+  # generation records capture entry; attempted maps IDs to lightweight completion state for exact attempts.
   generation: int
-  attempted: set[int]
+  attempted: dict[int, _MembershipCompletion]
+  # changed detects reservations that changed before adoption without actual-attempt evidence.
   changed: set[int] = field(default_factory=set)
 
 
@@ -1140,16 +1166,24 @@ class SavingCoordinator:
         self._finish_operation(operation)
 
   async def _execute(self, operation: _SavingOperation) -> None:
+    """Resolve operation through processing/admission, retaining the original physical-origin observation.
+
+    Stored demand reads fresh membership and DNS settings. Automatic demand uses
+    its source snapshot. Pass coverage precedes DNS and is never progress completion.
+    """
+    # domain holds the prepared result; run receives only this physical operation's origin metrics.
     domain: DomainResult | None = None
     run: ResolutionRun | None = None
     try:
       self._check_open()
       if operation.stored:
+        # candidate is the fresh stored record; servers and context are its task-local DNS configuration.
         candidate = await db.get_domain_candidate_for_resolve(operation.domain_id)
         servers = await operation.resolver.saving_dns_snapshot() if candidate is not None else None
         context = _DefaultDnsContext(settings.dns_timeout, settings.dns_lifetime)
       else:
         candidate = operation.candidate
+        # source is the automatic pass that supplied the immutable candidate and DNS snapshot.
         source = operation.source
         servers = source.servers if source is not None else None
         context = source.context if source is not None else None
@@ -1178,8 +1212,9 @@ class SavingCoordinator:
         self._priority_waiting -= 1
       self._ready.set()
       if self._ticket is not None:
-        self._ticket.attempted.add(operation.domain_id)
+        self._ticket.attempted[operation.domain_id] = operation.completion
       self._changed(operation.domain_id)
+      # interest is a logical pass covered by this actual attempt, before its completion.
       for interest in operation.interests:
         interest.run.cover()
       notify_observation(domain.observation, 'processing_started', perf_counter())
@@ -1188,6 +1223,7 @@ class SavingCoordinator:
       operation.error = operation.error or CancelledError()
       raise
     except Exception as err:
+      # err is the original operation failure; the log exposes only its safe class name.
       operation.error = err
       if isinstance(err, DatabaseWriteError):
         self._fail(err)
@@ -1200,7 +1236,11 @@ class SavingCoordinator:
       self._finish_operation(operation)
 
   def _finish_operation(self, operation: _SavingOperation) -> None:
-    """Finalize a terminated physical task once, including cancellation before entry."""
+    """Finalize operation once, observing only attempted work as completed membership.
+
+    A task cancelled before entry still releases its existing reservation, but
+    cannot advance pass progress. Observers never keep the operation business-owned.
+    """
     if operation.processed:
       return
     if operation.task is not None and operation.task.cancelled():
@@ -1211,6 +1251,12 @@ class SavingCoordinator:
     self._release_capacity(operation)
     self._active.pop(operation.token, None)
     self._complete_interests(operation)
+    operation.completion.finished = True
+    # run observes a pass that reused this already-attempted operation during selection.
+    for run in operation.completion.runs:
+      if operation.attempted:
+        run.complete_member()
+    operation.completion.runs.clear()
     if operation.done is not None:
       operation.done.set()
     self._release_known(operation)
@@ -1219,10 +1265,14 @@ class SavingCoordinator:
     self._update_idle()
 
   def _complete_interests(self, operation: _SavingOperation) -> None:
+    """Release operation's pass interests and report finished members independently of coverage."""
+    # interest is a pass still waiting for this operation's processing/admission boundary.
     for interest in tuple(operation.interests):
       if operation.error is not None:
         interest.error = interest.error or operation.error
       interest.remaining -= 1
+      if operation.attempted:
+        interest.run.complete_member()
       self._finish_pass(interest)
     operation.interests.clear()
 
@@ -1280,22 +1330,30 @@ class SavingCoordinator:
       self._capturing = None
 
   async def _capture_scan(self, operation: _SavingPass) -> None:
+    """Select operation's finite membership once, then adopt it without waiting for commits.
+
+    The ticket retains lightweight attempt completions across the selection await, so
+    progress can distinguish still-running work from a completion already released.
+    """
     await job_registry.try_start(Jobs.DOMAINS_RESOLVE)
+    # domain_id is each owned record key; owners holds its ordered physical reservations.
     self._ticket = _SelectionTicket(
       self._generation,
-      {domain_id for domain_id, owners in self._owners.items() if owners[0].attempted},
+      {domain_id: owners[0].completion for domain_id, owners in self._owners.items() if owners[0].attempted},
     )
     try:
+      # candidates is the complete selected membership, fixed before any DNS configuration read.
       candidates = await (
         db.get_new_domains_for_resolve()
         if operation.mode == Jobs.DOMAINS_RESOLVE_NEW
         else db.get_stale_domains_for_resolve()
       )
       self._check_open()
-      operation.run.select(len(candidates))
+      operation.run.select(len(candidates), track_membership=True)
       if candidates:
         operation.servers = await operation.resolver.saving_dns_snapshot()
         operation.context = _DefaultDnsContext(settings.dns_timeout, settings.dns_lifetime)
+      # index bounds cooperative adoption slices; candidate is the selected stored-domain snapshot.
       for index, candidate in enumerate(candidates):
         self._check_open()
         if operation.cancelled:
@@ -1307,6 +1365,7 @@ class SavingCoordinator:
       operation.error = operation.error or CancelledError()
       raise
     except Exception as err:
+      # err records selection/configuration/adoption failure without exposing sensitive details in logs.
       operation.error = err
       logger.error(
         'Domain membership selection or adoption failed [%s]',
@@ -1320,13 +1379,27 @@ class SavingCoordinator:
       self._ready.set()
 
   def _adopt(self, scan: _SavingPass, candidate: DomainCandidate) -> None:
+    """Attach candidate to scan while observing reused completion without changing pass ownership.
+
+    Already-attempted work retains the existing immediate coverage semantics. Its
+    completion identity is kept without task payloads to avoid logging DNS starts
+    as completed work or confusing a later same-ID reservation with the old one.
+    """
+    # started measures reservation admission; ticket captures attempts and changes around selection.
     started = perf_counter()
     ticket = self._ticket
     if ticket is None:
       raise RuntimeError('Missing domain membership ticket')
     if candidate.id in ticket.attempted:
       scan.run.cover()
+      # completion belongs to the exact attempt observed across the selection await, even after release.
+      completion = ticket.attempted[candidate.id]
+      if completion.finished:
+        scan.run.complete_member()
+      elif scan.run not in completion.runs:
+        completion.runs.append(scan.run)
       return
+    # owners contains current same-ID reservations; its first operation controls existing sharing/promotion.
     owners = self._owners.get(candidate.id)
     if owners:
       operation = owners[0]
@@ -1359,6 +1432,7 @@ class SavingCoordinator:
     observe_duration(queue_duration, started, queue='resolve', phase='admission', outcome='admitted')
 
   def _finish_pass(self, scan: _SavingPass) -> None:
+    """Finish scan's existing processing/admission wait without waiting for persistence or observer-only work."""
     if not scan.adopted or scan.remaining or scan.finished:
       return
     scan.finished = True

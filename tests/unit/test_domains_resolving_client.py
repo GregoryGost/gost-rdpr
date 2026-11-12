@@ -12,6 +12,7 @@ from base64 import urlsafe_b64decode
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
+from itertools import pairwise
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, mock_open
 
@@ -28,6 +29,387 @@ from prometheus_client import REGISTRY
 pytestmark = pytest.mark.unit
 
 ROS_RETRY_METHODS = frozenset({'GET', 'POST', 'PATCH', 'DELETE'})
+
+
+@pytest.mark.parametrize('configured', [None, '3', '17'])
+async def test_resolution_progress_limit_uses_default_and_environment(app, monkeypatch, configured):
+  """Read the intermediate-message budget from the environment, defaulting to ten.
+
+  app blocks secret-file loading; monkeypatch restores the configured environment.
+  configured selects an absent override or one of two valid integer budgets.
+  """
+  # settings_type constructs an isolated settings value without changing application globals.
+  settings_type = type(app.settings)
+  monkeypatch.delenv('RESOLVE_DOMAINS_LOG_EVERY', raising=False)
+  if configured is not None:
+    monkeypatch.setenv('RESOLVE_DOMAINS_LOG_EVERY', configured)
+  assert settings_type(_env_file=None).resolve_domains_log_every == (10 if configured is None else int(configured))
+
+
+@pytest.mark.parametrize('configured', ['-10', '-1', '0', '1', '2', '3.5', 'invalid'])
+async def test_resolution_progress_limit_rejects_values_below_three_or_nonintegers(app, monkeypatch, configured):
+  """Reject invalid configured budgets before starting any saving pass.
+
+  app prevents .env reads, monkeypatch isolates RESOLVE_DOMAINS_LOG_EVERY, and
+  configured covers the lower boundary and invalid integer representations.
+  """
+  from pydantic import ValidationError
+
+  monkeypatch.setenv('RESOLVE_DOMAINS_LOG_EVERY', configured)
+  with pytest.raises(ValidationError, match='resolve_domains_log_every'):
+    type(app.settings)(_env_file=None)
+
+
+@pytest.mark.parametrize('mode_name', ['DOMAINS_RESOLVE_NEW', 'DOMAINS_RESOLVE_STALE'])
+async def test_empty_resolution_pass_logs_only_explicit_empty_message(app, saving_boundary, caplog, mode_name):
+  """An empty NEW or STALE pass emits only the requested empty-pass message.
+
+  app and saving_boundary isolate I/O; caplog captures INFO records, and
+  mode_name chooses the automatic pass whose selected membership is empty.
+  """
+  # mode is the public coordinator scan kind; records holds INFO text; record is one captured log entry.
+  mode = getattr(importlib.import_module('jobs.job_registry').Jobs, mode_name)
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  await saving_boundary.resolver.domains_resolve(mode)
+  records = [record.getMessage() for record in caplog.records if record.levelno == logging.INFO]
+  assert records == ['Нет доменов для обработки']
+  saving_boundary.repository.get_dns_servers_for_resolve.assert_not_awaited()
+
+
+def resolution_log_records(caplog, kind, *, run_id=None, level=logging.INFO):
+  """Return captured resolution records for kind, optional run_id, and level.
+
+  caplog owns the captured records. Only the stable message prefix and origin
+  identifier are selected; summary wording and elapsed values remain unconstrained.
+  """
+  # record is each emitted logging record examined for the requested event kind.
+  return [
+    record
+    for record in caplog.records
+    if record.levelno == level
+    and str(record.msg).startswith(f'Resolution {kind} ')
+    and (run_id is None or record.args[0] == run_id)
+  ]
+
+
+@pytest.mark.parametrize('mode_name', ['DOMAINS_RESOLVE_NEW', 'DOMAINS_RESOLVE_STALE'])
+@pytest.mark.parametrize(('total', 'limit'), [(1, 10), (2, 10), (3, 3), (4, 3), (7, 3), (11, 3), (37, 10)])
+async def test_resolution_progress_fairly_spans_completed_membership(
+  app, saving_boundary, caplog, monkeypatch, mode_name, total, limit
+):
+  """Spread bounded intermediate INFO across the whole nonempty pass.
+
+  total and limit cover short passes and uneven divisions; mode_name selects NEW
+  or STALE. app/saving_boundary isolate I/O, monkeypatch sets the budget, and
+  caplog observes logs independently of Prometheus snapshot fields.
+  """
+  # boundary provides the real coordinator with fake DNS and repository boundaries.
+  boundary = saving_boundary
+  # mode identifies the public automatic pass; getter selects its repository query.
+  mode = getattr(importlib.import_module('jobs.job_registry').Jobs, mode_name)
+  getter = (
+    boundary.repository.get_new_domains_for_resolve
+    if mode_name == 'DOMAINS_RESOLVE_NEW'
+    else boundary.repository.get_stale_domains_for_resolve
+  )
+  # value assigns a distinct selected ID to each member.
+  getter.return_value = [boundary.candidate(value) for value in range(1, total + 1)]
+  monkeypatch.setattr(app.settings, 'resolve_domains_log_every', limit)
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  await boundary.resolver.domains_resolve(mode)
+  # run is the originating operation, even if a newer run later replaces the gauge.
+  run = boundary.commands[0].observation.run
+  # progress contains the emitted counts; record extracts each captured argument tuple.
+  progress = [record.args[2] for record in resolution_log_records(caplog, 'progress', run_id=run.run_id)]
+  assert len(progress) <= min(limit, total - 1)
+  assert bool(progress) is (total > 1)
+  assert progress == sorted(set(progress))
+  assert all(0 < completed < total for completed in progress)  # completed is one intermediate count.
+  # boundaries includes start and final completion; gaps measures fair spacing between reports.
+  # left and right are consecutive reported boundaries, including the two endpoints.
+  boundaries = [0, *progress, total]
+  gaps = [right - left for left, right in pairwise(boundaries)]
+  assert max(gaps) - min(gaps) <= 1
+  assert len(resolution_log_records(caplog, 'selected', run_id=run.run_id)) == 1
+  assert resolution_log_records(caplog, 'selected', run_id=run.run_id)[0].args[2] == total
+  # record contains total and remaining beside each intermediate completed count.
+  for record in resolution_log_records(caplog, 'progress', run_id=run.run_id):
+    assert record.args[3] == total
+    assert record.args[4] == total - record.args[2]
+  assert len(resolution_log_records(caplog, 'processing', run_id=run.run_id)) == 1
+  assert len(resolution_log_records(caplog, 'persistence', run_id=run.run_id)) == 1
+  assert len([record for record in caplog.records if record.levelno == logging.INFO]) == len(progress) + 3
+  assert run.snapshot()['selected'] == run.snapshot()['attempted'] == run.snapshot()['covered'] == total
+  assert run.snapshot()['success'] == total
+  assert run.snapshot()['active'] == 0
+
+
+async def test_failed_dns_pass_has_no_write_final_summary(app, saving_boundary, caplog):
+  """A failed DNS pass summarizes no-write outcomes without fabricated receipts.
+
+  app/saving_boundary preserve the real DNS classifier behind synthetic SERVFAIL
+  responses, and caplog observes separate processing and persistence summaries.
+  """
+  # boundary provides the real coordinator; jobs chooses the NEW scan.
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  # value identifies each domain whose A and CNAME evidence both fail.
+  boundary.repository.get_new_domains_for_resolve.return_value = [boundary.candidate(value) for value in (1, 2, 3)]
+  for value in (1, 2, 3):
+    boundary.outcomes[f'domain-{value}.example.test'] = 'servfail'
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  await boundary.resolver.domains_resolve(jobs.DOMAINS_RESOLVE_NEW)
+  assert boundary.commands == []
+  boundary.repository.put_domain_after_resolve.assert_not_awaited()
+  # processing and persistence are primitive aggregate snapshots at their distinct boundaries.
+  processing = resolution_log_records(caplog, 'processing')[0].args[2]
+  persistence = resolution_log_records(caplog, 'persistence')[0].args[2]
+  assert len(resolution_log_records(caplog, 'processing')) == len(resolution_log_records(caplog, 'persistence')) == 1
+  assert processing['failure'] == processing['completed_membership'] == 3
+  assert persistence['not_required'] == 3
+  assert persistence['admitted'] == persistence['confirmed'] == persistence['pending'] == persistence['unknown'] == 0
+
+
+async def test_resolution_progress_waits_for_out_of_order_completions(app, saving_boundary, caplog, monkeypatch):
+  """Starting or covering members cannot advance completed progress.
+
+  app/saving_boundary block four real DNS classifications, monkeypatch permits
+  four workers, and caplog records each deliberately released completion.
+  """
+  # boundary supplies isolated DNS gates; jobs names the public NEW scan entrypoint.
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 4)
+  monkeypatch.setattr(app.settings, 'resolve_domains_log_every', 3)
+  # value names each domain whose completion is controlled independently.
+  boundary.repository.get_new_domains_for_resolve.return_value = [boundary.candidate(value) for value in (1, 2, 3, 4)]
+  for value in (1, 2, 3, 4):
+    boundary.gates[f'domain-{value}.example.test'] = asyncio.Event()
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_NEW, resolver=boundary.resolver)
+  # The predicate waits until all four workers have reached their blocked DNS queries.
+  await await_condition(lambda: len(boundary.queries) == 4)
+  assert resolution_log_records(caplog, 'progress') == []
+  assert resolution_log_records(caplog, 'processing') == []
+  # completed is the actual completion count; value deliberately differs from selection order.
+  for completed, value in enumerate((3, 1, 4, 2), start=1):
+    # before identifies the records already checked at an earlier completion boundary.
+    before = len(resolution_log_records(caplog, 'progress'))
+    boundary.gates[f'domain-{value}.example.test'].set()
+    # The admission predicate freezes completed and waits for this result to reach the repository.
+    await await_condition(lambda completed=completed: len(boundary.commands) == completed)
+    # The active-work predicate waits for the same completion to retire its worker reservation.
+    await await_condition(lambda completed=completed: len(boundary.coordinator._active) == 4 - completed)
+    # record is each newly emitted progress update; it must reflect this actual completed count.
+    for record in resolution_log_records(caplog, 'progress')[before:]:
+      assert record.args[2] == completed < 4
+      assert record.args[4] == 4 - completed
+  await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+  assert 1 <= len(resolution_log_records(caplog, 'progress')) <= 3
+  assert [command.id for command in boundary.commands] == [3, 1, 4, 2]  # command is one admitted source result.
+
+
+async def test_promoted_stale_member_completes_pass_without_becoming_its_attempt(app, saving_boundary, caplog):
+  """A stored promotion completes STALE membership while retaining its own origin.
+
+  app and saving_boundary isolate the real coordinator; caplog verifies that
+  the automatic summary distinguishes completion from physical attempts.
+  """
+  # boundary controls DNS and repository results; jobs identifies the STALE scan.
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  # value is each selected stale domain; the callback reloads id and ignores unused query kwargs.
+  boundary.repository.get_stale_domains_for_resolve.return_value = [boundary.candidate(value) for value in (1, 2, 3)]
+  boundary.repository.get_domain_candidate_for_resolve.side_effect = lambda id, **kwargs: boundary.candidate(id)
+  # release holds the first physical attempt while the second reservation is promoted.
+  release = boundary.gates['domain-1.example.test'] = asyncio.Event()
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_STALE, resolver=boundary.resolver)
+  # The predicate waits for the first blocked stale attempt before promoting another member.
+  await await_condition(lambda: len(boundary.queries) == 1)
+  await boundary.coordinator.submit_stored(2, resolver=boundary.resolver)
+  assert resolution_log_records(caplog, 'progress') == []
+  release.set()
+  await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+  # stale is the origin of the unpromoted members; stored owns the promoted attempt.
+  stale = boundary.commands[0].observation.run
+  stored = boundary.commands[1].observation.run
+  assert stale is not stored
+  assert stale.snapshot()['selected'] == stale.snapshot()['covered'] == 3
+  assert stale.snapshot()['attempted'] == 2
+  assert stored.snapshot()['selected'] == stored.snapshot()['attempted'] == 1
+  # summary holds the final STALE log, whose additional count does not alter metric fields.
+  summary = resolution_log_records(caplog, 'processing', run_id=stale.run_id)[0].args[2]
+  assert summary['completed_membership'] == 3
+  assert summary['remaining_membership'] == 0
+  assert 'completed_membership' not in stale.snapshot()
+
+
+async def test_shared_active_members_delay_logs_without_delaying_new_pass_return(
+  app, saving_boundary, caplog, monkeypatch
+):
+  """Logical coverage preserves its boundary while logs await shared completion.
+
+  app/saving_boundary isolate the coordinator; monkeypatch permits two workers,
+  and caplog must not mislabel either running shared member as completed.
+  """
+  # boundary controls the two active stored operations; jobs supplies the NEW mode.
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 2)
+  # value identifies membership; the callback reloads id and ignores unused query kwargs.
+  boundary.repository.get_domain_candidate_for_resolve.side_effect = lambda id, **kwargs: boundary.candidate(id)
+  boundary.repository.get_new_domains_for_resolve.return_value = [boundary.candidate(value) for value in (1, 2)]
+  for value in (1, 2):
+    boundary.gates[f'domain-{value}.example.test'] = asyncio.Event()
+  await boundary.coordinator.submit_stored(1, resolver=boundary.resolver)
+  await boundary.coordinator.submit_stored(2, resolver=boundary.resolver)
+  # The predicate waits for both shared stored operations to enter DNS before NEW adopts them.
+  await await_condition(lambda: len(boundary.queries) == 2)
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  await asyncio.wait_for(boundary.resolver.domains_resolve(jobs.DOMAINS_RESOLVE_NEW), timeout=1)
+  # run is the latest NEW metrics origin, whose existing coverage contract is already satisfied.
+  run = importlib.import_module('metrics.metrics').ResolutionRun._latest['new']
+  assert run.snapshot()['selected'] == run.snapshot()['covered'] == 2
+  assert run.snapshot()['attempted'] == 0
+  assert run.snapshot()['processing_complete'] is True
+  assert resolution_log_records(caplog, 'progress', run_id=run.run_id) == []
+  assert resolution_log_records(caplog, 'processing', run_id=run.run_id) == []
+  boundary.gates['domain-2.example.test'].set()
+  # The predicate waits for the first shared completion's progress record before inspecting its counts.
+  await await_condition(lambda: len(resolution_log_records(caplog, 'progress', run_id=run.run_id)) == 1)
+  assert resolution_log_records(caplog, 'progress', run_id=run.run_id)[0].args[2] == 1
+  assert resolution_log_records(caplog, 'processing', run_id=run.run_id) == []
+  boundary.gates['domain-1.example.test'].set()
+  await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+  assert len(resolution_log_records(caplog, 'processing', run_id=run.run_id)) == 1
+  assert len(resolution_log_records(caplog, 'persistence', run_id=run.run_id)) == 1
+  assert run.snapshot()['attempted'] == 0
+
+
+@pytest.mark.parametrize('terminal', ['confirmed', 'known_not_committed', 'final_unknown'])
+async def test_provisional_unknown_is_not_final_and_late_receipt_keeps_original_log(app, caplog, terminal):
+  """Late final receipts settle only their originating run, once.
+
+  app isolates imports, caplog captures final INFO, and terminal chooses the
+  final truth after a provisional unknown. Duplicate events must be harmless.
+  """
+  # metrics creates production observations; old owns the receipt and observation receives its events.
+  metrics = importlib.import_module('metrics.metrics')
+  old = metrics.ResolutionRun('stored')
+  old.select(1)
+  observation = old.observe()
+  # event walks one legitimate processing/admission lifecycle before a late outcome.
+  for event in ('processing_started', 'success', 'admission_started', 'admitted', 'processing_finished'):
+    observation.notify(event, old.started_at)
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  old.finish(True)
+  observation.notify('unknown', old.started_at + 1)
+  assert resolution_log_records(caplog, 'persistence', run_id=old.run_id) == []
+  # newer supersedes only gauge ownership, not old's pending final summary.
+  newer = metrics.ResolutionRun('stored')
+  observation.notify(terminal, old.started_at + 2)
+  observation.notify(terminal, old.started_at + 3)
+  assert len(resolution_log_records(caplog, 'processing', run_id=old.run_id)) == 1
+  assert len(resolution_log_records(caplog, 'persistence', run_id=old.run_id)) == 1
+  # final is the original run's final primitive summary, not the newer gauge snapshot.
+  final = resolution_log_records(caplog, 'persistence', run_id=old.run_id)[0].args[2]
+  assert final['unknown' if terminal == 'final_unknown' else terminal] == 1
+  assert final['pending'] == 0
+  assert newer.snapshot()['admitted'] == newer.snapshot()['confirmed'] == 0
+
+
+async def test_cancelled_pass_never_reports_unstarted_members_as_completed(app, saving_boundary, caplog):
+  """Cancellation logs interruption without claiming completion of queued members.
+
+  app/saving_boundary hold one active member and two unstarted reservations;
+  caplog checks final counters after the caller's cancellation cleanup.
+  """
+  # boundary holds the first DNS request; jobs chooses NEW; operation is the caller-owned pass.
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  # value assigns the three members selected before cancellation.
+  boundary.repository.get_new_domains_for_resolve.return_value = [boundary.candidate(value) for value in (1, 2, 3)]
+  boundary.gates['domain-1.example.test'] = asyncio.Event()
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  operation = asyncio.create_task(boundary.resolver.domains_resolve(jobs.DOMAINS_RESOLVE_NEW))
+  # The predicate waits for the first DNS attempt so cancellation leaves two members unstarted.
+  await await_condition(lambda: len(boundary.queries) == 1)
+  operation.cancel()
+  with pytest.raises(asyncio.CancelledError):
+    await asyncio.wait_for(operation, timeout=3)
+  # summary preserves selected/attempted accounting despite cancellation before admission.
+  summary = resolution_log_records(caplog, 'processing')[0].args[2]
+  assert summary['selected'] == 3
+  assert summary['attempted'] == summary['cancelled_processing'] == 1
+  assert summary['completed_membership'] <= 1
+  assert summary['remaining_membership'] == summary['selected'] - summary['completed_membership']
+  assert summary['interrupted'] is True
+  assert boundary.commands == []
+
+
+async def test_repeated_new_generations_keep_progress_and_late_persistence_separate(
+  app, saving_boundary, caplog, monkeypatch
+):
+  """A queued NEW successor has its own budget and cannot steal late receipt logs.
+
+  app/saving_boundary isolate DNS and repository boundaries; monkeypatch installs
+  real observation events around controlled pending receipts. caplog verifies
+  each generation's origin while the coordinator never waits for commit.
+  """
+  # boundary supplies the actual coordinator; jobs identifies NEW; queue_dto supplies receipt outcomes.
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  queue_dto = importlib.import_module('models.dto.queue_dto')
+  # value identifies the same three selected domains across both finite generations.
+  boundary.repository.get_new_domains_for_resolve.return_value = [boundary.candidate(value) for value in (1, 2, 3)]
+  # release prevents the first generation from completing before the successor is accepted.
+  release = boundary.gates['domain-1.example.test'] = asyncio.Event()
+
+  async def admit_pending(domain):
+    """Admit domain with a real receipt while deliberately withholding commit truth."""
+    boundary.commands.append(domain)
+    domain.observation.notify('admission_started', domain.observation.run.started_at)
+    domain.write_receipt.mark_admitted()
+    domain.observation.notify('admitted', domain.observation.run.started_at)
+
+  monkeypatch.setattr(boundary.repository.put_domain_after_resolve, 'side_effect', admit_pending)
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_NEW, resolver=boundary.resolver)
+  # The predicate waits for blocked first-generation DNS before accepting its NEW successor.
+  await await_condition(lambda: len(boundary.queries) == 1)
+  await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_NEW, resolver=boundary.resolver)
+  release.set()
+  await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+  # first owns all physical writes; second is the latest completed logical generation.
+  first = boundary.commands[0].observation.run
+  second = importlib.import_module('metrics.metrics').ResolutionRun._latest['new']
+  assert first is not second
+  assert boundary.repository.get_new_domains_for_resolve.await_count == 2
+  assert len(boundary.queries) == len(boundary.commands) == 3
+  assert first.snapshot()['attempted'] == first.snapshot()['pending'] == 3
+  assert second.snapshot()['selected'] == second.snapshot()['covered'] == 3
+  assert second.snapshot()['attempted'] == 0
+  assert len(resolution_log_records(caplog, 'processing', run_id=first.run_id)) == 1
+  assert len(resolution_log_records(caplog, 'processing', run_id=second.run_id)) == 1
+  assert resolution_log_records(caplog, 'persistence', run_id=first.run_id) == []
+  assert len(resolution_log_records(caplog, 'persistence', run_id=second.run_id)) == 1
+  # command settles each first-generation receipt after the second generation already completed.
+  for command in boundary.commands:
+    command.write_receipt.set_outcome(queue_dto.WriteOutcome.CONFIRMED)
+    command.observation.notify('confirmed', command.observation.run.started_at + 1)
+  assert len(resolution_log_records(caplog, 'persistence', run_id=first.run_id)) == 1
+  assert first.snapshot()['confirmed'] == 3
+  assert second.snapshot()['confirmed'] == 0
 
 
 @pytest.mark.parametrize('inside_root', [False, True])

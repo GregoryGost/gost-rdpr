@@ -6,6 +6,7 @@ import dataclasses
 import importlib
 import importlib.metadata
 import json
+import logging
 import math
 import os
 import platform
@@ -3222,6 +3223,61 @@ def public_flow_snapshot(service, domain_id):
 
 
 @pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+@pytest.mark.parametrize('total', [1, 4])
+async def test_public_large_progress_budget_preserves_completion_and_http_responsiveness(e2e_service, total):
+  """Finish a small public NEW pass with a huge valid logging budget.
+
+  e2e_service owns the real application subprocess, disposable SQLite, bounded
+  requests and local DNS/DoH/RIPE providers. total selects one or a few domains;
+  neither case may make the HTTP event loop traverse unused logging intervals.
+  """
+  # service starts only after its isolated environment contains the large valid budget.
+  service = e2e_service
+  service.environment['RESOLVE_DOMAINS_LOG_EVERY'] = '1000000000'
+  service.environment['ROOT_LOG_LEVEL'] = 'info'
+  await service.start()
+  # names is the finite public selection; value supplies distinct synthetic domain names.
+  names = [f'progress-{value}.example.test' for value in range(total)]
+  # client bounds each public request so an event-loop stall cannot wedge the test runner.
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    assert (
+      await client.post('/dns', json=[{'server': service.dns_host}, {'doh_server': service.doh_url}])
+    ).status_code == 200
+    # name is one synthetic domain submitted through the real HTTP admission path.
+    assert (await client.post('/domains', json=[{'domain': name} for name in names])).status_code == 200
+    async with asyncio.timeout(5):
+      while True:
+        # rows contains committed NEW domains, excluding the seeded resolved default; dns_rows confirms DNS setup.
+        rows = (await client.get('/domains', params={'resolved': 'false'})).json()['payload']
+        dns_rows = (await client.get('/dns', params={'default': 'false'})).json()['payload']
+        if {row['name'] for row in rows} == set(names) and len(dns_rows) == 2:  # row is one committed domain.
+          break
+        await asyncio.sleep(0.01)
+    assert (await client.post('/commands/domains/resolve/new')).status_code == 200
+    # samples retains the public metric samples; fields contains this NEW pass's settled counters.
+    samples, fields = await completed_metrics(client, mode='new', selected=total)
+    assert fields['selected'] == fields['attempted'] == fields['covered'] == total
+    assert fields['success'] == fields['admitted'] == fields['confirmed'] == total
+    assert fields['failure'] == fields['pending'] == fields['unknown'] == 0
+    assert sample_total(samples, 'resolution_run_elapsed_seconds_count', mode='new') == 1
+    assert (await client.get('/health')).status_code == 200
+    # row identifies each selected domain whose IP result must be visible after real commit.
+    for row in rows:
+      # response is the public persisted result for this domain.
+      response = await client.get(f'/domains/{row["id"]}')
+      assert response.status_code == 200
+      assert set(response.json()['ips_v4']) == {'8.8.8.8', '8.8.4.4'}
+  await service.stop()
+  # progress holds only intermediate INFO lines; line is one captured child-process log line.
+  progress = [line for line in service.diagnostics().splitlines() if 'Resolution progress run_id=' in line]
+  assert len(progress) <= total - 1
+  assert bool(progress) is (total > 1)
+  assert service.diagnostics().count('Resolution processing run_id=') == 1
+  assert service.diagnostics().count('Resolution persistence run_id=') == 1
+
+
+@pytest.mark.e2e
 async def test_public_bulk_shared_addresses_keep_surviving_domain_and_durable_union(e2e_service):
   service = e2e_service
   names = ['first-shared.example.test', 'second-shared.example.test']
@@ -4754,6 +4810,186 @@ def measured_domain(app, *, mode='stored', complete=True):
     observation=observation,
   )
   return run, command
+
+
+def run_summary_records(caplog, run, kind):
+  """Select final INFO summaries for one run from caplog's captured records.
+
+  run identifies the origin rather than the latest metrics generation, and kind
+  distinguishes processing from persistence. Batch DEBUG records are excluded.
+  """
+  # record is one captured record whose positional arguments identify its origin.
+  return [
+    record
+    for record in caplog.records
+    if record.levelno == logging.INFO
+    and str(record.msg).startswith(f'Resolution {kind} run_id=')
+    and record.args[0] == run.run_id
+  ]
+
+
+@pytest.mark.parametrize('commit_before_processing', [False, True])
+async def test_multibatch_run_logs_final_persistence_once_after_both_boundaries(
+  app, store, monkeypatch, caplog, commit_before_processing
+):
+  """Keep batch details at DEBUG and summarize real SQLite commits once per run.
+
+  app/store isolate SQLite; monkeypatch chooses three-item batches, and caplog
+  captures actual output. commit_before_processing reverses the terminal event
+  order without replacing SQL, receipts, or observation code.
+  """
+  # metrics supplies the production observer; run owns seven source-domain results.
+  metrics = importlib.import_module('metrics.metrics')
+  run = metrics.ResolutionRun('new')
+  run.select(7)
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 3)
+  monkeypatch.setattr(app.settings, 'db_save_batch_timeout', 0.01)
+  # connection creates only test-owned fixture rows; value gives each selected domain an ID.
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.DomainsDbo),
+      [{'id': value, 'name': f'logged-{value}.example.test'} for value in range(1, 8)],
+    )
+  # evidence counts real transaction boundaries; commands retains receipt-bearing results.
+  evidence = instrument_sessions(store, monkeypatch)
+  commands = []
+  caplog.set_level(logging.DEBUG)
+  caplog.clear()
+  # value identifies each result; observation receives production lifecycle notifications.
+  for value in range(1, 8):
+    observation = run.observe()
+    observation.notify('processing_started', perf_counter())
+    observation.notify('success', perf_counter())
+    # command is a complete empty IPv4 result, which must still advance its checkpoint.
+    command = app.dto.DomainResult(
+      id=value, name=f'logged-{value}.example.test', resolution_complete=True, observation=observation
+    )
+    commands.append(command)
+    await store.put_domain_after_resolve(command)
+    observation.notify('processing_finished', perf_counter())
+  if not commit_before_processing:
+    run.finish(True)
+    assert len(run_summary_records(caplog, run, 'processing')) == 1
+    assert run_summary_records(caplog, run, 'persistence') == []
+  await store.start_writer()
+  await asyncio.wait_for(store.db_save_queue.join(), timeout=3)
+  if commit_before_processing:
+    assert run_summary_records(caplog, run, 'persistence') == []
+    run.finish(True)
+  assert evidence.commits == 3
+  assert [command.write_receipt.outcome.value for command in commands] == ['confirmed'] * 7
+  # connection reads committed checkpoints through the separate production read engine.
+  async with store._DataBase__read_engine.connect() as connection:
+    assert (await connection.execute(select(app.database.DomainsDbo.resolved))).scalars().all() == [True] * 7
+    assert all(
+      checkpoint is not None
+      for checkpoint in (await connection.execute(select(app.database.DomainsDbo.last_resolved_at))).scalars()
+    )  # checkpoint is each persisted completion timestamp.
+  assert len(run_summary_records(caplog, run, 'processing')) == 1
+  assert len(run_summary_records(caplog, run, 'persistence')) == 1
+  # final copies the final counters from the once-per-run persistence log.
+  final = run_summary_records(caplog, run, 'persistence')[0].args[2]
+  assert final['admitted'] == final['confirmed'] == 7
+  assert final['pending'] == final['unknown'] == final['known_not_committed'] == 0
+  # record identifies batch detail records independently of their summary payload text.
+  assert len([record for record in caplog.records if str(record.msg) == 'Resolution persistence summary=%s']) == 3
+  assert all(
+    record.levelno == logging.DEBUG
+    for record in caplog.records
+    if str(record.msg) == 'Resolution persistence summary=%s'
+  )
+
+
+@pytest.mark.parametrize(('stage', 'expected'), [('begin', 'known_not_committed'), ('after_commit', 'unknown')])
+async def test_failed_writer_logs_final_receipt_truth_once(app, store, monkeypatch, caplog, stage, expected):
+  """A writer fault reports its final receipt outcome without inventing success.
+
+  app/store use real isolated SQLite; monkeypatch injects the selected driver
+  stage, and caplog observes one final summary. expected follows whether SQLite
+  definitely did not commit or the commit acknowledgement became ambiguous.
+  """
+  await seed(app, store)
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+  # run and command carry real production observations across queue admission and writer cleanup.
+  run, command = measured_domain(app)
+
+  async def fault(current, evidence):
+    """Fail the requested driver stage; evidence retains real transaction counts."""
+    if current == stage:
+      raise RuntimeError('Synthetic driver stage failure')
+
+  instrument_sessions(store, monkeypatch, fault=fault)
+  caplog.set_level(logging.DEBUG)
+  caplog.clear()
+  await store.put_domain_after_resolve(command)
+  command.observation.notify('processing_finished', perf_counter())
+  run.finish(True)
+  assert run_summary_records(caplog, run, 'persistence') == []
+  await store.start_writer()
+  await asyncio.wait_for(asyncio.shield(store.writer_task), timeout=3)
+  assert len(run_summary_records(caplog, run, 'processing')) == 1
+  assert len(run_summary_records(caplog, run, 'persistence')) == 1
+  # final is the receipt-based final summary, independent of whether the row physically committed.
+  final = run_summary_records(caplog, run, 'persistence')[0].args[2]
+  assert final[expected] == final['admitted'] == 1
+  assert final['pending'] == final['confirmed'] == 0
+  assert command.write_receipt.outcome.value == ('final_unknown' if expected == 'unknown' else expected)
+  # current_domain reflects actual SQLite state; ambiguous acknowledgement may follow a physical commit.
+  # _ips is the returned IP snapshot, deliberately unused because this assertion concerns the checkpoint.
+  current_domain, _ips = await snapshot(app, store)
+  assert current_domain[0] is (stage == 'after_commit')
+
+
+@pytest.mark.parametrize('error_type', [RuntimeError, asyncio.CancelledError])
+@pytest.mark.parametrize('boundary', ['logger', 'collector'])
+async def test_final_summary_observation_failure_preserves_real_commit(
+  app, store, monkeypatch, caplog, error_type, boundary
+):
+  """Optional logging or gauge failures cannot change real commit receipts.
+
+  app/store isolate SQLite; monkeypatch injects error_type at boundary, while
+  caplog confirms collector failure still permits independent final logs.
+  """
+  await seed(app, store)
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+  # metrics is the production observation module; run/command retain normal source-domain truth.
+  metrics = importlib.import_module('metrics.metrics')
+  run, command = measured_domain(app)
+  # original_info keeps unrelated database lifecycle logging intact during resolution-log fault injection.
+  original_info = importlib.import_module('logger.logger').logger.info
+
+  def unavailable(*args, **kwargs):
+    """Raise the injected failure; args and kwargs accept any logger or collector call."""
+    raise error_type('Synthetic optional observation failure')
+
+  def fail_resolution_info(message, *args, **kwargs):
+    """Fail resolution INFO message values; forward other calls with their args and kwargs."""
+    if str(message).startswith('Resolution '):
+      raise error_type('Synthetic optional resolution logging failure')
+    return original_info(message, *args, **kwargs)
+
+  if boundary == 'logger':
+    monkeypatch.setattr(importlib.import_module('logger.logger').logger, 'info', fail_resolution_info)
+  else:
+    monkeypatch.setattr(metrics.run_snapshot, 'labels', unavailable)
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  await store.put_domain_after_resolve(command)
+  command.observation.notify('processing_finished', perf_counter())
+  run.finish(True)
+  await store.start_writer()
+  await asyncio.wait_for(store.db_save_queue.join(), timeout=3)
+  assert command.write_receipt.outcome.value == 'confirmed'
+  assert run.snapshot()['admitted'] == run.snapshot()['confirmed'] == 1
+  assert run.snapshot()['pending'] == 0
+  # current_domain proves the observed success reached SQLite rather than only a fake receipt.
+  # _ips is the returned IP snapshot, deliberately unused because this assertion concerns the checkpoint.
+  current_domain, _ips = await snapshot(app, store)
+  assert current_domain[0] is True
+  assert current_domain[1] is not None
+  if boundary == 'collector':
+    assert len(run_summary_records(caplog, run, 'processing')) == 1
+    assert len(run_summary_records(caplog, run, 'persistence')) == 1
 
 
 def assert_receipt_conservation(run):
@@ -8171,24 +8407,53 @@ def load_assert_source_budget(measurement, configuration):
 async def test_resolution_load_source_deadline_includes_admission_selection_and_retires_tasks(
   monkeypatch, delayed_stage
 ):
-  """Time spent before source selection cannot be granted again to persistence."""
+  """Exhaust the source budget before persistence, preserving timeout and cleanup.
+
+  monkeypatch confines the controlled clock and HTTP transport to this test.
+  delayed_stage chooses whether admission or selection consumes the budget.
+  The next persistence poll is forbidden even if cancellation cleanup takes time.
+  """
+  # loop supplies a real monotonic base; clock advances only the helper's view of time.
   loop = asyncio.get_running_loop()
+  clock = SimpleNamespace(value=loop.time())
+  # selected records frozen source membership; completed marks a forbidden later poll.
   selected, completed = asyncio.Event(), asyncio.Event()
+  # pending retains both probe tasks; retired records their cancellation cleanup.
   pending, retired = set(), set()
-  timers = []
+  # probes_ready prevents the first persistence response from racing probe startup.
+  probes_ready = asyncio.Event()
+  # started distinguishes the initial scrape; source_scrapes counts subsequent source polls.
   started = False
+  source_scrapes = 0
 
   async def request(request):
-    nonlocal started
+    """Serve synthetic request routes and consume time at the selected HTTP boundary.
+
+    request contains the HTTP method and URL. Probe requests remain pending until
+    cancellation, then fail during cleanup to challenge first-error preservation.
+    The selected phase consumes 31 virtual seconds against the 30-second budget.
+    """
+    nonlocal started, source_scrapes
+    # route identifies admission, metrics, or one of the independent API probes.
     route = (request.method, request.url.path)
     if route == ('POST', '/commands/domains/resolve/stale'):
       started = True
-      timers.extend([loop.call_later(0.1, selected.set), loop.call_later(0.2, completed.set)])
       if delayed_stage == 'admission':
-        await selected.wait()
+        clock.value += 31
+        selected.set()
     if route == ('GET', '/metrics'):
-      if started and delayed_stage == 'selection':
-        await selected.wait()
+      if started:
+        if not selected.is_set():
+          assert delayed_stage == 'selection'
+          clock.value += 31
+          selected.set()
+        source_scrapes += 1
+        if source_scrapes >= 2:
+          await probes_ready.wait()
+        if source_scrapes >= 3:
+          completed.set()
+          raise AssertionError('Persistence received a renewed deadline')
+      # fields exposes selection but withholds persistence completion for the first idle poll.
       fields = {
         'selected': int(selected.is_set()),
         'processing_complete': int(completed.is_set()),
@@ -8208,49 +8473,73 @@ async def test_resolution_load_source_deadline_includes_admission_selection_and_
           [
             'fastapi_app_info{pid="7"} 1',
             f'resolution_run_elapsed_seconds_count{{mode="stale"}} {int(completed.is_set())}',
+            # key names a run field; value is its synthetic metric value.
             *(f'resolution_run_snapshot{{mode="stale",field="{key}"}} {value}' for key, value in fields.items()),
           ]
         ),
       )
     if route in {('GET', '/domains/2'), ('POST', '/domains')}:
+      # task is one probe whose retirement must precede the helper's return.
       task = asyncio.current_task()
       pending.add(task)
+      if len(pending) == 2:
+        probes_ready.set()
       try:
         await asyncio.Event().wait()
+      except asyncio.CancelledError:
+        raise ValueError('Probe failed during cancellation cleanup') from None
       finally:
         retired.add(task)
     return httpx.Response(200, json={})
 
+  # real_client retains HTTPX construction; transport confines all requests to the fake above.
   real_client = httpx.AsyncClient
   transport = httpx.MockTransport(request)
+  # The client factory forwards kwargs unchanged while injecting the isolated transport.
   monkeypatch.setattr(httpx, 'AsyncClient', lambda **kwargs: real_client(transport=transport, **kwargs))
+  # module owns the helper's asyncio binding; clocked_asyncio delegates all real asyncio operations.
+  module = sys.modules[__name__]
+  clocked_asyncio = SimpleNamespace(**vars(asyncio))
+  # The time callback exposes controlled monotonic seconds; get_running_loop returns only that clock view.
+  clock.time = lambda: clock.value
+  clocked_asyncio.get_running_loop = lambda: clock
+  monkeypatch.setattr(module, 'asyncio', clocked_asyncio)
+  # service reports constant synthetic resources; its callback accepts the observed pid without OS access.
   service = SimpleNamespace(
     url='http://deadline.test',
     resource_snapshot=lambda pid: {'rss_bytes': 1, 'peak_rss_bytes': 1, 'cpu_seconds': 0, 'source': 'controlled OS'},
   )
+  # measurement retains the helper's source failure and API verdict after cleanup.
   measurement = {}
-  try:
-    async with asyncio.timeout(1):
-      with pytest.raises(TimeoutError):
-        await load_measure_pass(
-          service,
-          SimpleNamespace(count=1),
-          {'pass_timeout': 0.15, 'probe_interval': 1, 'rss_limit_mb': 1, 'cpu_percent_limit': 100},
-          {'read': 5, 'list': 5, 'stats': 5, 'job': 5, 'write': 5},
-          mode='stale',
-          measurement=measurement,
-        )
-    assert selected.is_set()
-    assert not completed.is_set()
-    assert measurement['source_pass_status'] == 'failed'
-    assert measurement['source_failure']['type'] == 'TimeoutError'
-    assert measurement.get('api_status') != 'passed'
-    assert len(pending) == 2
-    assert retired == pending
-    assert all(task.done() for task in pending)
-  finally:
-    for timer in timers:
-      timer.cancel()
+  async with asyncio.timeout(1):
+    with pytest.raises(TimeoutError):
+      await load_measure_pass(
+        service,
+        SimpleNamespace(count=1),
+        {
+          'pass_timeout': 30,
+          'probe_interval': 1,
+          'metrics_poll_interval': 0,
+          'rss_limit_mb': 1,
+          'cpu_percent_limit': 100,
+        },
+        {'read': 5, 'list': 5, 'stats': 5, 'job': 5, 'write': 5},
+        mode='stale',
+        measurement=measurement,
+      )
+  assert selected.is_set()
+  assert source_scrapes == 2
+  assert not completed.is_set()
+  assert measurement['source_budget_seconds'] == 30
+  assert measurement['source_pass_status'] == 'failed'
+  assert measurement['source_failure']['type'] == 'TimeoutError'
+  assert measurement.get('api_status') != 'passed'
+  assert len(pending) == 2
+  assert retired == pending
+  # task ranges over the retained probes, including cleanup failures already gathered by the helper.
+  assert all(task.done() for task in pending)
+  assert all(isinstance(task.exception(), ValueError) for task in pending)
+  assert {task.exception().args for task in pending} == {('Probe failed during cancellation cleanup',)}
 
 
 async def load_measure_pass(

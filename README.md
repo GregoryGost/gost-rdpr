@@ -156,7 +156,11 @@ Use the worker and semaphore limits to control concurrency, and `DOMAINS_UPDATE_
 | `QUEUE_MAX_SIZE` | int | `10000` | Positive capacity of each writer and RouterOS queue, and maximum accepted, unstarted explicit domain operations; producers wait when full |
 | `QUEUE_GET_TIMEOUT` | float | `0.1` | Maximum waiting time for a queue entry. 0.1s = 100ms |
 | `QUEUE_SLEEP_TIMEOUT` | float | `0.01` | The maximum wait time while the queue is empty. At the same time, the infinite loop should allow the scheduler to integrate other tasks into the overall flow. 0.01s = 10ms |
-| `RESOLVE_DOMAINS_LOG_EVERY` | int | `10` | Specifies the number of messages that will be logged during domain resolution. Distributes the total volume of domains to resolve among this number |
+| `RESOLVE_DOMAINS_LOG_EVERY` | int | `10` | Maximum intermediate INFO progress messages per nonempty NEW/STALE pass; minimum `3`. Initial totals and final summaries are excluded |
+
+Progress reports completed processing of the selected domains, including work shared with another operation.
+An empty pass emits only `Нет доменов для обработки`. Processing and persistence have separate INFO summaries;
+processing completion does not wait for database commits. Per-batch persistence details are available at DEBUG.
 
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |
