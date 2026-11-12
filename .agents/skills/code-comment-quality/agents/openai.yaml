@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code Comment Quality"
+  short_description: "Mandatory human-readable documentation coverage"
+  default_prompt: "Use $code-comment-quality with the active code_comment_quality rule to document every authored declaration in the affected scope for human developers. For Russian docstrings distinguish active classes, data holders, methods, and fields; prefer natural descriptions of actual behavior over infinitive task phrases without banning valid grammar. Review coverage and factual accuracy without fixed comment lengths."

@@ -2,13 +2,13 @@
 
 ## Execution Contract
 
-This repository consumes `agent-projects-tools` v1.16.2 in target project mode.
+This repository consumes `agent-projects-tools` v1.19.2 in target project mode.
 `AGENTS.md` defines bootstrap order; `.codex/rules/request_routing.md` is mandatory for every request.
 This profile declares capabilities and constraints; it grants no permission for side effects.
 Only exact active entries below and enabled specialized sections activate materials.
 Omitted optional materials are inactive. Read applicable entrypoints and validate their transitive hard dependencies
 with `.codex/rules/material_dependencies.md` before applying them.
-The FastAPI, cashews, and Python service E2E rule/skill pairs are intentional mutual dependencies;
+The code comment quality, FastAPI, cashews, and Python service E2E rule/skill pairs are intentional mutual dependencies;
 each member is explicitly active.
 Select applicable engineering policies for the intended project stack even before their implementation or scenarios
 exist. Missing scenarios or tooling affect execution readiness and acceptance evidence, not policy activation.
@@ -30,11 +30,28 @@ The full source catalog and template are not active profiles.
 - Git commit text language: Russian.
 - Documentation language policy: English for repository technical documentation and reusable agent materials.
   Preserve upstream text and exact quoted contracts in their original language.
+- Task tracking language policy: Russian for task titles, descriptions, checklists, acceptance criteria and status
+  notes, including `TASKS.md` and `TASKS_ARCHIVE.md`. This overrides the general documentation language policy
+  for task tracking.
 - Test/comment natural language policy: English for comments, docstrings, test explanations, documentation blocks,
   and other code-adjacent prose. Apply `comment-language-audit` when those surfaces are in scope.
 - API descriptions and developer-facing runtime messages: English, preserving established public contract values.
 - Keep identifiers, library names, protocols, commands, paths, packages, and proper names in their original language.
 - Apply language changes to the requested scope; this profile does not request a repository-wide translation.
+
+## Code Documentation Profile
+
+- Code comment quality enabled: yes.
+- Active code documentation rule/skill: `code_comment_quality.md` + `code-comment-quality`.
+- Required coverage: every authored declaration in affected owned functions/types, including private methods,
+  fields, constants, local/loop/exception bindings, test functions and fixtures.
+- Documentation language: use the Test/comment natural language policy above.
+- Documentation placement: Python docstrings for functions/methods; adjacent comments or explicitly named group
+  comments for fields, constants and variables; parameters may be documented inside the owning docstring.
+- Change boundary: apply to authorized affected definitions, including their existing declarations.
+  Repository-wide comment rewrites and new runtime behavior require separate authorization.
+- Validation: inventory declaration coverage and verify technical accuracy and human-readable wording
+  during implementation and review; `comment-language-audit` independently checks prose language.
 
 ## Agent Roles And Model Selection
 
@@ -310,6 +327,7 @@ Database and security skills are selected explicitly below; do not invent additi
 
 - Required routing rule: `.codex/rules/request_routing.md`
 - `source_code_hygiene.md`
+- `code_comment_quality.md`
 - `mark.md`
 - `context7_documentation.md`
 - `git.md`
@@ -325,6 +343,7 @@ Conditional bootstrap support files:
 ## Active Skills
 
 - `comment-language-audit`
+- `code-comment-quality`
 - `python-core`
 - `python-testing`
 - `python-fastapi-expert`

@@ -14,7 +14,11 @@ Load references when needed:
 ## Baseline
 
 - Add or update tests for every functional change.
-- Tests must have comments that describe what is being tested and why when the intent is not obvious. Use the test/comment language policy declared in `CODEX_PROJECT.md`; keep class names, variable names, library names, protocol names, and other proper names in their original form.
+- Document the purpose and expected behavior of tests in natural language. When `code_comment_quality.md` +
+  `code-comment-quality` is validly active, **every affected test function/fixture needs its own docstring, and every
+  local or fixture variable needs individual or explicitly mapped group documentation**; the name or brevity of a test
+  does not waive coverage. Follow the test/comment language policy in `CODEX_PROJECT.md`; preserve exact code
+  identifiers and proper names. This test skill does not activate the pair.
 - Test behavior and externally observable results, not private implementation details.
 - Keep business logic testable separately from handlers, repositories, ORM/SQL, framework wiring, HTTP clients, workers, CLI wrappers, and serializers.
 - Use `pytest`, `pytest-asyncio`, and `coverage.py` for Python 3.14+ projects.

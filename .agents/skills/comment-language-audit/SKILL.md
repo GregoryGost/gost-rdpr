@@ -10,6 +10,10 @@ Use this skill for portable language-policy work on code comments and code-adjac
 
 This skill covers natural-language quality only: target-language consistency, mixed prose, partial translation, grammar, inflection, source-language calques, noun-phrase construction, and audit workflow. Combine it with the active language or framework skill for syntax-specific rules such as Python docstrings, JSDoc, TSDoc, XML documentation comments, or framework documentation conventions.
 
+Semantic completeness, factual rationale, and documentation coverage belong to the separately activated
+`code_comment_quality.md` + `code-comment-quality` pair. Neither skill activates the other, and this language audit does
+not replace source-grounded technical review.
+
 ## Scope And Coordination
 
 - Read `CODEX_PROJECT.md` before editing code prose. Use its declared target natural language for comments, docstrings, test comments, and documentation blocks.
@@ -27,6 +31,21 @@ This skill covers natural-language quality only: target-language consistency, mi
 - For languages with inflection and agreement, check case, government, word agreement, verb-form consistency, and complete sentence structure.
 - Rewrite awkward literal translations into simple natural sentences while preserving exact code names and contract tokens.
 - For target languages where noun modifiers require case, agreement, hyphenation, adjective forms, or genitive constructions, do not keep source-language noun stacks as-is. Rewrite them into natural target-language noun phrases.
+
+## Meaning-sensitive language review
+
+- Literal translations can be grammatically correct yet useless. Recover the verified declaration purpose before
+  translating expressions such as English "owns transport" or "settings for one graph" into Russian.
+- For a resource owner, say who **creates, uses and closes** it only to the extent these facts are established. For a
+  configuration reader, describe what it actually reads or returns. Avoid imperative fragments like "Владеть транспортом
+  интеграции" and topic-only labels such as "Настройки одного графа" where the role is a reader.
+- Do not blacklist grammatical forms. A noun phrase is appropriate for some data containers; an infinitive can be
+  natural in context. For Russian docstrings, a method's present-tense action ("Открывает...", "Возвращает...") often
+  explains behavior more naturally than a task-like infinitive ("Открыть...", "Вернуть..."). A data class may
+  legitimately use "Хранит..." or a noun phrase if that matches its role; an adapter should describe its real operation
+  rather than claiming to store values. Judge the completeness, naturalness, and truth of the whole explanation.
+- This skill audits natural language when independently active; the source-comment quality pair must still check
+  explanatory meaning when this language skill is inactive.
 
 ## Audit Workflow
 

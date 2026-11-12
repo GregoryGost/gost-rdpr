@@ -90,7 +90,12 @@ For concrete examples, review checklist, and anti-patterns, load `references/ope
 
 - Keep API schemas separate from SQLAlchemy/SQLModel database models and internal domain objects.
 - Create explicit request and response models for public endpoints when their contracts differ.
-- Every externally visible Pydantic field should have a meaningful description when business meaning, format, constraints, or visibility are not obvious.
+- When `code_comment_quality.md` + `code-comment-quality` is independently active, every authored Pydantic field in an
+  affected model must have source documentation explaining its meaning and role, even if its name is descriptive. An
+  API-facing `Field(description=...)` also needs the relevant contract details for client documentation; it does not by
+  itself waive the active source-comment rule. When the pair is inactive, keep API field descriptions sufficiently
+  informative for clients according to the established project conventions. This FastAPI skill does not activate the
+  pair.
 - Add examples where concrete values improve API usability, especially identifiers, statuses, enums, timestamps, pagination, filters, and integration-facing fields.
 - Use model-level examples for request and response bodies that clients are expected to copy or generate.
 - Use validation constraints in schema fields when they are part of the HTTP contract.

@@ -86,10 +86,17 @@ For concrete examples, anti-patterns, and review checklist items, load `referenc
 - Follow the natural-language policy declared in `CODEX_PROJECT.md` for comments, docstrings, test comments, and documentation.
 - Use triple double quotes for docstrings.
 - Put docstrings immediately after the module, class, function, or method definition.
-- Public modules, exported functions/classes, and public methods should have docstrings when they are part of a stable project contract.
-- One-line docstrings should be concise summaries. Multi-line docstrings should start with a summary line, then a blank line, then details.
-- Function/method docstrings should document arguments, return values, side effects, raised exceptions, restrictions, and keyword-argument semantics when these are part of the public contract.
-- Comments should explain non-obvious business rules, invariants, trade-offs, side effects, and safety constraints. Do not add comments that merely restate obvious code.
+- When the `code_comment_quality.md` + `code-comment-quality` pair is validly active, **every authored module/class,
+  function, method (including private, tests, fixtures, and short accessors), field, constant and variable in the
+  affected scope must be documented**. Do not use function size or descriptive names to omit a docstring or local
+  comment; follow that pair's inventory and group-variable rules. This language skill does not activate the pair.
+- A Python function or method uses a docstring immediately inside the definition. A one-line docstring must still
+  describe actual behavior; a multi-line docstring starts with a summary, a blank line, then meaningful details.
+- Describe arguments, return values, effects, raised exceptions, restrictions, and keyword-argument semantics where
+  applicable. Explain complex mechanisms and constraints in full without inventing requirements.
+- Use adjacent `#` comments for local variables, fields and constants, or explicitly mapped group comments for related
+  declarations when the pair is active. Explain their meaning in context, not merely their names. Preserve readability,
+  factual accuracy and the project's natural language.
 
 ## Review Workflow
 
