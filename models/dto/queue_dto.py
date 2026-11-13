@@ -1,6 +1,7 @@
 from asyncio import CancelledError, Event
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from typing import Protocol
 
@@ -96,11 +97,16 @@ class TargetAction(StrEnum):
 
 @dataclass(frozen=True)
 class DomainResolutionIntent:
-  """An immutable prepared storage result captured before queue admission."""
+  """Keep a terminal saving result immutable through admission and writer retries."""
 
+  # id identifies the existing nondefault domain whose supports are reconciled.
   id: int
+  # resolution_complete permits IPv4 withdrawal and successful checkpoint advancement.
   resolution_complete: bool
+  # storage_ips contains the complete prepared IPv4 representation for this result.
   storage_ips: tuple[str, ...]
+  # last_attempt_at is the UTC processing completion time, frozen before admission.
+  last_attempt_at: datetime
 
 
 @dataclass(frozen=True)

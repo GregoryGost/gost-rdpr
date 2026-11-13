@@ -17,6 +17,7 @@ from collections.abc import AsyncGenerator, Coroutine, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from ipaddress import IPv4Address, IPv4Network, ip_address, ip_network
 from time import perf_counter
 from typing import Any, Literal, Self
@@ -287,23 +288,42 @@ class DomainsResolver:
     discovered_cnames: list[DomainsPostElementReq] | None = None,
     dns_context: _DefaultDnsContext | None = None,
   ) -> None:
+    """Prepare one terminal saving result and attempt exactly one writer admission.
+
+    domain receives evidence from the supplied immutable DNS server sequences;
+    discovered_cnames excludes aliases already discovered by the caller, and
+    dns_context reuses operation-owned classic resolvers. An unfinished DNS
+    aggregate or cancellation has no attempt date. Ordinary errors after DNS
+    completion admit an incomplete empty marker, preserving existing supports.
+    Admission errors propagate outside processing recovery; admitted commands
+    remain writer-owned when their caller is subsequently cancelled.
+    """
     logger.debug(f'START resolve domain {domain=} ...')
     domain.resolution_complete = False
     domain.processing_outcome = None
+    domain.last_attempt_at = None
     domain.storage_ips = ()
     domain.result.A.clear()
     domain.insert.ips_insert.clear()
     domain.insert.ips_delete.clear()
+    # dns_finished distinguishes terminal DNS evidence from an interrupted aggregate.
+    dns_finished = False
     try:
       if dns_context is None:
         dns_context = _DefaultDnsContext(settings.dns_timeout, settings.dns_lifetime)
+      # tasks contains endpoint operations; server is the configured endpoint in each sequence.
       tasks = [self.__resolve_server(domain, server, 'classic', dns_context) for server in default_dns_servers] + [
         self.__resolve_server(domain, server, 'doh') for server in doh_dns_servers
       ]
-      # Run parallel tasks
+      if not tasks:
+        return
+      # outcomes contains terminal endpoint evidence after all endpoint cleanup completes.
       outcomes = await _gather_owned(tasks)
+      dns_finished = True
       try:
+        # known_cnames holds caller-discovered names; cname is each candidate alias.
         known_cnames = {_absolute_name(from_text(cname.domain)) for cname in discovered_cnames or []}
+        # additional_cnames keeps new aliases in discovery order; outcome is their endpoint evidence.
         additional_cnames = [
           DomainsPostElementReq(domain=cname, list_id=domain.list_id)
           for cname in dict.fromkeys(cname for outcome in outcomes for cname in outcome.cnames)
@@ -313,13 +333,16 @@ class DomainsResolver:
           await self.__persist_cnames(additional_cnames)
       except DatabaseWriteError:
         raise
+      # err is a recoverable alias-discovery error, separate from address evidence.
       except Exception as err:
         logger.warning(
           f'[{err.__class__.__name__}]: additional CNAME discovery failed',
           exc_info=RuntimeError('Additional CNAME discovery failed'),
         )
+      # statuses summarizes endpoint authority; complete permits replacement only on agreement.
       statuses = {outcome.status for outcome in outcomes}
       complete = bool(outcomes) and statuses in ({DnsQueryStatus.ADDRESSES}, {DnsQueryStatus.ABSENT})
+      # address is an IPv4 answer from one successful outcome, before storage filtering.
       domain.result.A = sorted(
         {address for outcome in outcomes if outcome.status == DnsQueryStatus.ADDRESSES for address in outcome.addresses}
       )
@@ -329,21 +352,12 @@ class DomainsResolver:
           if any(outcome.status != DnsQueryStatus.FAILURE for outcome in outcomes)
           else ProcessingOutcome.FAILURE
         )
-        notify_observation(domain.observation, domain.processing_outcome, perf_counter())
-        return
-      # Ips processing for domain
-      current_ips: list[IpRecordDto] = await db.get_all_ips_for_domain(domain_id=domain.id)
-      domain.resolution_complete = complete
-      # add new ips, remove not resolved ips but current exists
-      await self.__ips_processing(domain=domain, current_ips=current_ips)
-      domain.processing_outcome = ProcessingOutcome.SUCCESS if complete else ProcessingOutcome.PARTIAL
-      notify_observation(domain.observation, domain.processing_outcome, perf_counter())
-      # INSERT IPS (send to Queue)
-      # DELETE IPS (send to Queue)
-      # UPDATE DOMAINS (send to Queue)
-      if complete or domain.storage_ips:
-        await db.put_domain_after_resolve(domain=domain)
-      logger.debug(f'FINAL resolve domain {domain=}')
+      else:
+        # current_ips is the committed support snapshot needed for safe address preparation.
+        current_ips: list[IpRecordDto] = await db.get_all_ips_for_domain(domain_id=domain.id)
+        domain.resolution_complete = complete
+        await self.__ips_processing(domain=domain, current_ips=current_ips)
+        domain.processing_outcome = ProcessingOutcome.SUCCESS if complete else ProcessingOutcome.PARTIAL
     except CancelledError:
       if domain.processing_outcome is None:
         domain.processing_outcome = ProcessingOutcome.CANCELLED
@@ -353,18 +367,29 @@ class DomainsResolver:
       raise
     except DomainIpReadError:
       domain.processing_outcome = ProcessingOutcome.FAILURE
-      notify_observation(domain.observation, domain.processing_outcome, perf_counter())
       domain.resolution_complete = False
-      logger.warning('Domain IP snapshot unavailable; resolving cycle skipped')
+      domain.storage_ips = ()
+      domain.insert.ips_insert.clear()
+      domain.insert.ips_delete.clear()
+      logger.warning('Domain IP snapshot unavailable; preserving stored addresses')
+    # err is an ordinary processing error; partially prepared changes cannot authorize replacement.
     except Exception as err:
       domain.resolution_complete = False
-      if domain.processing_outcome is None:
-        domain.processing_outcome = ProcessingOutcome.FAILURE
-      notify_observation(domain.observation, domain.processing_outcome, perf_counter())
+      domain.storage_ips = ()
+      domain.insert.ips_insert.clear()
+      domain.insert.ips_delete.clear()
+      domain.processing_outcome = ProcessingOutcome.FAILURE
       logger.error(
         f'[{err.__class__.__name__}]: domain resolving cycle failed',
         exc_info=RuntimeError('Domain resolving cycle failed'),
       )
+    if not dns_finished:
+      return
+    # Freeze processing completion once; queue waits and writer retries must not move this date.
+    domain.last_attempt_at = datetime.now(UTC)
+    notify_observation(domain.observation, domain.processing_outcome, perf_counter())
+    await db.put_domain_after_resolve(domain=domain)
+    logger.debug(f'FINAL resolve domain {domain=}')
 
   async def __persist_cnames(self: Self, cnames: list[DomainsPostElementReq]) -> None:
     try:
