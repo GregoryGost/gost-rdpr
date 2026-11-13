@@ -23,7 +23,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import aiosqlite
 import dns.asyncresolver
@@ -4973,15 +4973,29 @@ async def test_pending_gateway_reconciliation_preserves_existing_values_and_fail
 @pytest.mark.e2e
 @pytest.mark.parametrize('e2e_service', [False], indirect=True)
 async def test_public_legacy_target_name_overlap_is_refused_without_changes(e2e_service):
+  """Require the overlap refusal and an independent child exit before harness cleanup.
+
+  e2e_service supplies the real entrypoint, disposable SQLite and local provider fakes.
+  """
+  # service is the stopped application whose empty prefix collides with legacy table names.
   service = e2e_service
   service.environment['DB_TABLE_PREFIX'] = ''
+  # Coverage rewrites its SQLite data after SystemExit and can delay this bounded exit check.
+  # Other service E2E children keep their coverage instrumentation.
+  service.environment.pop('COVERAGE_PROCESS_START', None)
+  service.environment.pop('COVERAGE_FILE', None)
   create_legacy_database(service.db_path)
+  # before captures every persisted table and row before the refused startup.
   before = sqlite_snapshot(service.db_path)
   with pytest.raises(AssertionError, match='Application exited before readiness'):
     await service.start()
+  assert 'Legacy source and target tables overlap' in service.diagnostics()
+  assert service.startup_attempts[-1]['exit_code_before_cleanup'] == 3
   assert sqlite_snapshot(service.db_path) == before
   assert service.process is None
+  assert service.log is None
   assert service.providers.requests == []
+  assert service.providers.http_requests == []
 
 
 async def test_startup_error_after_physical_commit_keeps_writer_stopped_and_allows_fresh_recovery(
@@ -5936,11 +5950,21 @@ async def test_dns_configuration_ignores_enqueue_and_rollback_until_writer_commi
 async def test_dns_read_failure_is_typed_and_prevents_job_admission_and_persistence(
   app, store, resolver, monkeypatch, mode, caplog
 ):
+  """Reject broken DNS storage before automatic or stored resolution can enqueue writes.
+
+  app, store and resolver provide the isolated database and resolution dependencies;
+  monkeypatch supplies their shared patch scope. mode selects NEW or STALE, and
+  caplog verifies that public errors do not expose SQL details.
+  """
+  # jobs provides the public automatic-resolution modes used by this check.
   jobs = importlib.import_module('jobs.job_registry')
   await seed(app, store, resolved=mode == 'stale', checkpoint=STALE_CHECKPOINT if mode == 'stale' else None)
+  # before captures domain and IP rows that configuration failures must preserve.
   before = await snapshot(app, store)
+  # connection owns the committed test fault that removes DNS configuration storage.
   async with store._DataBase__write_engine.begin() as connection:
     await connection.execute(text('DROP TABLE rdpr_dns_servers'))
+  # failure is the typed public error whose message must hide schema and filesystem details.
   with pytest.raises(app.database.DnsConfigurationReadError) as failure:
     await store.get_dns_servers_for_resolve()
   assert 'rdpr_dns_servers' not in str(failure.value)
@@ -5948,7 +5972,8 @@ async def test_dns_read_failure_is_typed_and_prevents_job_admission_and_persiste
   with pytest.raises(app.database.DnsConfigurationReadError):
     await resolver.resolve_once('www.example.test')
   with pytest.raises(app.database.DnsConfigurationReadError):
-    await asyncio.wait_for(resolver.domains_resolve(getattr(jobs.Jobs, f'DOMAINS_RESOLVE_{mode.upper()}')), timeout=3)
+    # Bound a hung test while allowing the almost four-second STALE read measured with coverage.
+    await asyncio.wait_for(resolver.domains_resolve(getattr(jobs.Jobs, f'DOMAINS_RESOLVE_{mode.upper()}')), timeout=10)
   with pytest.raises(app.database.DnsConfigurationReadError):
     await resolver.resolve_stored_domain(1)
   assert store.pending_count == store.unknown_count == 0
@@ -9689,14 +9714,32 @@ async def test_api_diagnostic_metrics_observation_is_separate_and_has_no_payload
   assert 'private metric labels' not in json.dumps(recorder.evidence)
 
 
-@pytest.mark.parametrize('outcome', ['success', 'status', 'network', 'read', 'cancel'])
+@pytest.mark.parametrize(
+  'outcome',
+  ['success', 'extra_poll', 'status', 'network', 'read', 'cancel'],
+  ids=['success', 'extra-poll-success', 'status', 'network', 'read', 'cancel'],
+)
 async def test_api_diagnostic_idle_metrics_polls_concurrently_and_retires_siblings(monkeypatch, outcome):
-  """Idle scrapes are read-only, fail promptly, and cannot outlive the idle observer."""
+  """Check concurrent read-only scrapes, primary failures, and retirement of both idle tasks.
+
+  outcome selects normal success, success with an extra in-flight poll, a metric
+  status/network failure, a read failure, or external cancellation. monkeypatch
+  replaces only this module's perf_counter so one completed read cycle ends the
+  synthetic idle window; asyncio's scheduling and timeout clocks remain real.
+  """
+  # clock holds synthetic elapsed seconds until the final read advances the idle deadline.
   clock = [0.0]
+  # read_started signals an in-flight health read; poll_started signals the first concurrent scrape.
   read_started, poll_started = asyncio.Event(), asyncio.Event()
+  # extra_poll_started releases the held health read only after a second idle poll begins.
+  extra_poll_started = asyncio.Event()
+  # requests captures HTTP methods/paths; tasks retains the reader/poller for cleanup assertions.
   requests, tasks = [], {}
+  # metric_requests counts every scrape, including the mandatory before/after observations.
   metric_requests = 0
+  # primary must escape unchanged even if cancelling its sibling raises another error.
   primary = httpx.ReadError('synthetic idle failure')
+  # metrics reports both modes fully drained; mode selects each job and key its drain field.
   metrics = '\n'.join(
     [f'resolution_run_elapsed_seconds_count{{mode="{mode}"}} 0' for mode in ('new', 'stale')]
     + [
@@ -9707,6 +9750,11 @@ async def test_api_diagnostic_idle_metrics_polls_concurrently_and_retires_siblin
   )
 
   async def request(request):
+    """Serve request through the mock transport, synchronizing reads and metric failures.
+
+    The captured outcome controls the response/error. In the extra-poll case,
+    /health stays in flight until the same poller issues a second idle scrape.
+    """
     nonlocal metric_requests
     requests.append((request.method, request.url.path))
     if request.url.path == '/metrics':
@@ -9725,11 +9773,17 @@ async def test_api_diagnostic_idle_metrics_polls_concurrently_and_retires_siblin
           finally:
             if outcome == 'read':
               raise ValueError('secondary poller cleanup error')
+      if metric_requests == 3 and outcome == 'extra_poll':
+        assert asyncio.current_task() is tasks['poller']
+        assert not tasks['reader'].done()
+        extra_poll_started.set()
       return httpx.Response(200, text=metrics)
     if request.url.path == '/health':
       tasks['reader'] = asyncio.current_task()
       read_started.set()
       await poll_started.wait()
+      if outcome == 'extra_poll':
+        await extra_poll_started.wait()
       if outcome == 'read':
         raise primary
       if outcome in {'network', 'status', 'cancel'}:
@@ -9738,8 +9792,11 @@ async def test_api_diagnostic_idle_metrics_polls_concurrently_and_retires_siblin
       clock[0] = 1
     return httpx.Response(200, json={})
 
+  # The clock callback reads test-local time without changing asyncio's real timeout clock.
   monkeypatch.setattr(sys.modules[__name__], 'perf_counter', lambda: clock[0])
+  # recorder separates API latency samples from optional metric evidence.
   recorder = ApiDiagnosticRecorder()
+  # configuration bounds the observer and retains its real metric polling interval.
   configuration = {
     'pass_timeout': 1,
     'idle_seconds': 0.2,
@@ -9747,6 +9804,7 @@ async def test_api_diagnostic_idle_metrics_polls_concurrently_and_retires_siblin
     'metrics_poll_interval': 0.05,
     'idle_metrics_polling': True,
   }
+  # client confines exchanges to request; observer owns the real idle helper and its child tasks.
   async with httpx.AsyncClient(base_url='http://test', transport=httpx.MockTransport(request)) as client:
     observer = asyncio.create_task(api_diagnostic_idle(client, SimpleNamespace(count=2), configuration, recorder))
     try:
@@ -9754,9 +9812,10 @@ async def test_api_diagnostic_idle_metrics_polls_concurrently_and_retires_siblin
         await poll_started.wait()
         if outcome == 'cancel':
           observer.cancel('cancel idle observer')
-        if outcome == 'success':
+        if outcome in {'success', 'extra_poll'}:
           await observer
         else:
+          # expected is the public failure type; caught retains its original exception for identity checks.
           expected = (
             asyncio.CancelledError
             if outcome == 'cancel'
@@ -9771,13 +9830,28 @@ async def test_api_diagnostic_idle_metrics_polls_concurrently_and_retires_siblin
           if outcome == 'cancel':
             assert caught.value.args == ('cancel idle observer',)
       assert set(tasks) == {'reader', 'poller'}
+      # task iterates the retained sibling handles, which must both be retired before returning.
       assert all(task.done() for task in tasks.values())
+      # method is each captured verb; _ discards its path while checking every exchange is read-only.
       assert all(method == 'GET' for method, _ in requests)
       assert 'metrics' not in recorder.observations
-      if outcome == 'success':
-        assert metric_requests == 3
+      # scrapes retains every completed or failed metric exchange; row iterates the evidence entries.
+      scrapes = recorder.evidence['metrics_scrapes']
+      assert metric_requests == len(scrapes)
+      assert all(row['path'] != '/metrics' for row in recorder.observations.requests)
+      if outcome in {'success', 'extra_poll'}:
+        # scopes records observation phases in request order; only idle_poll may repeat.
+        scopes = [row['scope'] for row in scrapes]
+        assert scopes.count('idle_before') == scopes.count('idle_after') == 1
+        assert scopes[0] == 'idle_before'
+        assert scopes[-1] == 'idle_after'
+        assert len(scopes[1:-1]) >= 1
+        assert set(scopes[1:-1]) == {'idle_poll'}
+        if outcome == 'extra_poll':
+          assert extra_poll_started.is_set()
+          assert scopes.count('idle_poll') >= 2
         assert recorder.evidence['idle_drained_modes_after'] == recorder.evidence['idle_drained_modes_before']
-        assert all(row['status_code'] == 200 for row in recorder.evidence['metrics_scrapes'])
+        assert all(row['status_code'] == 200 and row['error_type'] is None for row in scrapes)
     finally:
       observer.cancel()
       await asyncio.gather(observer, return_exceptions=True)
@@ -10958,6 +11032,383 @@ def test_batch_comparison_startup_profile_preserves_fixed_workload_and_historica
     'DB_SAVE_BATCH_TIMEOUT': '0.1',
     'DOMAINS_UPDATE_INTERVAL': '0',
   }
+
+
+@pytest.fixture
+async def startup_boundary(tmp_path, monkeypatch, pytestconfig):
+  """Control child exit, health sockets and deadline delivery around the real startup method.
+
+  tmp_path owns the harness log; monkeypatch restores OS-boundary adapters; pytestconfig
+  locates the already loaded conftest plugin without importing application globals.
+  No application process, database or provider connection is started by this fixture.
+  """
+  # root identifies this checkout; plugin supplies the actual ServiceProcess harness.
+  root = Path(__file__).resolve().parents[2]
+  plugin = pytestconfig.pluginmanager.get_plugin(str(root / 'tests/conftest.py'))
+  assert plugin is not None
+  # loop runs the harness; original_timeout retains the real cancellable timeout manager.
+  loop = asyncio.get_running_loop()
+  original_timeout = asyncio.timeout
+  # exited wakes process.wait; health_entered identifies the first attempted socket connection.
+  exited = asyncio.Event()
+  health_entered = asyncio.Event()
+  # boundary groups the controls and observations for this single startup:
+  # child holds the OS-observed returncode, wait, kill and stdin adapters; service is the real harness.
+  # hold_connect blocks connection completion; exit_during_response publishes exit before response consumption.
+  # receive_count selects response bytes then EOF; deadlines holds outer Timeout managers.
+  # timeout_delays records requested seconds; sockets records health sockets for closure checks.
+  # health_tasks and child_waits record their owning tasks; cleanup_requests records stdin/kill actions.
+  # health_entered publishes the first connect attempt; publish_exit below exposes the child-exit control.
+  # spawn records interpreter inputs; real_spawn retains the OS adapter for isolated bootstrap checks.
+  boundary = SimpleNamespace(
+    child=SimpleNamespace(returncode=None),
+    service=plugin.ServiceProcess(root, tmp_path, {'APP_PORT': '1'}),
+    hold_connect=False,
+    exit_during_response=False,
+    receive_count=0,
+    deadlines=[],
+    timeout_delays=[],
+    sockets=[],
+    health_tasks=[],
+    child_waits=[],
+    cleanup_requests=[],
+    health_entered=health_entered,
+    spawn=AsyncMock(),
+    real_spawn=asyncio.create_subprocess_exec,
+  )
+
+  def publish_exit(code):
+    """Expose code as the child's OS-observed return code and wake every exit waiter."""
+    boundary.child.returncode = code
+    exited.set()
+
+  async def wait_child():
+    """Return the child's observed exit code after its explicit exit event."""
+    boundary.child_waits.append(asyncio.current_task())
+    await exited.wait()
+    return boundary.child.returncode
+
+  def request_shutdown(data):
+    """Record data written to child stdin and make a live child exit during cleanup."""
+    boundary.cleanup_requests.append(data)
+    if boundary.child.returncode is None:
+      publish_exit(0)
+
+  def kill_child():
+    """Represent the OS kill boundary if graceful cleanup unexpectedly falls back to it."""
+    boundary.cleanup_requests.append('kill')
+    publish_exit(-9)
+
+  async def connect_health(connection, address):
+    """Observe connection and address without opening a network connection.
+
+    When hold_connect is selected, cancellation is the only way to finish the operation.
+    """
+    assert address == ('127.0.0.1', 1)
+    boundary.sockets.append(connection)
+    boundary.health_tasks.append(asyncio.current_task())
+    health_entered.set()
+    if boundary.hold_connect:
+      await asyncio.Future()
+
+  async def receive_health(connection, maximum):
+    """Supply a valid HTTP response, optionally publishing child exit before its first byte.
+
+    connection must be the socket opened by health_ready; maximum is its bounded read size.
+    """
+    assert connection in boundary.sockets
+    assert 0 < maximum <= 4097
+    boundary.receive_count += 1
+    if boundary.receive_count == 1:
+      if boundary.exit_during_response:
+        publish_exit(3)
+      return b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'
+    return b''
+
+  def capture_timeout(delay):
+    """Preserve delay and capture only the real outer startup deadline for manual delivery."""
+    # manager owns the actual asyncio cancellation semantics, including expiry conversion.
+    manager = original_timeout(delay)
+    boundary.timeout_delays.append(delay)
+    if delay == 15:
+      boundary.deadlines.append(manager)
+    return manager
+
+  boundary.publish_exit = publish_exit
+  boundary.child.wait = wait_child
+  boundary.child.kill = kill_child
+  boundary.child.stdin = SimpleNamespace(
+    write=request_shutdown,
+    drain=AsyncMock(),
+    close=Mock(),
+    wait_closed=AsyncMock(),
+  )
+  boundary.spawn.return_value = boundary.child
+  monkeypatch.setattr(asyncio, 'create_subprocess_exec', boundary.spawn)
+  monkeypatch.setattr(asyncio, 'timeout', capture_timeout)
+  monkeypatch.setattr(loop, 'sock_connect', connect_health)
+  monkeypatch.setattr(loop, 'sock_sendall', AsyncMock())
+  monkeypatch.setattr(loop, 'sock_recv', receive_health)
+  try:
+    yield boundary
+  finally:
+    await boundary.service.stop(allow_failure=True)
+
+
+def assert_startup_resources_collected(boundary):
+  """Check that boundary's completed startup left no process, log, socket or waiter behind."""
+  assert boundary.service.process is None
+  assert boundary.service.log is None
+  # connection is each health socket; task is each child or health operation observed at its OS boundary.
+  assert all(connection.fileno() == -1 for connection in boundary.sockets)
+  assert all(task.done() for task in boundary.child_waits + boundary.health_tasks)
+
+
+@pytest.mark.parametrize('measured', [True, False], ids=['coverage-requested', 'unmeasured'])
+async def test_process_startup_gives_child_private_environment_without_coverage_autostart(startup_boundary, measured):
+  """Only the explicit bootstrap may start child coverage; caller settings remain reusable.
+
+  startup_boundary observes the real start method at the OS spawn boundary. measured
+  selects whether the caller requests subprocess coverage through its original config path.
+  """
+  # boundary supplies the controlled child and records the exact spawn environment.
+  boundary = startup_boundary
+  boundary.service.environment.update(
+    COVERAGE_FILE='owned-branch-fragments',
+    PYTHONPATH='owned-source-root',
+    TEST_SOURCE_EVIDENCE='owned-source-evidence.json',
+    DB_SHUTDOWN_TIMEOUT='20',
+  )
+  if measured:
+    boundary.service.environment['COVERAGE_PROCESS_START'] = 'owned-coverage-config.toml'
+  # original retains all caller inputs so removal or rewriting cannot be hidden by aliasing.
+  original = dict(boundary.service.environment)
+  await boundary.service.start()
+  # spawned is the mapping Python receives before .pth startup hooks can run.
+  spawned = boundary.spawn.await_args.kwargs['env']
+  assert 'COVERAGE_PROCESS_START' not in spawned
+  assert boundary.service.environment == original
+  # expected preserves every unrelated setting while assigning coverage solely to the bootstrap.
+  expected = dict(original)
+  if measured:
+    expected['TEST_COVERAGE_CONFIG'] = expected.pop('COVERAGE_PROCESS_START')
+  assert spawned == expected
+  assert boundary.service.startup_attempts[-1]['status'] == 'ready'
+  assert boundary.timeout_delays[:2] == [15, 0.5]
+
+
+@pytest.mark.parametrize('measured', [True, False], ids=['branch-coverage', 'unmeasured'])
+async def test_process_startup_bootstrap_has_one_coverage_lifetime(startup_boundary, measured):
+  """A real interpreter must have no automatic owner before or after explicit measurement.
+
+  startup_boundary captures the actual bootstrap and spawn environment. measured selects
+  explicit branch measurement of a tiny test-owned entrypoint, with fragments separated
+  from application coverage. The real interpreter executes .pth hooks and bootstrap cleanup.
+  This checks harness instrumentation, not application startup or business behavior.
+  """
+  # boundary supplies the real bootstrap without opening application sockets or databases.
+  boundary = startup_boundary
+  # directory owns the synthetic entrypoint and lifecycle reports for this one child.
+  directory = boundary.service.directory
+  # coverage_root is the configured artifact area; synthetic data must never enter pytest-cov's combined file.
+  coverage_root = boundary.service.root / '.pytest_cache' / 'coverage'
+  coverage_root.mkdir(parents=True, exist_ok=True)
+  # coverage_temporary owns a unique directory across workers and runs, removed only after handles close.
+  with TemporaryDirectory(prefix='bootstrap-lifecycle-', dir=coverage_root) as coverage_temporary:
+    # coverage_directory holds only this diagnostic's configuration and suffixed measurement data.
+    coverage_directory = Path(coverage_temporary)
+    # config requests branches with the default measurement core; fragment_base is this child's data prefix.
+    config = coverage_directory / 'coverage.ini'
+    fragment_base = coverage_directory / '.coverage'
+    # main is the only measured file, so this diagnostic cannot contribute application coverage.
+    main = directory / 'main.py'
+    config.write_text(f'[run]\nbranch = true\ninclude = {main.as_posix()}\n', encoding='utf-8')
+    # program reports the active owner and executes both outcomes of a known synthetic branch.
+    program = (
+      'import json\n'
+      'from pathlib import Path\n'
+      'from coverage import Coverage\n'
+      '# active is the explicit owner visible while the entrypoint runs.\n'
+      'active = Coverage.current()\n'
+      '# observed records whether branch measurement is enabled for that owner.\n'
+      'observed = {"active": active is not None, "branch": active.get_option("run:branch") if active else None}\n'
+      'Path("coverage-during.json").write_text(json.dumps(observed), encoding="utf-8")\n'
+      '# selected exercises each outcome; result records the selected branch value.\n'
+      'for selected in (True, False):\n'
+      '  if selected:\n'
+      '    result = 1\n'
+      '  else:\n'
+      '    result = 2\n'
+      'assert result == 2\n'
+    )
+    main.write_text(program, encoding='utf-8')
+    boundary.service.root = directory
+    # system_key names each safe Windows bootstrap setting, matching the real service fixture's allowlist.
+    boundary.service.environment.update(
+      {
+        system_key: os.environ[system_key]
+        for system_key in ('SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP')
+        if system_key in os.environ
+      }
+    )
+    boundary.service.environment['COVERAGE_FILE'] = str(fragment_base)
+    if measured:
+      boundary.service.environment['COVERAGE_PROCESS_START'] = str(config)
+    await boundary.service.start()
+    # invocation preserves the actual bootstrap and private environment handed to the spawn adapter.
+    invocation = boundary.spawn.await_args
+    await boundary.service.stop()
+    # probe observes ownership after .pth execution and at exit, without changing coverage lifecycle calls.
+    probe = (
+      'import atexit, coverage as probe_coverage, json\n'
+      'from pathlib import Path\n'
+      '# probe_before records an owner started by interpreter hooks before the bootstrap.\n'
+      'probe_before = probe_coverage.Coverage.current() is not None\n'
+      'def probe_finish():\n'
+      '  """Report whether bootstrap cleanup left or resumed a measurement owner."""\n'
+      '  Path("coverage-after.json").write_text(json.dumps({"before": probe_before, '
+      '"after": probe_coverage.Coverage.current() is not None}), encoding="utf-8")\n'
+      'atexit.register(probe_finish)\n'
+    )
+    # child executes the exact captured bootstrap plus read-only observations in a real interpreter.
+    child = await boundary.real_spawn(
+      invocation.args[0],
+      '-B',
+      '-c',
+      probe + invocation.args[3],
+      str(main),
+      cwd=directory,
+      env=invocation.kwargs['env'],
+      stdin=asyncio.subprocess.PIPE,
+      stdout=asyncio.subprocess.PIPE,
+      stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+      # output retains diagnostics; read stdout directly because communicate would close the shutdown pipe.
+      assert child.stdout is not None
+      output = await asyncio.wait_for(child.stdout.read(), timeout=10)
+      await asyncio.wait_for(child.wait(), timeout=5)
+      assert child.returncode == 0, output.decode('utf-8', errors='replace')
+    finally:
+      if child.returncode is None:
+        child.kill()
+        await asyncio.wait_for(child.wait(), timeout=5)
+      if child.stdin is not None:
+        child.stdin.close()
+        await child.stdin.wait_closed()
+    assert json.loads((directory / 'coverage-after.json').read_text(encoding='utf-8')) == {
+      'before': False,
+      'after': False,
+    }
+    assert json.loads((directory / 'coverage-during.json').read_text(encoding='utf-8')) == {
+      'active': measured,
+      'branch': True if measured else None,
+    }
+    # fragments are the saved suffixed data files from this bootstrap alone.
+    fragments = list(coverage_directory.glob('.coverage.*'))
+    if measured:
+      assert len(fragments) == 1
+      # data opens that isolated fragment; branch_line is the synthetic conditional's source position.
+      data = importlib.import_module('coverage').CoverageData(basename=str(fragments[0]))
+      data.read()
+      branch_line = program.splitlines().index('  if selected:') + 1
+      try:
+        assert data.has_arcs()
+        assert data.measured_files() == {str(main)}
+        assert {(branch_line, branch_line + 1), (branch_line, branch_line + 3)} <= set(data.arcs(str(main)))
+      finally:
+        data.close()
+    else:
+      assert fragments == []
+
+
+async def test_process_startup_rejects_health_response_after_observed_child_exit(startup_boundary):
+  """A valid health response cannot report readiness after the child has observably exited.
+
+  startup_boundary delivers the child's exit before the HTTP200 response is consumed.
+  """
+  # boundary selects the exit/response ordering; startup runs the actual harness in its own task.
+  boundary = startup_boundary
+  boundary.exit_during_response = True
+  startup = asyncio.create_task(boundary.service.start())
+  with pytest.raises(AssertionError, match='Application exited before readiness'):
+    await startup
+  assert boundary.service.startup_attempts[-1]['status'] == 'failed'
+  assert boundary.cleanup_requests == []
+  assert_startup_resources_collected(boundary)
+
+
+@pytest.mark.parametrize('exit_code', [3, None], ids=['exited-child', 'live-child'])
+async def test_process_startup_deadline_distinguishes_observed_exit_from_live_child(startup_boundary, exit_code):
+  """An exit observed before the deadline outranks timeout; a live child still times out.
+
+  startup_boundary holds a real health operation pending; exit_code selects whether the
+  OS has reported a child exit before the captured fifteen-second deadline is delivered.
+  """
+  # boundary controls the OS reports; startup is the pending real startup operation.
+  boundary = startup_boundary
+  boundary.hold_connect = True
+  startup = asyncio.create_task(boundary.service.start())
+  await asyncio.wait_for(boundary.health_entered.wait(), timeout=2)
+  assert boundary.timeout_delays == [15, 0.5]
+  if exit_code is not None:
+    boundary.publish_exit(exit_code)
+  boundary.deadlines[0].reschedule(asyncio.get_running_loop().time())
+  if exit_code is None:
+    with pytest.raises(TimeoutError):
+      await startup
+    assert boundary.cleanup_requests == [b'\n']
+  else:
+    with pytest.raises(AssertionError, match='Application exited before readiness'):
+      await startup
+    assert boundary.cleanup_requests == []
+  assert boundary.service.startup_attempts[-1]['status'] == 'failed'
+  assert_startup_resources_collected(boundary)
+
+
+@pytest.mark.parametrize('exit_code', [None, 3], ids=['live-child', 'exited-child'])
+async def test_process_startup_external_cancellation_remains_primary_and_collects_resources(
+  startup_boundary, exit_code
+):
+  """External cancellation remains cancellation while startup collects its child and socket.
+
+  startup_boundary keeps health pending; exit_code optionally publishes an exit before
+  caller cancellation, which must still propagate as the caller's CancelledError.
+  """
+  # boundary supplies a live child; startup is cancelled by its caller rather than a deadline.
+  boundary = startup_boundary
+  boundary.hold_connect = True
+  startup = asyncio.create_task(boundary.service.start())
+  await asyncio.wait_for(boundary.health_entered.wait(), timeout=2)
+  if exit_code is not None:
+    boundary.publish_exit(exit_code)
+  startup.cancel('caller cancelled startup')
+  with pytest.raises(asyncio.CancelledError, match='caller cancelled startup'):
+    await startup
+  assert boundary.service.startup_attempts[-1]['status'] == 'failed'
+  assert boundary.cleanup_requests == ([b'\n'] if exit_code is None else [])
+  assert_startup_resources_collected(boundary)
+
+
+async def test_process_startup_live_health_response_becomes_ready_and_collects_observers(startup_boundary):
+  """A live child with HTTP200 becomes ready and leaves no health or exit observer running.
+
+  startup_boundary supplies a complete response without exposing a child exit.
+  """
+  # boundary leaves the child live; startup completes through the real health parser.
+  boundary = startup_boundary
+  startup = asyncio.create_task(boundary.service.start())
+  await startup
+  assert boundary.child.returncode is None
+  assert boundary.service.process is boundary.child
+  assert boundary.service.startup_attempts[-1]['status'] == 'ready'
+  assert boundary.timeout_delays[:2] == [15, 0.5]
+  # connection is each socket consumed by health_ready; task is each temporary startup observer.
+  assert all(connection.fileno() == -1 for connection in boundary.sockets)
+  assert all(task.done() for task in boundary.child_waits + boundary.health_tasks)
+  await boundary.service.stop()
+  assert boundary.cleanup_requests == [b'\n']
+  assert_startup_resources_collected(boundary)
 
 
 @pytest.mark.e2e
@@ -12698,21 +13149,38 @@ async def test_public_http_retries_preserve_resolution_persistence_and_logical_m
 @pytest.mark.e2e
 @pytest.mark.parametrize('e2e_service', [False], indirect=True)
 @pytest.mark.parametrize('slow_transport', ['classic', 'doh'])
-async def test_public_dns_deadline_keeps_stale_data_and_retry_checkpoint_then_recovers(e2e_service, slow_transport):
+@pytest.mark.parametrize('healthy_delay', [0.0, 0.25])
+async def test_public_dns_deadline_keeps_stale_data_and_retry_checkpoint_then_recovers(
+  e2e_service, slow_transport, healthy_delay
+):
+  """Keep healthy DNS evidence when the other transport fails, then recover completely.
+
+  e2e_service owns the isolated application and providers; slow_transport selects
+  the failing protocol. healthy_delay gives the healthy A answer its latency in
+  seconds, then applies that latency to the formerly failing transport on recovery.
+  """
+  # service owns the application process, temporary database and local provider controls.
   service = e2e_service
-  service.environment['DOH_OPERATION_TIMEOUT'] = '0.15'
-  service.environment['DNS_OPERATION_TIMEOUT'] = '0.15'
-  service.environment['DNS_TIMEOUT'] = '0.03'
-  service.environment['DNS_LIFETIME'] = '0.06'
+  # Only the failing transport gets a one-second operation budget. The normal
+  # classic timeout/lifetime (2/5 seconds) and DoH phase timeouts (2 seconds) stay
+  # longer so the outer deadline expires first, while recovery latency still fits.
+  service.environment['DNS_OPERATION_TIMEOUT' if slow_transport == 'classic' else 'DOH_OPERATION_TIMEOUT'] = '1'
   await service.start()
+  # domain_id identifies the seeded public domain; before_domain and before_ips retain
+  # its complete-resolution checkpoint and existing address identities/metadata.
   domain_id = await configure_public_domain(service)
   before_domain, before_ips = public_flow_snapshot(service, domain_id)
+  # healthy_transport receives the controlled A delay without changing the failing transport.
+  healthy_transport = 'doh' if slow_transport == 'classic' else 'classic'
+  service.providers.schedule[(healthy_transport, 'www.example.test', dns.rdatatype.A, service.providers.cycle)] = [
+    {'delay': healthy_delay}
+  ]
   service.providers.hold_dns = slow_transport == 'doh'
   service.providers.drop_classic = slow_transport == 'classic'
+  # client uses the public HTTP boundary; samples and fields expose the completed run.
   async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
     assert (await client.post(f'/domains/{domain_id}/resolve')).status_code == 202
-    async with asyncio.timeout(3):
-      samples, fields = await completed_metrics(client, mode='stored', selected=1)
+    samples, fields = await completed_metrics(client, mode='stored', selected=1)
     if slow_transport == 'doh':
       assert service.providers.dns_entered.is_set()
     assert fields['partial'] == fields['admitted'] == fields['confirmed'] == 1
@@ -12724,6 +13192,8 @@ async def test_public_dns_deadline_keeps_stale_data_and_retry_checkpoint_then_re
     assert (
       sample_total(samples, 'resolution_dns_duration_seconds_count', transport=slow_transport, outcome='cancelled') == 0
     )
+    # after_domain and after_ips expose durable state after each failed or recovered pass;
+    # address selects each retained address whose complete metadata must remain unchanged.
     after_domain, after_ips = public_flow_snapshot(service, domain_id)
     assert after_domain == before_domain
     assert {address: after_ips[address] for address in before_ips} == before_ips
@@ -12731,6 +13201,11 @@ async def test_public_dns_deadline_keeps_stale_data_and_retry_checkpoint_then_re
     service.providers.hold_dns = False
     service.providers.drop_classic = False
     service.providers.dns_release.set()
+    # Recovery applies the same healthy latency to the previously failing A transport.
+    service.providers.schedule[(slow_transport, 'www.example.test', dns.rdatatype.A, service.providers.cycle)] = [
+      {'delay': healthy_delay}
+    ]
+    # previous distinguishes the recovery run from the first completed metrics snapshot.
     previous = sample_total(samples, 'resolution_run_elapsed_seconds_count', mode='stored')
     assert (await client.post(f'/domains/{domain_id}/resolve')).status_code == 202
     samples, fields = await completed_metrics(client, mode='stored', selected=1, previous_completed=previous)
@@ -12740,6 +13215,83 @@ async def test_public_dns_deadline_keeps_stale_data_and_retry_checkpoint_then_re
     assert after_domain[1] != before_domain[1]
     assert set(after_ips) == {'8.8.8.8', '8.8.4.4', '2001:4860:4860::8888'}
     assert after_ips['2001:4860:4860::8888'] == before_ips['2001:4860:4860::8888']
+
+
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+async def test_doh_provider_hold_returns_dns_response_after_release(e2e_service):
+  """Release a live held DoH request and preserve its DNS wire response.
+
+  e2e_service starts only disposable protocol fakes; no application process runs.
+  """
+  # service exposes the local provider; query and encoded carry one real A wire query.
+  service = e2e_service
+  service.providers.hold_dns = True
+  query = dns.message.make_query('www.example.test', dns.rdatatype.A)
+  encoded = urlsafe_b64encode(query.to_wire()).decode('ascii').rstrip('=')
+  # client owns the real HTTPX connection; pending retains its cancellable request task.
+  async with httpx.AsyncClient(trust_env=False, timeout=10) as client:
+    pending = asyncio.create_task(
+      client.get(service.doh_url, params={'dns': encoded}, headers={'Accept': 'application/dns-message'})
+    )
+    try:
+      await asyncio.wait_for(service.providers.dns_entered.wait(), timeout=10)
+      assert service.providers.dns_active == 1
+      assert not pending.done()
+      assert not service.providers.dns_release.is_set()
+      service.providers.dns_release.set()
+      # response and answer are the HTTP and decoded DNS responses after explicit release.
+      response = await asyncio.wait_for(pending, timeout=10)
+      assert response.status_code == 200
+      assert response.headers['content-type'] == 'application/dns-message'
+      answer = dns.message.from_wire(response.content)
+      assert answer.id == query.id
+      assert answer.question == query.question
+      assert len(answer.answer) == 1
+      assert answer.answer[0].name == query.question[0].name
+      assert answer.answer[0].rdtype == dns.rdatatype.A
+      # record is each returned A value, checked against the fake's declared DoH address.
+      assert [record.to_text() for record in answer.answer[0]] == ['8.8.4.4']
+      assert service.providers.dns_active == 0
+      assert service.providers.errors == []
+    finally:
+      service.providers.dns_release.set()
+      pending.cancel()
+      await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+async def test_doh_provider_hold_retires_cancelled_client_without_release(e2e_service):
+  """Retire a held DoH exchange after client cancellation without a provider error.
+
+  e2e_service supplies local protocol fakes without starting the application.
+  The finite idle wait is a hang safeguard, not a provider latency requirement.
+  """
+  # service exposes the local provider; query and encoded carry one real A wire query.
+  service = e2e_service
+  service.providers.hold_dns = True
+  query = dns.message.make_query('www.example.test', dns.rdatatype.A)
+  encoded = urlsafe_b64encode(query.to_wire()).decode('ascii').rstrip('=')
+  # client owns the real HTTPX connection; pending retains the request until cancellation completes.
+  async with httpx.AsyncClient(trust_env=False, timeout=10) as client:
+    pending = asyncio.create_task(
+      client.get(service.doh_url, params={'dns': encoded}, headers={'Accept': 'application/dns-message'})
+    )
+    try:
+      await asyncio.wait_for(service.providers.dns_entered.wait(), timeout=10)
+      assert service.providers.dns_active == 1
+      assert not service.providers.dns_release.is_set()
+      pending.cancel()
+      with pytest.raises(asyncio.CancelledError):
+        await pending
+      async with asyncio.timeout(10):
+        while service.providers.dns_active:
+          await asyncio.sleep(0.01)
+      assert not service.providers.dns_release.is_set()
+      assert service.providers.errors == []
+    finally:
+      service.providers.dns_release.set()
+      pending.cancel()
+      await asyncio.gather(pending, return_exceptions=True)
 
 
 @pytest.mark.e2e
