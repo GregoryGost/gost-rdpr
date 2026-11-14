@@ -40,19 +40,30 @@ class DomainsDbo(Dbo):
   default: Default Domain / ID=0
   """
 
+  # __tablename__ is prefixed by the common mapped base during class creation.
   __tablename__ = 'domains'
 
+  # id is the persistent identity; zero is reserved for the default context.
   id: Mapped[int] = mapped_column(INTEGER, primary_key=True, autoincrement=True, nullable=False)
+  # domain_list_id associates imported domains with their owning list.
   domain_list_id: Mapped[int | None] = mapped_column(INTEGER, index=True, nullable=True)
 
+  # resolved records that a complete saving resolution has established a checkpoint.
   resolved: Mapped[bool] = mapped_column(BOOLEAN, default=False, nullable=False)
+  # name is the unique DNS name used for resolution and lookup.
   name: Mapped[str] = mapped_column(TEXT, unique=True, index=True, nullable=False)
+  # ros_comment carries optional RouterOS metadata for this domain.
   ros_comment: Mapped[str | None] = mapped_column(TEXT, nullable=True)
 
+  # created_at is generated at insertion; updated_at retains its existing runtime onupdate behavior.
   created_at: Mapped[datetime] = mapped_column(TIMESTAMP, index=True, server_default=func.now())
   updated_at: Mapped[datetime | None] = mapped_column(TIMESTAMP, onupdate=func.now(), nullable=True)
+  # last_resolved_at advances only when complete DNS evidence is committed.
   last_resolved_at: Mapped[datetime | None] = mapped_column(TIMESTAMP, index=True, nullable=True)
+  # last_attempt_at is the committed processing completion time, including partial and failed attempts.
+  last_attempt_at: Mapped[datetime | None] = mapped_column(TIMESTAMP, nullable=True)
 
+  # __table_args__ preserves domain validity, parent ownership and the partial update-date index.
   __table_args__ = (
     CheckConstraint("name != ''", name='name_chk'),
     ForeignKeyConstraint(['domain_list_id'], [DomainsListsDbo.id], name='domain_list_id_fk', ondelete='CASCADE'),
@@ -73,9 +84,21 @@ class DomainsDbo(Dbo):
     end_date: str | None = None,
     default: bool | None = None,
     search_text: str | None = None,
-  ) -> tuple[Sequence[Row[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None]], int]:
+  ) -> tuple[
+    Sequence[Row[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None, datetime | None]],
+    int,
+  ]:
+    """Read a filtered domain page and matching count within the caller's session.
+
+    limit and offset bound the page; resolved, start_date, end_date, default and
+    search_text preserve the existing optional filters. The detached projection
+    includes both checkpoint and attempt dates for the shared public response.
+    """
     try:
-      select_stmt: Select[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None] = select(
+      # select_stmt projects the domain fields in the order consumed by the response converter.
+      select_stmt: Select[
+        int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None, datetime | None
+      ] = select(
         cls.id,
         cls.domain_list_id,
         cls.resolved,
@@ -84,7 +107,9 @@ class DomainsDbo(Dbo):
         cls.created_at,
         cls.updated_at,
         cls.last_resolved_at,
+        cls.last_attempt_at,
       )
+      # select_query_total_stmt counts all matches before pagination is applied.
       select_query_total_stmt: Select[int] = select(func.count()).select_from(cls)
       if resolved is not None:
         select_stmt = select_stmt.where(cls.resolved == resolved)
@@ -101,24 +126,29 @@ class DomainsDbo(Dbo):
       if search_text is not None:
         select_stmt = select_stmt.where(cls.name.contains(search_text))
         select_query_total_stmt = select_query_total_stmt.where(cls.name.contains(search_text))
-      select_limit_stmt: Select[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None] = (
-        select_stmt.limit(limit).offset(offset)
-      )
+      # select_limit_stmt applies page bounds without changing the count query.
+      select_limit_stmt = select_stmt.limit(limit).offset(offset)
+      # result_query_total is the full match count; result contains only the selected page.
       result_query_total: Result[int] = await db_session.execute(select_query_total_stmt)
       result: Result[
-        int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None
+        int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None, datetime | None
       ] = await db_session.execute(select_limit_stmt)
       #
       return result.fetchall(), result_query_total.scalar_one()
+    # err propagates execution failure to the database response boundary.
     except Exception as err:
       raise err
 
   @classmethod
   async def get_on_id(
     cls: type[Self], db_session: AsyncSession, id: int
-  ) -> Row[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None] | None:
+  ) -> Row[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None, datetime | None] | None:
+    """Read the public domain projection for id, or None when it is absent."""
     try:
-      select_stmt: Select[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None] = select(
+      # select_stmt uses the same field order as the paginated domain projection.
+      select_stmt: Select[
+        int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None, datetime | None
+      ] = select(
         cls.id,
         cls.domain_list_id,
         cls.resolved,
@@ -127,11 +157,14 @@ class DomainsDbo(Dbo):
         cls.created_at,
         cls.updated_at,
         cls.last_resolved_at,
+        cls.last_attempt_at,
       ).where(cls.id == id)
+      # exec_result contains at most one row because id is the primary key.
       exec_result: Result[
-        int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None
+        int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None, datetime | None
       ] = await db_session.execute(select_stmt)
       return exec_result.fetchone()
+    # err propagates execution failure to the database response boundary.
     except Exception as err:
       raise err
 
@@ -157,19 +190,28 @@ class DomainsDbo(Dbo):
   async def get_stale_for_resolve(
     cls: type[Self], db_session: AsyncSession, limit: int | None = None
   ) -> Sequence[Row[int, str, int | None, int]]:
-    """Select checkpoint-eligible domains in stable checkpoint and ID order."""
+    """Select domains whose effective attempt date has reached the retry interval.
+
+    db_session belongs to the caller; optional limit bounds this ordered snapshot.
+    A historical checkpoint supplies the effective date until an attempt exists.
+    """
     try:
-      elapsed_expr = func.coalesce(func.unixepoch(func.current_timestamp()) - func.unixepoch(cls.last_resolved_at), 0)
-      #
+      # effective_date prefers the last attempt while retaining historical checkpoint eligibility.
+      effective_date = func.coalesce(cls.last_attempt_at, cls.last_resolved_at)
+      # elapsed_expr is the elapsed whole seconds used by the existing retry interval.
+      elapsed_expr = func.coalesce(func.unixepoch(func.current_timestamp()) - func.unixepoch(effective_date), 0)
+      # select_stmt captures eligible nondefault descriptors in effective-date and ID order.
       select_stmt: Select[int, str, int | None, int] = (
         select(cls.id, cls.name, cls.domain_list_id, elapsed_expr.label('elapsed'))
-        .where(cls.id > 0, cls.last_resolved_at.is_not(None), elapsed_expr >= settings.domains_update_interval)
-        .order_by(cls.last_resolved_at, cls.id)
+        .where(cls.id > 0, effective_date.is_not(None), elapsed_expr >= settings.domains_update_interval)
+        .order_by(effective_date, cls.id)
         .limit(limit)
       )
+      # result contains detached descriptors with their scheduling age.
       result: Result[int, str, int | None, int] = await db_session.execute(select_stmt)
       #
       return result.fetchall()
+    # err is translated by the database selection boundary.
     except Exception as err:
       raise err
 
@@ -177,16 +219,24 @@ class DomainsDbo(Dbo):
   async def get_new_for_resolve(
     cls: type[Self], db_session: AsyncSession, limit: int | None = None
   ) -> Sequence[Row[int, str, int | None, int]]:
+    """Select undated nondefault domains by ID, optionally bounded by limit.
+
+    db_session is caller-owned. A domain with either an attempt or a historical
+    checkpoint belongs to interval-based scheduling rather than this NEW set.
+    """
     try:
+      # select_stmt captures a finite ordered selection with zero elapsed age.
       select_stmt: Select[int, str, int | None, int] = (
         select(cls.id, cls.name, cls.domain_list_id, literal(0).label('elapsed'))
-        .where(cls.id > 0, cls.last_resolved_at.is_(None))
+        .where(cls.id > 0, cls.last_attempt_at.is_(None), cls.last_resolved_at.is_(None))
         .order_by(cls.id)
         .limit(limit)
       )
+      # result holds the selected lightweight descriptors for the caller.
       result: Result[int, str, int | None, int] = await db_session.execute(select_stmt)
       #
       return result.fetchall()
+    # err is translated by the database selection boundary.
     except Exception as err:
       raise err
 

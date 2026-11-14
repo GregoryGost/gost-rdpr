@@ -644,12 +644,96 @@ class ServiceProcess:
         status = bytes(headers).split(b'\r\n', 1)[0].split(b' ', 2)
         return len(status) >= 2 and status[0] in {b'HTTP/1.0', b'HTTP/1.1'} and status[1] == b'200'
 
+  async def _wait_for_readiness(self):
+    """Race the current child's exit against bounded health polling.
+
+    A known exit wins over a health response or the readiness deadline. Caller
+    cancellation remains cancellation. Both observers are cancelled and collected
+    before returning, including when cancellation arrives again during collection.
+    """
+
+    async def poll_health():
+      """Retry bounded health requests until one succeeds or this observer is cancelled."""
+      while True:
+        try:
+          if await self.health_ready():
+            return
+        except OSError, TimeoutError:
+          pass
+        await asyncio.sleep(0.02)
+
+    # process retains the child being observed until start owns failure cleanup.
+    process = self.process
+    assert process is not None
+    if process.returncode is not None:
+      raise AssertionError(f'Application exited before readiness:\n{self.diagnostics()}')
+    # observers retains every created task, even if creating the next observer fails.
+    observers = []
+    # primary is this readiness failure; an unrelated exception handled by the caller does not count.
+    primary = None
+    try:
+      # exit_task wakes on process exit independently of a pending health request.
+      exit_task = asyncio.create_task(process.wait())
+      observers.append(exit_task)
+      # health_task owns all probe sockets through health_ready's closing context.
+      health_task = asyncio.create_task(poll_health())
+      observers.append(health_task)
+      try:
+        async with asyncio.timeout(15):
+          await asyncio.wait(observers, return_when=asyncio.FIRST_COMPLETED)
+      except TimeoutError:
+        # Classify the deadline before observer draining or process shutdown can change returncode.
+        if process.returncode is not None:
+          raise AssertionError(f'Application exited before readiness:\n{self.diagnostics()}') from None
+        raise
+    except BaseException as error:
+      # error is the readiness failure that observer draining must preserve.
+      primary = error
+      raise
+    finally:
+      # observer is each task whose cancellation releases its wait or health socket.
+      for observer in observers:
+        observer.cancel()
+      # collected retrieves every outcome; shielding keeps repeated cancellation from abandoning it.
+      collected = asyncio.gather(*observers, return_exceptions=True)
+      # cancelled retains the first caller cancellation received only while draining observers.
+      cancelled = None
+      while not collected.done():
+        try:
+          await asyncio.shield(collected)
+        except asyncio.CancelledError as cancellation:
+          # cancellation is a caller interruption; finish collecting before propagating it.
+          if cancelled is None:
+            cancelled = cancellation
+      collected.result()
+      if primary is None and cancelled is not None:
+        raise cancelled
+    if not exit_task.cancelled():
+      # A failed exit observer must propagate its error instead of reporting readiness.
+      exit_task.result()
+    if process.returncode is not None or not exit_task.cancelled():
+      raise AssertionError(f'Application exited before readiness:\n{self.diagnostics()}')
+    health_task.result()
+
   async def start(self):
+    """Start the isolated application and retain evidence of readiness or startup failure.
+
+    The child writes stdout/stderr to the owned log and accepts graceful shutdown
+    through stdin. Readiness has a fifteen-second budget; failure or cancellation
+    preserves its primary exception while stop collects the process and log.
+    A private environment copy keeps Python's coverage startup hook from creating
+    another collector before the bootstrap starts and saves its own measurement.
+    """
     if self.process is not None:
       raise RuntimeError('Application is already running')
     if getattr(self, 'load_mode', False) and self.environment.get('TEST_TASK_MEASUREMENTS'):
       raise ValueError('Load runs must use public metrics without task interception')
-    # Test-owned setup runs before main.py; stdin requests a graceful SIGINT shutdown.
+    # spawn_environment preserves caller settings while moving the coverage signal
+    # out of the standard variable read by Python's .pth startup hook.
+    spawn_environment = self.environment.copy()
+    if 'COVERAGE_PROCESS_START' in spawn_environment:
+      spawn_environment['TEST_COVERAGE_CONFIG'] = spawn_environment.pop('COVERAGE_PROCESS_START')
+    # bootstrap runs test-owned setup before main.py; stdin requests graceful SIGINT shutdown.
     bootstrap = (
       'import _thread, asyncio, ctypes, json, os, runpy, sys, threading\n'
       'from pathlib import Path\n'
@@ -661,6 +745,7 @@ class ServiceProcess:
       + inspect.getsource(load_set_cpu_mask)
       + '\n'
       'if os.environ.get("TEST_CPU_PROFILE"):\n'
+      '  # cpu retains requested affinity and the actual child process evidence.\n'
       '  cpu = json.loads(os.environ["TEST_CPU_PROFILE"])\n'
       '  cpu["application_pid"] = os.getpid()\n'
       '  if cpu["requested_mask"] is not None:\n'
@@ -672,15 +757,19 @@ class ServiceProcess:
       + '\n'
       + inspect.getsource(observe_child_tasks)
       + '\n'
+      '# task_evidence holds optional task counters until the child exits.\n'
       'task_evidence = observe_child_tasks() if os.environ.get("TEST_TASK_MEASUREMENTS") else None\n'
       'def stop():\n'
+      '  """Interrupt the main thread when the parent sends its stdin shutdown byte."""\n'
       '  os.read(sys.stdin.fileno(), 1)\n'
       '  _thread.interrupt_main()\n'
       'threading.Thread(target=stop, daemon=True).start()\n'
+      '# coverage owns measurement and saving; None leaves unmeasured runs unchanged.\n'
       'coverage = None\n'
-      'if os.environ.get("COVERAGE_PROCESS_START"):\n'
+      'if os.environ.get("TEST_COVERAGE_CONFIG"):\n'
+      '  # coverage_module supplies the explicit owner without invoking automatic startup.\n'
       '  import coverage as coverage_module\n'
-      '  coverage = coverage_module.Coverage(config_file=os.environ["COVERAGE_PROCESS_START"], data_suffix=True)\n'
+      '  coverage = coverage_module.Coverage(config_file=os.environ["TEST_COVERAGE_CONFIG"], data_suffix=True)\n'
       '  coverage.start()\n'
       'try:\n'
       '  runpy.run_path(sys.argv[1], run_name="__main__")\n'
@@ -688,6 +777,8 @@ class ServiceProcess:
       '  pass\n'
       'finally:\n'
       '  if os.environ.get("TEST_SOURCE_EVIDENCE"):\n'
+      '    # evidence records the executed source; name/module identify loaded modules,\n'
+      '    # and path identifies each migration copy whose checksum is recorded.\n'
       '    evidence = {"main": str(Path(sys.argv[1]).resolve()), "pythonpath": os.environ.get("PYTHONPATH"), '
       '"modules": {name: str(Path(module.__file__).resolve()) for name, module in tuple(sys.modules.items()) '
       'if name in ("config.config", "database.db", "metrics.metrics", "server.server") and '
@@ -701,13 +792,17 @@ class ServiceProcess:
       '    normalize_migration_coverage(coverage.get_data(), Path(sys.argv[1]).parent, [Path.cwd() / "migrations"])\n'
       '    coverage.save()\n'
     )
+    # attempt is the retained outcome record for this single startup.
     attempt = {'status': 'starting'}
     self.startup_attempts.append(attempt)
+    # started anchors elapsed/readiness measurements in monotonic seconds.
     started = perf_counter()
+    # self.log receives child output directly, avoiding pipe backpressure during startup.
     self.log = self.log_path.open('ab', buffering=0)
     try:
       if self.environment.get('TEST_CPU_PROFILE'):
         (self.directory / 'cpu-affinity.json').unlink(missing_ok=True)
+      # self.process retains the owned child for readiness observation and eventual stop.
       self.process = await asyncio.create_subprocess_exec(
         sys.executable,
         '-B',
@@ -715,29 +810,24 @@ class ServiceProcess:
         bootstrap,
         str(self.root / 'main.py'),
         cwd=self.directory,
-        env=self.environment,
+        env=spawn_environment,
         stdin=asyncio.subprocess.PIPE,
         stdout=self.log,
         stderr=asyncio.subprocess.STDOUT,
       )
-      async with asyncio.timeout(15):
-        while True:
-          if self.process.returncode is not None:
-            raise AssertionError(f'Application exited before readiness:\n{self.diagnostics()}')
-          try:
-            if await self.health_ready():
-              attempt.update(status='ready', readiness_seconds=perf_counter() - started)
-              if self.environment.get('TEST_CPU_PROFILE'):
-                attempt['cpu'] = json.loads((self.directory / 'cpu-affinity.json').read_text(encoding='utf-8'))
-              break
-          except OSError, TimeoutError:
-            pass
-          await asyncio.sleep(0.02)
+      await self._wait_for_readiness()
+      attempt.update(status='ready', readiness_seconds=perf_counter() - started)
+      if self.environment.get('TEST_CPU_PROFILE'):
+        attempt['cpu'] = json.loads((self.directory / 'cpu-affinity.json').read_text(encoding='utf-8'))
     except BaseException as error:
+      # error is the primary startup failure, retained even if stop also fails.
       attempt.update(status='failed', elapsed_seconds=perf_counter() - started, error=repr(error))
+      if self.process is not None:
+        attempt['exit_code_before_cleanup'] = self.process.returncode
       try:
         await self.stop(allow_failure=True)
       except BaseException as cleanup_error:  # noqa: BLE001 -- Preserve the primary error at this harness boundary.
+        # cleanup_error adds diagnostics without replacing error or the pre-cleanup exit evidence.
         attempt['cleanup_error'] = repr(cleanup_error)
         error.add_note(f'Startup cleanup also failed: {cleanup_error!r}')
       raise
@@ -1030,20 +1120,34 @@ async def e2e_service(tmp_path, dns_message, request):
   connections = set()
 
   async def serve_http(reader, writer):
+    """Serve sequential bodyless provider GETs and close their connection on exit.
+
+    reader supplies request bytes and the peer's EOF state; writer sends each
+    synthetic response and is closed and removed from connections in finally.
+    Exchange counters retire even on timeout or cancellation. A DoH release wait
+    may outlive a cancelled client, so its watchdog treats known EOF as a normal
+    disconnect; connected waits and all other protocol failures remain errors.
+    """
     connections.add(writer)
     providers.counters[('http', 'transport', 'connections')] += 1
+    # waiting_for_dns_release stays true on an interrupted DoH hold so timeout
+    # classification cannot suppress header, response-write or RIPE failures.
+    waiting_for_dns_release = False
     try:
       while True:
         # Idle pooled connections own no exchange and may expire quietly.
         try:
           async with asyncio.timeout(30 if providers.keepalive else 5):
+            # line is the request line, then each header line from this exchange.
             line = await reader.readline()
         except TimeoutError:
           return
         if not line:
           return
         async with asyncio.timeout(60 if load_mode else 5):
+          # method and target select the provider operation; _ discards the HTTP version.
           method, target, _ = line.decode('ascii').split()
+          # headers stores normalized fields; header_size bounds their cumulative wire bytes.
           headers = {}
           header_size = 0
           while line := await reader.readline():
@@ -1052,17 +1156,22 @@ async def e2e_service(tmp_path, dns_message, request):
               raise ValueError('Provider request headers exceed limit')
             if line == b'\r\n':
               break
+            # key and value are the current header's name and untrimmed field value.
             key, value = line.decode('ascii').split(':', 1)
             headers[key.lower()] = value.strip()
           if method != 'GET' or int(headers.get('content-length', '0')) or 'transfer-encoding' in headers:
             raise ValueError('Provider supports bodyless GET requests only')
+          # url separates the provider path; params holds its decoded query values.
           url = urlsplit(target)
           params = parse_qs(url.query)
+          # query is populated only for DoH so its DNS wire response can be built later.
           query = None
           providers.sample(providers.http_requests, (method, url.path))
+          # transport selects DoH or RIPE accounting; name and rdtype identify the scheduled lookup.
           if url.path == '/dns-query':
             transport = 'doh'
             assert headers.get('accept') == 'application/dns-message'
+            # encoded is the URL-safe base64 DNS message, with omitted padding restored below.
             encoded = params['dns'][0]
             query = dns.message.from_wire(urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)))
             name, rdtype = query.question[0].name.to_text(), query.question[0].rdtype
@@ -1071,6 +1180,7 @@ async def e2e_service(tmp_path, dns_message, request):
             name, rdtype = params['resource'][0], None
           else:
             raise AssertionError(f'Unexpected provider request: {method} {url.path}')
+          # step is the configured response for this provider attempt and cycle.
           step = providers.step(transport, name, rdtype)
           if transport == 'doh':
             providers.dns_active += 1
@@ -1081,6 +1191,7 @@ async def e2e_service(tmp_path, dns_message, request):
             providers.sample(providers.requests, ('ripe', name, None))
             providers.ripe_entered.set()
           try:
+            # delay is the scheduled or default provider latency in seconds.
             if delay := step.get('delay', providers.delay + (providers.ripe_delay if transport == 'ripe' else 0)):
               await asyncio.sleep(delay)
             if providers.unavailable or step.get('kind') == 'disconnect':
@@ -1088,11 +1199,14 @@ async def e2e_service(tmp_path, dns_message, request):
             if step.get('kind') == 'drop':
               await reader.read(1)
               return
+            # pending_statuses supplies legacy one-shot failures; legacy_status consumes one
+            # only when step has no explicit status, and status is the final validated HTTP code.
             pending_statuses = providers.http_statuses.get(url.path, [])
             legacy_status = pending_statuses.pop(0) if pending_statuses and 'status' not in step else None
             status = int(step.get('status', legacy_status if legacy_status is not None else 200))
             if not 100 <= status <= 599:
               raise ValueError('Provider HTTP status must be in 100..599')
+            # body is the response payload; media describes its default content type.
             if legacy_status is not None:
               body, media = b'', 'application/octet-stream'
             elif transport == 'doh':
@@ -1101,14 +1215,19 @@ async def e2e_service(tmp_path, dns_message, request):
               name = name.rstrip('.')
               if name in providers.hold_dns_names:
                 providers.dns_entered_by_name.setdefault(name, asyncio.Event()).set()
+                waiting_for_dns_release = True
                 await providers.dns_release_by_name.setdefault(name, asyncio.Event()).wait()
+                waiting_for_dns_release = False
               if providers.hold_dns:
                 providers.dns_entered.set()
+                waiting_for_dns_release = True
                 await providers.dns_release.wait()
+                waiting_for_dns_release = False
               media = 'application/dns-message'
             else:
               if providers.hold_ripe:
                 await providers.ripe_release.wait()
+              # kind selects the RIPE JSON success, malformed or synthetic error payload.
               kind = step.get('kind', 'empty')
               if kind == 'malformed':
                 body = b'{invalid-json'
@@ -1118,7 +1237,9 @@ async def e2e_service(tmp_path, dns_message, request):
                 body = json.dumps({'status': 'ok', 'data': {'prefix': step.get('prefix')}}).encode()
               media = 'application/json'
             body = step.get('body', body)
+            # close follows the scheduled/fixture policy and the client's explicit close request.
             close = step.get('close', not providers.keepalive) or headers.get('connection', '').lower() == 'close'
+            # response_headers contains the status and framing for this single payload.
             response_headers = (
               f'HTTP/1.1 {status} Synthetic Provider Response\r\n'
               f'Content-Type: {step.get("media", media)}\r\nContent-Length: {len(body)}\r\n'
@@ -1139,7 +1260,15 @@ async def e2e_service(tmp_path, dns_message, request):
     except ConnectionError, asyncio.IncompleteReadError:
       # Clients may cancel or time out intentionally during degraded-provider cases.
       providers.counters[('http', 'transport', 'client_closed')] += 1
-    except (AssertionError, KeyError, ValueError, IndexError, dns.exception.DNSException, TimeoutError) as error:
+    except TimeoutError as error:
+      # error is the exchange watchdog expiry; only a held DoH response with
+      # fully consumed input and known peer EOF represents an expected disconnect.
+      if waiting_for_dns_release and reader.at_eof():
+        providers.counters[('http', 'transport', 'client_closed')] += 1
+      else:
+        providers.record_error(error)
+    except (AssertionError, KeyError, ValueError, IndexError, dns.exception.DNSException) as error:
+      # error retains a malformed request or response setup failure for fixture teardown.
       providers.record_error(error)
     finally:
       writer.close()

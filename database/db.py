@@ -466,26 +466,47 @@ class DataBase:
     }
 
   async def __compatible_current_table(self, conn: AsyncConnection, name: str, sql: str | None) -> bool:
+    """Check exact target DDL and unique indexes during pending legacy preflight.
+
+    conn is the startup transaction, name is a fixed mapped target, and sql is
+    its captured DDL. Only the domains table also accepts its exact prior DDL
+    without the nullable attempt column; all other constraints remain mandatory.
+    Completed imports skip this preflight through their existing history path.
+    """
     if name == IpRecordsDbo.__tablename__:
       try:
         await ip_schema_kind(conn, allow_missing_gateway=True)
       except RuntimeError:
         return False
       return True
+    # table supplies the current mapped DDL; expected_tokens preserves every constraint.
     table = MigrationsDbo.metadata.tables[name]
-    if sql is None or self.__startup_sql_tokens(sql) != self.__startup_sql_tokens(
-      str(CreateTable(table).compile(dialect=conn.dialect))
-    ):
+    expected_tokens = self.__startup_sql_tokens(str(CreateTable(table).compile(dialect=conn.dialect)))
+    # accepted_tokens allows only exact current DDL, plus the single known prior domains shape.
+    accepted_tokens = [expected_tokens]
+    if name == DomainsDbo.__tablename__:
+      # previous_tokens removes precisely the new nullable column's three-token declaration.
+      previous_tokens = expected_tokens.copy()
+      # attempt_position locates that known declaration in the freshly compiled current DDL.
+      attempt_position = previous_tokens.index('last_attempt_at')
+      if previous_tokens[attempt_position : attempt_position + 3] != ['last_attempt_at', 'timestamp', ',']:
+        return False
+      del previous_tokens[attempt_position : attempt_position + 3]
+      accepted_tokens.append(previous_tokens)
+    if sql is None or self.__startup_sql_tokens(sql) not in accepted_tokens:
       return False
+    # expected_unique_indexes contains compiled unique-index signatures; index is each mapped index.
     expected_unique_indexes = {
       tuple(self.__startup_sql_tokens(str(CreateIndex(index).compile(dialect=conn.dialect))))
       for index in table.indexes
       if index.unique
     }
+    # indexes lists actual uniqueness sources; actual_unique_indexes collects explicit index DDL.
     indexes = (
       await conn.execute(text('SELECT name, origin FROM pragma_index_list(:name) WHERE "unique" = 1'), {'name': name})
     ).all()
     actual_unique_indexes = set()
+    # index is now each physical unique index; index_sql is its captured SQLite DDL.
     for index in indexes:
       if index.origin == 'u':
         # Inline UNIQUE constraints are already covered by the exact table DDL.
@@ -1285,19 +1306,27 @@ class DataBase:
     default: bool | None = None,
     search_text: str | None = None,
   ) -> DomainsPayloadResp:
+    """Convert a filtered domain page to the shared list/search HTTP response.
+
+    before_time supplies duration timing; pagination and filters are passed to
+    the mapped read. All date fields retain the existing epoch/display conversion.
+    A read error keeps the established empty-response behavior and closes the session.
+    """
     logger.debug('Try get all Domains ...')
     logger.debug(f'{limit=}, {offset=}, {start_date=}, {end_date=}, {search_text=}')
+    # payload accumulates response rows; query_total counts matches before page bounds.
     payload: list[DomainElementResp] = []
     query_total = 0
+    # db_session owns all page and supported-address reads until the response is detached.
     db_session: AsyncSession | None = None
     try:
       db_session = await self.__read_connect()
+      # total and resolved_count retain the established global domain statistics.
       total: int = await DomainsDbo.get_total(db_session=db_session)
       resolved_count: int = await DomainsDbo.get_total_resolved(db_session=db_session)
       if total > 0:
-        domains_and_query: tuple[
-          Sequence[Row[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None]], int
-        ] = await DomainsDbo.get_all(
+        # domains_and_query bundles the detached page with its full filtered count.
+        domains_and_query = await DomainsDbo.get_all(
           db_session=db_session,
           limit=limit,
           offset=offset,
@@ -1307,14 +1336,14 @@ class DataBase:
           default=default,
           search_text=search_text,
         )
-        #
-        domains: Sequence[Row[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None]] = (
-          domains_and_query[0]
-        )
+        # domains is the selected page, while query_total records its unpaginated size.
+        domains = domains_and_query[0]
         query_total: int = domains_and_query[1]
+        # ips_by_domain loads supported addresses once; domain is each row whose ID is requested.
         ips_by_domain = await IpRecordsDbo.get_ips_on_domain_ids(
           db_session=db_session, domain_ids=[domain[0] for domain in domains]
         )
+        # ip_addr_v4 and ip_addr_v6 are the supported address lists for the current domain.
         for domain in domains:
           ip_addr_v4, ip_addr_v6 = ips_by_domain[domain[0]]
           payload.append(
@@ -1334,6 +1363,10 @@ class DataBase:
               last_resolved_at_hum=None
               if domain[7] is None
               else cast(datetime, domain[7]).strftime('%Y-%m-%d %H:%M:%S'),
+              last_attempt_at=None if domain[8] is None else cast(datetime, domain[8]).timestamp(),
+              last_attempt_at_hum=None
+              if domain[8] is None
+              else cast(datetime, domain[8]).strftime('%Y-%m-%d %H:%M:%S'),
             )
           )
       return DomainsPayloadResp(
@@ -1346,6 +1379,7 @@ class DataBase:
         duration=monotonic() - before_time,
         payload=payload,
       )
+    # err preserves the existing page-read logging and empty-response boundary.
     except Exception as err:
       logger.error(f'Try get all Domains failed : {err}', exc_info=True)
       if db_session is not None:
@@ -1358,14 +1392,20 @@ class DataBase:
         await db_session.close()
 
   async def get_domain_on_id(self: Self, id: int) -> DomainElementResp | None:
+    """Return id's shared domain response with supported addresses, or None.
+
+    Dates use the same conversion as list/search. The short read session is
+    closed on success or error, preserving the existing absent/error contract.
+    """
     logger.debug(f'Try get Domain on ID={id} ...')
+    # db_session owns descriptor and supported-address reads until response conversion.
     db_session: AsyncSession | None = None
     try:
       db_session = await self.__read_connect()
-      domain: (
-        Row[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None] | None
-      ) = await DomainsDbo.get_on_id(db_session=db_session, id=id)
+      # domain is the detached nine-field projection, or None for an absent ID.
+      domain = await DomainsDbo.get_on_id(db_session=db_session, id=id)
       if domain is not None:
+        # ip_addr_v4 and ip_addr_v6 contain the domain's independently supported address families.
         ip_addr_v4, ip_addr_v6 = await IpRecordsDbo.get_ips_on_domain_id(db_session=db_session, domain_id=domain[0])
         return DomainElementResp(
           id=domain[0],
@@ -1381,8 +1421,11 @@ class DataBase:
           updated_at_hum=None if domain[6] is None else cast(datetime, domain[6]).strftime('%Y-%m-%d %H:%M:%S'),
           last_resolved_at=None if domain[7] is None else cast(datetime, domain[7]).timestamp(),
           last_resolved_at_hum=None if domain[7] is None else cast(datetime, domain[7]).strftime('%Y-%m-%d %H:%M:%S'),
+          last_attempt_at=None if domain[8] is None else cast(datetime, domain[8]).timestamp(),
+          last_attempt_at_hum=None if domain[8] is None else cast(datetime, domain[8]).strftime('%Y-%m-%d %H:%M:%S'),
         )
       return None
+    # err is logged while preserving the established detail-read failure response.
     except Exception as err:
       logger.error(f'Try get Domain on ID={id} failed : {err}', exc_info=True)
       if db_session is not None:
@@ -1440,33 +1483,45 @@ class DataBase:
       raise DatabaseReadError('Cannot select new domains for resolution') from err
 
   async def get_stale_domains_for_resolve(self: Self) -> list[DomainCandidate]:
-    """Capture all currently STALE members in checkpoint/ID order."""
+    """Capture all STALE members in effective-attempt-date and ID order.
+
+    The finite detached selection closes its read session before processing starts.
+    """
     try:
+      # db_session owns only the finite selection read.
       async with await self.__read_connect() as db_session:
+        # domains is the ordered mapped projection; domain is each detached candidate row.
         domains = await DomainsDbo.get_stale_for_resolve(db_session=db_session)
         return [DomainCandidate(id=domain[0], name=domain[1], list_id=domain[2]) for domain in domains]
+    # err is translated to the coordinator's sanitized selection-failure contract.
     except Exception as err:
       logger.error('Stale domain selection failed')
       raise DatabaseReadError('Cannot select stale domains for resolution') from err
 
   async def get_domain_candidate_for_resolve(self, id: int, *, new: bool | None = None) -> DomainCandidate | None:
-    """Read one fresh descriptor, optionally requiring exact scan eligibility."""
+    """Read id with optional NEW or STALE eligibility; new=None bypasses the interval.
+
+    This helper does not change the coordinator's fixed finite scan membership.
+    Read failures are translated to DatabaseReadError before crossing the boundary.
+    """
     try:
+      # db_session owns this short descriptor read and closes before the result escapes.
       async with await self.__read_connect() as db_session:
+        # statement excludes the default context while preserving manual interval bypass.
         statement = select(DomainsDbo.id, DomainsDbo.name, DomainsDbo.domain_list_id).where(
           DomainsDbo.id == id, DomainsDbo.id > 0
         )
         if new is True:
-          statement = statement.where(DomainsDbo.last_resolved_at.is_(None))
+          statement = statement.where(DomainsDbo.last_attempt_at.is_(None), DomainsDbo.last_resolved_at.is_(None))
         elif new is False:
-          elapsed = func.coalesce(
-            func.unixepoch(func.current_timestamp()) - func.unixepoch(DomainsDbo.last_resolved_at), 0
-          )
-          statement = statement.where(
-            DomainsDbo.last_resolved_at.is_not(None), elapsed >= settings.domains_update_interval
-          )
+          # effective_date and elapsed exactly match the automatic STALE selection.
+          effective_date = func.coalesce(DomainsDbo.last_attempt_at, DomainsDbo.last_resolved_at)
+          elapsed = func.coalesce(func.unixepoch(func.current_timestamp()) - func.unixepoch(effective_date), 0)
+          statement = statement.where(effective_date.is_not(None), elapsed >= settings.domains_update_interval)
+        # domain is the detached descriptor, or None when absent or ineligible.
         domain = (await db_session.execute(statement)).one_or_none()
         return None if domain is None else DomainCandidate(id=domain[0], name=domain[1], list_id=domain[2])
+    # err is the source read failure retained as the sanitized exception's cause.
     except Exception as err:
       logger.error('Domain resolution descriptor read failed')
       raise DatabaseReadError('Cannot read domain for resolution') from err
@@ -1494,14 +1549,27 @@ class DataBase:
         await db_session.close()
 
   async def put_domain_after_resolve(self: Self, domain: DomainResult) -> WriteReceipt:
-    """Freeze one prepared result and return admission, never commit, evidence."""
+    """Freeze domain's terminal result and return admission, never commit, evidence.
+
+    The caller must supply last_attempt_at from processing completion. Missing
+    time is a contract error, never replaced by admission or writer clock time.
+    Cancellation before admission leaves no command; admitted work is writer-owned.
+    """
+    if domain.last_attempt_at is None:
+      raise DatabaseWriteError('Domain resolution completion time is unavailable')
     if domain.write_receipt is None:
       domain.write_receipt = WriteReceipt()
+    # receipt is retained by the saving coordinator independently of optional metrics.
     receipt = domain.write_receipt
     try:
+      # domains_resolved_element freezes the timestamp and prepared addresses before a queue wait.
       domains_resolved_element: QueueElementDto = QueueElementDto(
         target=TargetAction.DOMAINS_RESOLVED,
-        elements=[DomainResolutionIntent(domain.id, domain.resolution_complete, tuple(domain.storage_ips))],
+        elements=[
+          DomainResolutionIntent(
+            domain.id, domain.resolution_complete, tuple(domain.storage_ips), domain.last_attempt_at
+          )
+        ],
         observations=(domain.observation,) if domain.observation is not None else (),
         receipt=receipt,
       )
@@ -1509,6 +1577,7 @@ class DataBase:
       return receipt
     except DatabaseWriteError:
       raise
+    # err is an unexpected admission failure translated to the persistence contract.
     except Exception as err:
       logger.error('Domain resolution admission failed')
       raise DatabaseWriteError('Cannot admit resolved domain') from err
@@ -2505,11 +2574,20 @@ class DataBase:
 
   @staticmethod
   def __prepare_domain_groups(intents: list[DomainResolutionIntent]) -> list[tuple[DomainResolutionIntent, ...]]:
-    """Freeze validated address sets and preserve repeated-domain admission order."""
+    """Validate intents and group distinct domains without changing admission order.
+
+    Repeated IDs start another group so reconciliation sees each successive
+    intent. Completion dates survive deduplication, regrouping and batch retries.
+    """
+    # groups is the ordered result; group accumulates distinct domains for one SQL reconciliation.
     groups: list[tuple[DomainResolutionIntent, ...]] = []
     group: list[DomainResolutionIntent] = []
+    # domain_ids tracks identities already placed in group; intent is the next admitted result.
     domain_ids: set[int] = set()
     for intent in intents:
+      if intent.last_attempt_at is None:
+        raise DatabaseWriteError('Domain resolution completion time is unavailable')
+      # addresses removes duplicate prepared values; address is each value checked for IPv4 authority.
       addresses = tuple(dict.fromkeys(intent.storage_ips))
       if any(get_ip_version(address) != 4 for address in addresses):
         raise DatabaseWriteError('Resolved storage payload must contain IPv4 addresses')
@@ -2517,7 +2595,7 @@ class DataBase:
         groups.append(tuple(group))
         group = []
         domain_ids.clear()
-      group.append(DomainResolutionIntent(intent.id, intent.resolution_complete, addresses))
+      group.append(DomainResolutionIntent(intent.id, intent.resolution_complete, addresses, intent.last_attempt_at))
       domain_ids.add(intent.id)
     if group:
       groups.append(tuple(group))
@@ -2648,21 +2726,34 @@ class DataBase:
     )
 
   async def __batch_items_commit(self: Self, queue_elements: list[QueueElementDto]) -> None:
-    """Persist one atomic batch and translate all persistence failures."""
+    """Persist queue_elements atomically and translate persistence failures.
+
+    Category phases retain their existing order. Resolution intents reconcile
+    supports first, then record all attempt dates before direct domain deletion;
+    complete-only checkpoints remain after deletion. Commit confirms receipts.
+    Only known precommit BUSY/LOCKED failures with successful rollback and release
+    are retryable; an uncertain commit never becomes an automatic replay.
+    """
     logger.debug(f'Try prepare elements count={len(queue_elements)} ...')
+    # attempt_started times this batch attempt; preparation_finished distinguishes preparation failures.
     attempt_started = perf_counter()
     preparation_finished = False
+    # transaction_started and transaction_outcome track the explicit write transaction's metric interval.
     transaction_started: float | None = None
     transaction_outcome = 'failure'
+    # db_session owns the only runtime write transaction for this batch.
     db_session: AsyncSession | None = None
+    # commit_started marks ambiguous-outcome territory; committed records a confirmed commit return.
     commit_started = False
     committed = False
+    # failure retains the first persistence error; rollback_ok and release_ok gate safe retries.
     failure: Exception | CancelledError | None = None
     rollback_ok = True
     release_ok = True
     try:
-      # Prepare elements
-      # DNS SERVERS
+      # queue_element is each admitted category command; item is its category-specific payload.
+      # dns_servers_add prepares server rows; dns_servers_delete selects IDs and
+      # dns_servers_delete_all records whether the nondefault-server set must be cleared.
       dns_servers_add: list[dict[str, str | None]] = [
         {
           DnsServersDbo.server.property.key: item.server,
@@ -2682,7 +2773,8 @@ class DataBase:
       dns_servers_delete_all: list[QueueElementDto] = [
         queue_element for queue_element in queue_elements if queue_element.target == TargetAction.DNS_SERVERS_DELETE_ALL
       ]
-      # DOMAINS LISTS
+      # domains_lists_add prepares new lists; domains_lists_delete selects list IDs;
+      # domains_lists_delete_all requests a clear; domains_lists_update carries metadata changes.
       domains_lists_add: list[dict[str, str | None]] = [
         {
           DomainsListsDbo.name.property.key: item.name,
@@ -2717,7 +2809,7 @@ class DataBase:
         if queue_element.target == TargetAction.DOMAINS_LISTS_UPDATE
         for item in queue_element.elements
       ]
-      # DOMAINS
+      # domains_add prepares new names; domains_delete selects IDs; domains_delete_all requests a clear.
       domains_add: list[dict[str, str | None]] = [
         {
           DomainsDbo.name.property.key: item.domain,
@@ -2737,6 +2829,8 @@ class DataBase:
       domains_delete_all: list[QueueElementDto] = [
         queue_element for queue_element in queue_elements if queue_element.target == TargetAction.DOMAINS_DELETE_ALL
       ]
+      # domains_resolved_update advances complete-only checkpoints using the existing writer-time clock.
+      # domain is each immutable result carried by a resolved-domain command.
       domains_resolved_update: list[dict[str, int | bool | datetime]] = [
         {
           DomainsDbo.id.property.key: domain.id,
@@ -2745,10 +2839,11 @@ class DataBase:
         }
         for queue_element in queue_elements
         if queue_element.target == TargetAction.DOMAINS_RESOLVED
-        for domain in queue_element.elements  # item = DomainResult
+        for domain in queue_element.elements
         if domain.resolution_complete
       ]
-      # IPS LISTS
+      # ips_lists_add prepares list rows; ips_lists_delete selects IDs;
+      # ips_lists_delete_all requests a clear; ips_lists_update carries list metadata changes.
       ips_lists_add: list[dict[str, str | None]] = [
         {
           IpsListsDbo.name.property.key: item.name,
@@ -2781,7 +2876,7 @@ class DataBase:
         if queue_element.target == TargetAction.IPS_LISTS_UPDATE
         for item in queue_element.elements
       ]
-      # IPS
+      # ips_add prepares explicit global IP insertions without changing DNS ownership semantics.
       ips_add: list[dict[str, str | int]] = [
         {
           IpRecordsDbo.ip_address.property.key: item.addr,
@@ -2795,19 +2890,29 @@ class DataBase:
         if queue_element.target == TargetAction.IPS_ADD
         for item in queue_element.elements  # item = IpsPostElementReq
       ]
+      # resolution_intents retains admission order; element is each command and intent its frozen result.
       resolution_intents: list[DomainResolutionIntent] = [
         intent
         for element in queue_elements
         if element.target == TargetAction.DOMAINS_RESOLVED
         for intent in element.elements
       ]
+      # resolution_groups keeps repeated-ID reconciliation sequential while batching distinct IDs.
       resolution_groups = self.__prepare_domain_groups(resolution_intents)
+      # domains_attempt_update preserves each frozen time in admission order, including repeated IDs.
+      domains_attempt_update = [
+        {DomainsDbo.id.property.key: intent.id, DomainsDbo.last_attempt_at.property.key: intent.last_attempt_at}
+        for intent in resolution_intents
+      ]
+      # list_withdrawals collects ownership removals; withdrawal is one list-specific payload.
       list_withdrawals: list[IpListWithdrawal] = [
         withdrawal
         for element in queue_elements
         if element.target == TargetAction.IPS_LIST_WITHDRAW
         for withdrawal in element.elements
       ]
+      # ips_id_delete and ips_addr_delete select explicit global deletions;
+      # ips_delete_all records a request to clear all nondefault global IPs.
       ips_id_delete: list[int] = [
         item
         for queue_element in queue_elements
@@ -2823,7 +2928,8 @@ class DataBase:
       ips_delete_all: list[QueueElementDto] = [
         queue_element for queue_element in queue_elements if queue_element.target == TargetAction.IPS_DELETE_ALL
       ]
-      # ROS CONFIGS
+      # ros_configs_add prepares device rows; ros_configs_delete selects IDs;
+      # ros_configs_delete_all requests a clear of nondefault devices.
       ros_configs_add: list[dict[str, str | None]] = [
         {
           RosConfigsDbo.host.property.key: item.host,
@@ -2855,12 +2961,15 @@ class DataBase:
       #
       db_session = await self.__write_connect()
       # Connection setup precedes the timed explicit write transaction.
+      # connection is the physical batch connection whose bind budget controls reconciliation.
       connection = await db_session.connection()
       # The unchanged final projection uses two LIMIT/OFFSET pairs even without DNS work.
+      # minimum_budget accommodates the existing projection and any complete-support withdrawal page.
       minimum_budget = max(
         DNS_GLOBAL_ROW_BINDS,
         DNS_SUPPORT_PAGE_FIXED_BINDS + 1 if any(intent.resolution_complete for intent in resolution_intents) else 0,
       )
+      # parameter_budget bounds every reconciliation statement for this physical connection.
       parameter_budget = await self.__writer_parameter_budget(connection, minimum_budget)
       # Recording with immediate write lock
       transaction_started = perf_counter()
@@ -2894,8 +3003,14 @@ class DataBase:
       if ips_add:
         await self.__add_explicit_ips(db_session, ips_add)
       with observe_writer_phase('reconcile'):
+        # group is the next distinct-ID portion, preserving repeated-ID intent order.
         for group in resolution_groups:
           await self.__reconcile_domain_group(db_session, group, parameter_budget)
+      # Mark every reconciled attempt while all domain parents still exist. A
+      # later partial-result deletion may commit, while complete checkpoints keep
+      # their existing post-deletion row-count validation and rollback behavior.
+      if domains_attempt_update:
+        await db_session.execute(update(DomainsDbo), domains_attempt_update)
       for withdrawal in list_withdrawals:
         await db_session.execute(
           delete(IpSupportDbo).where(
@@ -2930,6 +3045,7 @@ class DataBase:
         await self.__finish_ip_supports(db_session)
       # Any failure from commit itself has an ambiguous physical outcome.
       commit_started = True
+      # commit_timer measures physical commit; commit_outcome stays unknown until commit returns.
       commit_timer = perf_counter()
       commit_outcome = 'unknown'
       try:
@@ -2942,6 +3058,7 @@ class DataBase:
       observe_duration(writer_duration, transaction_started, phase='transaction', outcome=transaction_outcome)
       transaction_started = None
       self.__notify_batch(queue_elements, 'confirmed', final=True)
+    # err is the preparation/transaction failure retained for cleanup and sanitized translation.
     except (Exception, CancelledError) as err:
       failure = err
       if not preparation_finished:
@@ -2959,6 +3076,7 @@ class DataBase:
         observe_duration(writer_duration, transaction_started, phase='transaction', outcome=transaction_outcome)
         transaction_started = None
       if db_session is not None:
+        # rollback_started times the attempt to release precommit changes safely.
         rollback_started = perf_counter()
         try:
           await db_session.rollback()
@@ -2974,6 +3092,7 @@ class DataBase:
           )
     finally:
       if db_session is not None:
+        # cleanup_started times physical session release after commit or rollback.
         cleanup_started = perf_counter()
         try:
           await db_session.close()
@@ -3006,9 +3125,11 @@ class DataBase:
       )
     if failure is not None:
       # SQLite extended result codes retain the primary code in the low byte.
+      # original unwraps configuration causes to inspect the actual SQLite error without exposing it.
       original = getattr(failure, 'orig', failure)
       while isinstance(original, DatabaseConfigurationError) and original.__cause__ is not None:
         original = original.__cause__
+      # sqlite_code identifies BUSY/LOCKED; retryable requires known rollback/release before commit began.
       sqlite_code = getattr(original, 'sqlite_errorcode', None)
       retryable = (
         not commit_started

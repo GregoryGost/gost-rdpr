@@ -156,7 +156,11 @@ Use the worker and semaphore limits to control concurrency, and `DOMAINS_UPDATE_
 | `QUEUE_MAX_SIZE` | int | `10000` | Positive capacity of each writer and RouterOS queue, and maximum accepted, unstarted explicit domain operations; producers wait when full |
 | `QUEUE_GET_TIMEOUT` | float | `0.1` | Maximum waiting time for a queue entry. 0.1s = 100ms |
 | `QUEUE_SLEEP_TIMEOUT` | float | `0.01` | The maximum wait time while the queue is empty. At the same time, the infinite loop should allow the scheduler to integrate other tasks into the overall flow. 0.01s = 10ms |
-| `RESOLVE_DOMAINS_LOG_EVERY` | int | `10` | Specifies the number of messages that will be logged during domain resolution. Distributes the total volume of domains to resolve among this number |
+| `RESOLVE_DOMAINS_LOG_EVERY` | int | `10` | Maximum intermediate INFO progress messages per nonempty NEW/STALE pass; minimum `3`. Initial totals and final summaries are excluded |
+
+Progress reports completed processing of the selected domains, including work shared with another operation.
+An empty pass emits only `Нет доменов для обработки`. Processing and persistence have separate INFO summaries;
+processing completion does not wait for database commits. Per-batch persistence details are available at DEBUG.
 
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -454,12 +458,33 @@ The [Dockerfile](./Dockerfile) fetches and builds the UI, then packages it with 
 Build arguments include `UI_REPO_URL`, `UI_BRANCH`, `PYTHON_VERSION`, `NODE_VERSION`,
 `PNPM_VERSION` and `POETRY_VERSION`.
 
+The UI builder uses Node.js `26.13.1` and pnpm `12.18.0`; the current UI requires Node.js `>=26.12.1`.
+pnpm is installed through npm because Node.js 26 does not bundle Corepack.
+Dependencies are installed with `pnpm install --frozen-lockfile`, and `pnpm build:docker` builds the UI without
+running the TypeScript check.
+
+`UI_BRANCH` defaults to `main`:
+
 ```powershell
-docker buildx build --platform linux/amd64 --load -t gost-rdpr:local .
+docker buildx build --platform linux/amd64 --no-cache-filter ui-builder --load -t gost-rdpr:local .
 ```
 
+To build the UI from `develop`:
+
+```powershell
+docker buildx build --platform linux/amd64 --no-cache-filter ui-builder `
+  --build-arg UI_BRANCH=develop --load -t gost-rdpr:local .
+```
+
+`--no-cache-filter ui-builder` fetches the selected branch again instead of reusing a previously cloned UI.
+The Python stages retain their normal build cache.
 Use `linux/arm64` when targeting that platform.
 Run the result using the quick-start options with image `gost-rdpr:local`.
+
+The development-image workflow selects the UI `develop` branch and refreshes the UI builder cache in the same way.
+It runs after backend pull requests are merged into `develop` or through a manual workflow dispatch on that branch.
+An update only to the UI requires a new manual workflow run; a retry reuses the versioned image if it was already
+published by that run.
 
 Codex contributors should start with [AGENTS.md](./AGENTS.md) and [CODEX_PROJECT.md](./CODEX_PROJECT.md).
 

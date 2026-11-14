@@ -34,7 +34,8 @@ class Settings(BaseSettings):
   queue_max_size: int = Field(default=10000, gt=0)
   queue_get_timeout: float = Field(default=0.1)
   queue_sleep_timeout: float = Field(default=0.01)
-  resolve_domains_log_every: int = Field(default=10)
+  # Maximum intermediate completion messages per nonempty NEW/STALE pass; initial and final logs are separate.
+  resolve_domains_log_every: int = Field(default=10, ge=3)
   # DB section
   db_log_level: str = Field(default='error')
   db_timeout: float = Field(default=30.0)  # default in lib sqlite3 = 5.0

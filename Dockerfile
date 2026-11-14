@@ -7,15 +7,15 @@
 # Build arguments:
 #   UI_REPO_URL - UI repository URL (default: https://github.com/GregoryGost/gost-rdpr-ui.git)
 #   UI_BRANCH - UI branch to clone (default: main)
-#   UI_COMMIT - Exact UI commit to build instead of the branch tip (optional)
 #   PYTHON_VERSION - Python base image version (default: 3.15-slim-trixie)
-#   NODE_VERSION - Node.js base image version (default: 24.13-alpine)
+#   NODE_VERSION - Node.js base image version (default: 26.13.1-alpine)
+#   PNPM_VERSION - UI package manager version (default: 12.18.0)
 #
 # Note: Nginx is installed from Debian repositories (python:slim-trixie is Debian-based)
 #
 
 ARG PYTHON_VERSION=3.15-slim-trixie
-ARG NODE_VERSION=24.13-alpine
+ARG NODE_VERSION=26.13.1-alpine
 
 ########################################################################################################################
 # UI BUILDER (Node.js + Vue 3)
@@ -30,23 +30,14 @@ WORKDIR /ui
 # Install git for cloning
 RUN apk add --no-cache git
 
-# Fetch the selected UI revision, preserving branch-based local builds.
+# Clone UI_REPO_URL at UI_BRANCH, which defaults to the main branch for local builds.
 ARG UI_BRANCH=main
 ARG UI_REPO_URL=https://github.com/GregoryGost/gost-rdpr-ui.git
-ARG UI_COMMIT=
-RUN if [ -n "${UI_COMMIT}" ]; then \
-      git init . \
-      && git remote add origin "${UI_REPO_URL}" \
-      && git fetch --depth 1 origin "${UI_COMMIT}" \
-      && git checkout --detach FETCH_HEAD \
-      && test "$(git rev-parse HEAD)" = "${UI_COMMIT}"; \
-    else \
-      git clone --depth 1 --branch "${UI_BRANCH}" "${UI_REPO_URL}" .; \
-    fi
+RUN git clone --depth 1 --branch "${UI_BRANCH}" "${UI_REPO_URL}" .
 
-# Install pnpm
-ARG PNPM_VERSION=11.1.1
-RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
+# PNPM_VERSION matches the UI packageManager pin; Node.js 26 does not bundle Corepack.
+ARG PNPM_VERSION=12.18.0
+RUN npm install --global "pnpm@${PNPM_VERSION}"
 
 # Install dependencies
 RUN pnpm install --frozen-lockfile

@@ -6,6 +6,7 @@ import dataclasses
 import importlib
 import importlib.metadata
 import json
+import logging
 import math
 import os
 import platform
@@ -22,7 +23,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import aiosqlite
 import dns.asyncresolver
@@ -1299,10 +1300,17 @@ async def support_snapshot(store):
 
 
 async def queue_resolution(app, store, domain_id, addresses, *, complete=True):
+  """Admit explicit completed evidence for domain_id, addresses and completeness.
+
+  app supplies DTOs and store owns the isolated queue; completion time is provided
+  by this test producer rather than fabricated by the writer.
+  """
+  # command models one processing result completed at a fixed UTC instant.
   command = app.dto.DomainResult(
     id=domain_id,
     name=f'domain-{domain_id}.example.test',
     resolution_complete=complete,
+    last_attempt_at=datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC),
     storage_ips=tuple(addresses),
   )
   await store.put_domain_after_resolve(command)
@@ -1755,6 +1763,12 @@ async def test_complete_and_direct_domain_delete_roll_back_the_entire_batch(app,
 async def test_full_real_writer_queue_backpressures_pool_and_retains_admitted_command_on_cancel(
   app, store, resolver, network, monkeypatch
 ):
+  """Caller cancellation preserves the already-admitted completion date and drops waiting work.
+
+  app/store/resolver/network isolate real coordination and persistence; monkeypatch
+  constrains the writer queue to one entry so both cancellation boundaries are visible.
+  """
+  # jobs selects NEW; waiting announces a second producer blocked by the admitted command.
   jobs = importlib.import_module('jobs.job_registry')
   monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 2)
   monkeypatch.setattr(app.settings, 'queue_max_size', 1)
@@ -1762,18 +1776,23 @@ async def test_full_real_writer_queue_backpressures_pool_and_retains_admitted_co
   waiting = asyncio.Event()
 
   class WriterQueue(asyncio.Queue):
+    """Observe full-queue backpressure while preserving standard put semantics."""
+
     async def put(self, item):
+      """Notify waiting when item must await capacity before real admission."""
       if self.full():
         waiting.set()
       await super().put(item)
 
   store.db_save_queue = WriterQueue(maxsize=1)
+  # connection seeds disposable membership; value identifies each finite selected domain.
   async with store._DataBase__write_engine.begin() as connection:
     await connection.execute(
       insert(app.database.DomainsDbo),
       [{'id': value, 'name': f'queued-{value}.example.test', 'resolved': False} for value in range(1, 65)],
     )
     await connection.execute(insert(app.database.DnsServersDbo).values(id=42, server='192.0.2.53'))
+  # requests records actual DNS calls; task owns the public saving pass.
   requests = network({'192.0.2.53': 'positive'})
   task = asyncio.create_task(resolver.domains_resolve(jobs.Jobs.DOMAINS_RESOLVE_NEW))
   try:
@@ -1790,9 +1809,18 @@ async def test_full_real_writer_queue_backpressures_pool_and_retains_admitted_co
     assert await support_snapshot(store) == set()
     await store.start_writer()
     await asyncio.wait_for(store.db_save_queue.join(), timeout=2)
+    # supports identifies the one completed, admitted source result after caller cancellation.
     supports = await support_snapshot(store)
     assert len(supports) == 1
+    # address and list_id are the surviving support's address and optional list context.
     assert {(address, list_id) for address, _, list_id in supports} == {('8.8.8.8', None)}
+    # domain_id is the sole surviving source identity; _ discards its checked address/list metadata.
+    for _, domain_id, _ in supports:
+      assert (await attempt_state(app, store, domain_id))[0] is not None
+    async with store._DataBase__read_engine.connect() as connection:
+      assert (
+        await connection.execute(text('SELECT COUNT(*) FROM rdpr_domains WHERE last_attempt_at IS NOT NULL'))
+      ).scalar_one() == 1
     assert store.pending_count == store.unknown_count == 0
     assert store.writer_state == 'RUNNING'
   finally:
@@ -1843,7 +1871,7 @@ async def flush_queue(store):
   ],
 )
 @pytest.mark.parametrize('second_kind', ['servfail', 'nodata'])
-async def test_partial_cycle_adds_reliable_ip_without_postponing_retry(
+async def test_partial_cycle_adds_reliable_ip_and_postpones_retry(
   app,
   store,
   resolver,
@@ -1852,7 +1880,13 @@ async def test_partial_cycle_adds_reliable_ip_without_postponing_retry(
   checkpoint,
   second_kind,
 ):
+  """A completed partial cycle postpones selection while retaining IP/checkpoint evidence.
+
+  app/store/resolver/network isolate real persistence; resolved/checkpoint describe
+  prior successful state and second_kind supplies conflicting DNS evidence.
+  """
   await seed(app, store, resolved=resolved, checkpoint=checkpoint)
+  # before captures the unchanged successful state and existing IP identities.
   before = await snapshot(app, store)
   network({'192.0.2.53': 'positive', '192.0.2.54': second_kind})
   await resolver._DomainsResolver__dns_main_tasker(
@@ -1860,17 +1894,22 @@ async def test_partial_cycle_adds_reliable_ip_without_postponing_retry(
     default_dns_servers=[app.Server(server='192.0.2.53'), app.Server(server='192.0.2.54')],
     doh_dns_servers=[],
   )
+  # commands are admitted results; after holds the committed checkpoint/IP state.
   commands = await flush_queue(store)
   assert len(commands) == 1
   assert commands[0].elements[0].resolution_complete is False
   after = await snapshot(app, store)
   assert after[0] == before[0]
+  # key is each preexisting IP identity whose address must remain intact.
   assert {key: after[1][key] for key in before[1]} == before[1]
   assert set(after[1].values()) == set(before[1].values()) | {'8.8.8.8'}
+  # eligible must be empty in both automatic modes until the attempt interval passes.
   eligible = await (
     store.get_new_domains_for_resolve() if checkpoint is None else store.get_stale_domains_for_resolve()
   )
-  assert [domain.id for domain in eligible] == [1]
+  assert eligible == []
+  assert await store.get_new_domains_for_resolve() == []
+  assert await store.get_stale_domains_for_resolve() == []
 
 
 @pytest.mark.parametrize('kind', ['nxdomain', 'nodata', 'positive'])
@@ -1897,9 +1936,20 @@ async def test_complete_cycle_reconciles_only_ipv4_and_checkpoints_atomically(ap
 
 @pytest.mark.parametrize('complete', [False, True])
 async def test_writer_independently_gates_deletion_and_checkpoint(app, store, complete):
+  """Only complete evidence may withdraw IPv4 or advance successful state; both forms save an explicit attempt.
+
+  Fixtures own isolated app/storage resources; scenario parameters select the input or failure boundary.
+  """
+  # before is checkpoint and IP state before the saving command.
+  # command is the explicitly completed source result.
+  # domain is committed successful-checkpoint fields.
+  # ips is persisted IP identities and addresses.
+  # key is one original IP identity.
   await seed(app, store)
   before = await snapshot(app, store)
-  command = app.dto.DomainResult(id=1, name='www.example.test', resolution_complete=complete)
+  command = app.dto.DomainResult(
+    id=1, name='www.example.test', resolution_complete=complete, last_attempt_at=datetime(2026, 1, 2, tzinfo=UTC)
+  )
   command.storage_ips = ('8.8.4.4',)
   command.insert.ips_insert = [app.Ip(ip_address='8.8.4.4', addr_type=4)]
   command.insert.ips_delete = [10, 12, 13, 14]
@@ -1917,6 +1967,13 @@ async def test_writer_independently_gates_deletion_and_checkpoint(app, store, co
 
 
 async def test_checkpoint_failure_rolls_back_ip_addition_and_deletion(app, store, monkeypatch):
+  """A rejected successful checkpoint rolls back the attempt and all IP changes in the same transaction.
+
+  Fixtures own isolated app/storage resources; scenario parameters select the input or failure boundary.
+  """
+  # before is the original successful state and IP identity map.
+  # connection is the disposable writer connection installing the failure trigger.
+  # command is the explicitly completed authoritative result.
   await seed(app, store)
   before = await snapshot(app, store)
   async with store._DataBase__write_engine.begin() as connection:
@@ -1926,7 +1983,9 @@ async def test_checkpoint_failure_rolls_back_ip_addition_and_deletion(app, store
         "BEGIN SELECT RAISE(ABORT, 'synthetic checkpoint rejection'); END"
       )
     )
-  command = app.dto.DomainResult(id=1, name='www.example.test', resolution_complete=True)
+  command = app.dto.DomainResult(
+    id=1, name='www.example.test', resolution_complete=True, last_attempt_at=datetime(2026, 1, 2, tzinfo=UTC)
+  )
   command.storage_ips = ('8.8.4.4',)
   command.insert.ips_insert = [app.Ip(ip_address='8.8.4.4', addr_type=4)]
   command.insert.ips_delete = [10]
@@ -1960,8 +2019,13 @@ async def test_connection_open_failure_remains_typed_without_uninitialized_clean
 
 
 @pytest.mark.parametrize('kind', ['servfail', 'empty'])
-async def test_all_failure_cycle_never_enqueues_or_changes_storage(app, store, resolver, network, kind):
+async def test_all_failure_cycle_saves_marker_without_changing_ips_or_checkpoint(app, store, resolver, network, kind):
+  """A terminal DNS failure saves one attempt and preserves prior successful data.
+
+  app/store/resolver/network isolate persistence and kind chooses untrustworthy evidence.
+  """
   await seed(app, store, resolved=True, checkpoint=STALE_CHECKPOINT)
+  # before is the independent checkpoint and IP preservation oracle.
   before = await snapshot(app, store)
   network({'192.0.2.53': kind})
   await resolver._DomainsResolver__dns_main_tasker(
@@ -1969,8 +2033,10 @@ async def test_all_failure_cycle_never_enqueues_or_changes_storage(app, store, r
     default_dns_servers=[app.Server(server='192.0.2.53')],
     doh_dns_servers=[],
   )
-  assert await flush_queue(store) == []
+  assert len(await flush_queue(store)) == 1
   assert await snapshot(app, store) == before
+  assert await store.get_stale_domains_for_resolve() == []
+  assert await store.get_new_domains_for_resolve() == []
 
 
 async def enqueue_names(app, store, names):
@@ -2354,10 +2420,18 @@ async def test_shutdown_wakes_blocked_producer_without_admitting_its_event(app, 
   ],
 )
 async def test_producer_methods_propagate_closed_admission(app, store, method_name):
+  """Each producer reports a closed writer without retaining unadmitted work.
+
+  Fixtures own isolated app/storage resources; scenario parameters select the input or failure boundary.
+  """
+  # method is the selected real queue producer.
+  # arguments is valid producer inputs, including an explicit resolution completion time.
   await store.close(timeout=2)
   method = getattr(store, method_name)
   if method_name == 'put_domain_after_resolve':
-    arguments = [app.dto.DomainResult(id=1, name='closed.example.test')]
+    arguments = [
+      app.dto.DomainResult(id=1, name='closed.example.test', last_attempt_at=datetime(2026, 1, 2, tzinfo=UTC))
+    ]
   elif method_name.startswith('put_add_'):
     arguments = [[]]
   else:
@@ -2958,10 +3032,19 @@ async def test_writer_parent_deletion_cascades_linked_ips(app, store, monkeypatc
 
 
 async def test_mixed_domain_delete_and_partial_resolution_preserve_grouping(app, store, monkeypatch):
+  """A partial resolution and direct deletion retain the existing successful mixed-batch contract.
+
+  Fixtures own isolated app/storage resources; scenario parameters select the input or failure boundary.
+  """
+  # command is the completed partial result admitted beside its parent deletion.
+  # evidence is real transaction boundary observations.
+  # connection is the read connection checking cleanup and foreign keys.
   await seed(app, store)
   monkeypatch.setattr(app.settings, 'db_save_batch_size', 3)
   monkeypatch.setattr(app.settings, 'db_save_batch_timeout', 3600.0)
-  command = app.dto.DomainResult(id=1, name='www.example.test', resolution_complete=False)
+  command = app.dto.DomainResult(
+    id=1, name='www.example.test', resolution_complete=False, last_attempt_at=datetime(2026, 1, 2, tzinfo=UTC)
+  )
   command.storage_ips = ('8.8.4.4',)
   command.insert.ips_insert = [app.Ip(ip_address='8.8.4.4', addr_type=4)]
   # Existing grouping inserts resolved IPs before deleting domains in one batch.
@@ -2984,13 +3067,22 @@ async def test_late_resolution_after_parent_deletion_fails_without_orphan_or_rep
   store,
   monkeypatch,
 ):
+  """A completed resolution cannot recreate a deleted parent or orphan its IP data.
+
+  Fixtures own isolated app/storage resources; scenario parameters select the input or failure boundary.
+  """
+  # command is the completed result for an already-deleted domain.
+  # evidence is real commit and cleanup observations.
+  # connection is the connection checking durable orphan absence.
   await seed(app, store)
   monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
   evidence = instrument_sessions(store, monkeypatch)
   await store.put_delete_domains_to_queue(id=1)
   await store.start_writer()
   await asyncio.wait_for(store.db_save_queue.join(), timeout=2)
-  command = app.dto.DomainResult(id=1, name='www.example.test', resolution_complete=True)
+  command = app.dto.DomainResult(
+    id=1, name='www.example.test', resolution_complete=True, last_attempt_at=datetime(2026, 1, 2, tzinfo=UTC)
+  )
   command.storage_ips = ('8.8.4.4',)
   command.insert.ips_insert = [app.Ip(ip_address='8.8.4.4', addr_type=4)]
   await store.put_domain_after_resolve(command)
@@ -3138,7 +3230,18 @@ async def test_lifespan_database_error_keeps_priority_when_http_cleanup_also_fai
   'path', ['/commands/domains/resolve/new', '/commands/domains/resolve/stale', '/domains/1/resolve']
 )
 async def test_saving_request_rejection_preserves_error_json(app, store, monkeypatch, state, path):
-  """Exercise the real HTTP handlers, coordinator and writer failure boundary together."""
+  """Real saving routes preserve stable error JSON for a stopping coordinator or failed writer.
+
+  Fixtures own isolated app/storage resources; scenario parameters select the input or failure boundary.
+  """
+  # commands is the public command router module.
+  # domains is the public domain router module.
+  # coordinator is the real saving coordinator.
+  # expected is the public failure message for the selected lifecycle state.
+  # api is the actual routes under an in-process ASGI boundary.
+  # transport is the in-process HTTP transport.
+  # client is the bounded synthetic HTTP client.
+  # response is the returned public error response.
   commands = importlib.import_module('routers.commands_router')
   domains = importlib.import_module('routers.domains_router')
   coordinator = app.resolver.saving_coordinator
@@ -3149,7 +3252,12 @@ async def test_saving_request_rejection_preserves_error_json(app, store, monkeyp
   else:
     monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
     await store.put_domain_after_resolve(
-      app.dto.DomainResult(id=999, name='missing-parent.example.test', resolution_complete=True)
+      app.dto.DomainResult(
+        id=999,
+        name='missing-parent.example.test',
+        resolution_complete=True,
+        last_attempt_at=datetime(2026, 1, 2, tzinfo=UTC),
+      )
     )
     await store.start_writer()
     await asyncio.wait_for(asyncio.shield(store.writer_task), timeout=2)
@@ -3222,6 +3330,61 @@ def public_flow_snapshot(service, domain_id):
 
 
 @pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+@pytest.mark.parametrize('total', [1, 4])
+async def test_public_large_progress_budget_preserves_completion_and_http_responsiveness(e2e_service, total):
+  """Finish a small public NEW pass with a huge valid logging budget.
+
+  e2e_service owns the real application subprocess, disposable SQLite, bounded
+  requests and local DNS/DoH/RIPE providers. total selects one or a few domains;
+  neither case may make the HTTP event loop traverse unused logging intervals.
+  """
+  # service starts only after its isolated environment contains the large valid budget.
+  service = e2e_service
+  service.environment['RESOLVE_DOMAINS_LOG_EVERY'] = '1000000000'
+  service.environment['ROOT_LOG_LEVEL'] = 'info'
+  await service.start()
+  # names is the finite public selection; value supplies distinct synthetic domain names.
+  names = [f'progress-{value}.example.test' for value in range(total)]
+  # client bounds each public request so an event-loop stall cannot wedge the test runner.
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    assert (
+      await client.post('/dns', json=[{'server': service.dns_host}, {'doh_server': service.doh_url}])
+    ).status_code == 200
+    # name is one synthetic domain submitted through the real HTTP admission path.
+    assert (await client.post('/domains', json=[{'domain': name} for name in names])).status_code == 200
+    async with asyncio.timeout(5):
+      while True:
+        # rows contains committed NEW domains, excluding the seeded resolved default; dns_rows confirms DNS setup.
+        rows = (await client.get('/domains', params={'resolved': 'false'})).json()['payload']
+        dns_rows = (await client.get('/dns', params={'default': 'false'})).json()['payload']
+        if {row['name'] for row in rows} == set(names) and len(dns_rows) == 2:  # row is one committed domain.
+          break
+        await asyncio.sleep(0.01)
+    assert (await client.post('/commands/domains/resolve/new')).status_code == 200
+    # samples retains the public metric samples; fields contains this NEW pass's settled counters.
+    samples, fields = await completed_metrics(client, mode='new', selected=total)
+    assert fields['selected'] == fields['attempted'] == fields['covered'] == total
+    assert fields['success'] == fields['admitted'] == fields['confirmed'] == total
+    assert fields['failure'] == fields['pending'] == fields['unknown'] == 0
+    assert sample_total(samples, 'resolution_run_elapsed_seconds_count', mode='new') == 1
+    assert (await client.get('/health')).status_code == 200
+    # row identifies each selected domain whose IP result must be visible after real commit.
+    for row in rows:
+      # response is the public persisted result for this domain.
+      response = await client.get(f'/domains/{row["id"]}')
+      assert response.status_code == 200
+      assert set(response.json()['ips_v4']) == {'8.8.8.8', '8.8.4.4'}
+  await service.stop()
+  # progress holds only intermediate INFO lines; line is one captured child-process log line.
+  progress = [line for line in service.diagnostics().splitlines() if 'Resolution progress run_id=' in line]
+  assert len(progress) <= total - 1
+  assert bool(progress) is (total > 1)
+  assert service.diagnostics().count('Resolution processing run_id=') == 1
+  assert service.diagnostics().count('Resolution persistence run_id=') == 1
+
+
+@pytest.mark.e2e
 async def test_public_bulk_shared_addresses_keep_surviving_domain_and_durable_union(e2e_service):
   service = e2e_service
   names = ['first-shared.example.test', 'second-shared.example.test']
@@ -3277,6 +3440,27 @@ async def test_public_bulk_shared_addresses_keep_surviving_domain_and_durable_un
 @pytest.mark.e2e
 @pytest.mark.parametrize('kind', ['alias-chain-positive', 'cname-only', 'servfail', 'alias-cycle'])
 async def test_public_a_alias_discovery_persists_only_reachable_aliases_without_granting_ip_deletion(e2e_service, kind):
+  """Reachable aliases persist without permitting failed A evidence to replace IPs; all completed attempts confirm.
+
+  Fixtures own isolated app/storage resources; scenario parameters select the input or failure boundary.
+  """
+  # service is the isolated real application and local providers.
+  # domain_id is the stored source domain identity.
+  # before is pre-operation checkpoint and IP metadata.
+  # aliases is the reachable names authorized by the wire scenario.
+  # client is the bounded real HTTP client.
+  # checked is the public no-save diagnostic response.
+  # row is one public result or provider request row.
+  # listed is the committed domain catalogue before saving.
+  # _ is unused elapsed-metric samples.
+  # fields is the stored run processing and persistence counters.
+  # after is durable checkpoint and IP metadata after shutdown.
+  # connection is the disposable database connection checking alias membership.
+  # names is the final domain catalogue.
+  # name is one expected source or alias name.
+  # transport is the classic or DoH provider kind.
+  # record_type is one captured DNS record type.
+  # source is one provider request transport.
   service = e2e_service
   domain_id = await configure_public_domain(service)
   before = public_flow_snapshot(service, domain_id)
@@ -3302,7 +3486,7 @@ async def test_public_a_alias_discovery_persists_only_reachable_aliases_without_
     assert (await client.post(f'/domains/{domain_id}/resolve')).status_code == 202
     _, fields = await completed_metrics(client, mode='stored', selected=1)
     assert fields['success' if kind == 'alias-chain-positive' else 'failure'] == 1
-    assert fields['confirmed'] == int(kind == 'alias-chain-positive')
+    assert fields['confirmed'] == 1
   await service.stop()
   after = public_flow_snapshot(service, domain_id)
   if kind == 'alias-chain-positive':
@@ -3341,6 +3525,31 @@ async def test_public_resolution_reconciles_only_complete_trustworthy_ipv4(
   complete,
   addresses,
 ):
+  """Preserve checkpoint/IP evidence and postpone incomplete attempts until their interval expires.
+
+  Fixtures own isolated app/storage resources; scenario parameters select the input or failure boundary.
+  """
+  # service is the isolated real application and providers.
+  # domain_id is the stored source domain identity.
+  # before_domain is pre-operation successful checkpoint fields.
+  # before_ips is pre-operation IP identities and metadata.
+  # connection is the disposable fixture connection.
+  # row is one database or API result.
+  # history is completed migration metadata.
+  # migrations is migration source paths in the selected app snapshot.
+  # path is one migration source path.
+  # client is the bounded real HTTP client.
+  # response is one public response.
+  # payload is the diagnostic JSON object.
+  # by_transport is diagnostic results keyed by classic or DoH.
+  # transport is one selected provider protocol.
+  # kind is the provider evidence scenario.
+  # server is the expected configured provider address.
+  # expected is the expected diagnostic IPv4 values.
+  # domain is post-operation successful-checkpoint fields.
+  # ips is post-operation IP identity and metadata map.
+  # address is one original IP address whose metadata must survive.
+  # record_type is one required DNS record type.
   service = e2e_service
   service.providers.classic, service.providers.doh = classic, doh
   domain_id = await configure_public_domain(service)
@@ -3400,9 +3609,19 @@ async def test_public_resolution_reconciles_only_complete_trustworthy_ipv4(
   }
 
   if not complete:
-    # A new process runs the public stale job without a manual per-domain override.
+    # A fresh attempt postpones the public stale pass despite an old successful checkpoint.
     service.providers.classic = service.providers.doh = 'positive'
     service.providers.requests.clear()
+    await service.start()
+    async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+      response = await client.post('/commands/domains/resolve/stale')
+      assert response.status_code == 200, response.text
+    await service.stop()
+    assert service.providers.requests == []
+    assert public_flow_snapshot(service, domain_id)[0] == before_domain
+    # Expire only the attempt; the next real automatic pass must now recover.
+    with closing(sqlite3.connect(service.db_path)) as connection, connection:
+      connection.execute('UPDATE rdpr_domains SET last_attempt_at=? WHERE id=?', ('2000-01-01 00:00:00', domain_id))
     await service.start()
     async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
       response = await client.post('/commands/domains/resolve/stale')
@@ -3423,17 +3642,41 @@ async def test_public_resolution_reconciles_only_complete_trustworthy_ipv4(
 
 
 @pytest.mark.e2e
-async def test_failed_new_domain_remains_eligible_for_the_public_new_job(e2e_service):
+async def test_failed_new_domain_waits_interval_but_manual_resolution_bypasses_it(e2e_service):
+  """Persist failed NEW attempts across restart, preserve diagnostic no-save and allow manual recovery.
+
+  e2e_service owns the actual app, migrations, writer, temporary SQLite and local
+  DNS/DoH providers. All resolution and read assertions cross public HTTP boundaries.
+  """
+  # service controls local providers; domain_id identifies the unresolved stored domain.
   service = e2e_service
   service.providers.classic = 'servfail'
   service.providers.doh = 'empty'
   domain_id = await configure_public_domain(service, resolved=False)
+  # before contains successful checkpoint and IP evidence that a failure cannot replace.
   before = public_flow_snapshot(service, domain_id)
+  # client bounds real API requests; response is each public acknowledgement or date payload.
   async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    response = await client.get(f'/domains/{domain_id}')
+    assert response.json()['last_attempt_at'] is response.json()['last_attempt_at_hum'] is None
+    assert (await client.post('/domains/resolve/check', json={'domain': 'www.example.test'})).status_code == 200
+    assert (await client.get(f'/domains/{domain_id}')).json()['last_attempt_at'] is None
+    service.providers.requests.clear()
     response = await client.post('/commands/domains/resolve/new')
     assert response.status_code == 200, response.text
+    # fields confirms failed processing and the marker's real commit; _ discards unused metric samples.
+    _, fields = await completed_metrics(client, mode='new', selected=1)
+    assert fields['failure'] == fields['admitted'] == fields['confirmed'] == 1
+    # failed stores the public nullable date pair after this terminal failure.
+    failed = (await client.get(f'/domains/{domain_id}')).json()
+    assert isinstance(failed['last_attempt_at'], (int, float))
+    assert (
+      datetime.fromisoformat(failed['last_attempt_at_hum']).strftime('%Y-%m-%d %H:%M:%S')
+      == failed['last_attempt_at_hum']
+    )
   await service.stop()
   assert public_flow_snapshot(service, domain_id) == before
+  # row is one captured local-provider request, including protocol and DNS record type.
   assert {(row[0], row[2]) for row in service.providers.requests} == {
     ('classic', dns.rdatatype.A),
     ('classic', dns.rdatatype.CNAME),
@@ -3441,14 +3684,24 @@ async def test_failed_new_domain_remains_eligible_for_the_public_new_job(e2e_ser
     ('doh', dns.rdatatype.CNAME),
   }
   service.providers.classic = service.providers.doh = 'positive'
+  service.providers.requests.clear()
   await service.start()
   async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    assert (await client.get(f'/domains/{domain_id}')).json()['last_attempt_at'] == failed['last_attempt_at']
     response = await client.post('/commands/domains/resolve/new')
     assert response.status_code == 200, response.text
-    async with asyncio.timeout(5):
-      while public_flow_snapshot(service, domain_id)[0][1] is None:
-        await asyncio.sleep(0.02)
+    assert (await client.post('/commands/domains/resolve/stale')).status_code == 200
   await service.stop()
+  assert service.providers.requests == []
+  assert public_flow_snapshot(service, domain_id) == before
+  await service.start()
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    assert (await client.post(f'/domains/{domain_id}/resolve')).status_code == 202
+    # _ again discards unused samples; fields now describes manual recovery rather than NEW.
+    _, fields = await completed_metrics(client, mode='stored', selected=1)
+    assert fields['success'] == fields['confirmed'] == 1
+  await service.stop()
+  # domain and ips are durable state after manual bypass and real lifespan drain.
   domain, ips = public_flow_snapshot(service, domain_id)
   assert domain[0] == 1
   assert set(ips) == {'8.8.8.8', '8.8.4.4', '2001:4860:4860::8888'}
@@ -3755,11 +4008,18 @@ async def test_public_current_schema_upgrade_backfills_source_and_preserves_rows
 
 
 async def seed_previous_ip_volume(service, *, keep_default):
-  """Create a previous-release volume with both missing and valid foreign-key targets."""
+  """Create previous-release IP ownership with both missing and valid foreign-key targets.
+
+  service owns disposable SQLite and actual startup; keep_default determines whether
+  the old standalone domain already exists. Domain fixtures explicitly name legacy
+  fields so a new nullable column does not change this historical data contract.
+  """
   await service.start()
   await service.stop()
+  # created and updated preserve deliberately distinct historical row dates.
   created = '2001-02-03 04:05:06'
   updated = '2002-03-04 05:06:07'
+  # connection prepares the stopped fixture; objects records its pre-upgrade schema inventory.
   with closing(sqlite3.connect(service.db_path)) as connection, connection:
     objects = connection.execute('SELECT type,name FROM sqlite_master ORDER BY type,name').fetchall()
     connection.execute(
@@ -3783,7 +4043,8 @@ async def seed_previous_ip_volume(service, *, keep_default):
       VALUES (6,'IP list','https://provider.example.test/ips','IP list metadata','IP hash',3)
     """)
     connection.executemany(
-      'INSERT INTO rdpr_domains VALUES (?,?,?,?,?,?,?,?)',
+      'INSERT INTO rdpr_domains '
+      '(id,domain_list_id,resolved,name,ros_comment,created_at,updated_at,last_resolved_at) VALUES (?,?,?,?,?,?,?,?)',
       [
         (-1, None, 1, 'existing-negative.example.test', 'valid negative ID', created, updated, updated),
         (7, 5, 1, 'listed.example.test', 'valid list', created, updated, updated),
@@ -4178,6 +4439,12 @@ async def test_public_checksum_refresh_preserves_history_and_data_across_failure
 @pytest.mark.e2e
 @pytest.mark.parametrize('e2e_service', [False], indirect=True)
 async def test_public_historical_gateway_upgrade_preserves_old_data_and_all_history(e2e_service):
+  """Preserve every legacy domain/IP value and history row while adding the inherited attempt date.
+
+  e2e_service owns the real startup process and disposable historical database.
+  The new attempt value must equal the known checkpoint without altering old dates.
+  """
+  # service owns startup/shutdown; connection prepares and verifies the disposable old schema.
   service = e2e_service
   with closing(sqlite3.connect(service.db_path)) as connection, connection:
     connection.executescript("""
@@ -4213,10 +4480,12 @@ async def test_public_historical_gateway_upgrade_preserves_old_data_and_all_hist
         (34, 'retired-migration.py', 'unrelated-checksum', '2004-05-06 07:08:09', '2004-05-07 07:08:09'),
       ],
     )
+    # old_history retains applied and failed rows; old_ip and old_domain retain exact legacy data.
     old_history = connection.execute('SELECT * FROM rdpr_migrations ORDER BY id').fetchall()
     old_ip = connection.execute('SELECT * FROM rdpr_ip_records').fetchone()
     old_domain = connection.execute('SELECT * FROM rdpr_domains').fetchone()
   await service.start()
+  # client and response verify that the real upgraded public API still exposes the existing address.
   async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
     response = await client.get('/domains/7')
     assert response.status_code == 200, response.text
@@ -4224,7 +4493,16 @@ async def test_public_historical_gateway_upgrade_preserves_old_data_and_all_hist
   await service.stop()
   with closing(sqlite3.connect(service.db_path)) as connection:
     assert connection.execute('SELECT * FROM rdpr_migrations WHERE id<=34 ORDER BY id').fetchall() == old_history
-    assert connection.execute('SELECT * FROM rdpr_domains WHERE id=7').fetchone() == old_domain
+    assert (
+      connection.execute(
+        'SELECT id,domain_list_id,resolved,name,ros_comment,created_at,updated_at,last_resolved_at '
+        'FROM rdpr_domains WHERE id=7'
+      ).fetchone()
+      == old_domain
+    )
+    assert connection.execute('SELECT last_attempt_at FROM rdpr_domains WHERE id=7').fetchone() == (
+      '2002-03-04 05:06:07',
+    )
     assert connection.execute('SELECT * FROM rdpr_ip_records WHERE id=17').fetchone() == (*old_ip, 0)
     assert connection.execute('SELECT ip_record_id,domain_id,ip_list_id FROM rdpr_ip_supports').fetchall() == [
       (17, 7, None)
@@ -4239,7 +4517,9 @@ async def test_public_historical_gateway_upgrade_preserves_old_data_and_all_hist
       (IP_REFERENCE_REPAIR_MIGRATION,),
       (IP_OWNERSHIP_MIGRATION,),
       (CHECKSUM_REFRESH_MIGRATION,),
+      ('migration_202618042125.py',),
     ]
+  # before captures all upgraded schema, history and values for exact completed-restart preservation.
   before = sqlite_snapshot(service.db_path)
   await service.start()
   await service.stop()
@@ -4693,15 +4973,29 @@ async def test_pending_gateway_reconciliation_preserves_existing_values_and_fail
 @pytest.mark.e2e
 @pytest.mark.parametrize('e2e_service', [False], indirect=True)
 async def test_public_legacy_target_name_overlap_is_refused_without_changes(e2e_service):
+  """Require the overlap refusal and an independent child exit before harness cleanup.
+
+  e2e_service supplies the real entrypoint, disposable SQLite and local provider fakes.
+  """
+  # service is the stopped application whose empty prefix collides with legacy table names.
   service = e2e_service
   service.environment['DB_TABLE_PREFIX'] = ''
+  # Coverage rewrites its SQLite data after SystemExit and can delay this bounded exit check.
+  # Other service E2E children keep their coverage instrumentation.
+  service.environment.pop('COVERAGE_PROCESS_START', None)
+  service.environment.pop('COVERAGE_FILE', None)
   create_legacy_database(service.db_path)
+  # before captures every persisted table and row before the refused startup.
   before = sqlite_snapshot(service.db_path)
   with pytest.raises(AssertionError, match='Application exited before readiness'):
     await service.start()
+  assert 'Legacy source and target tables overlap' in service.diagnostics()
+  assert service.startup_attempts[-1]['exit_code_before_cleanup'] == 3
   assert sqlite_snapshot(service.db_path) == before
   assert service.process is None
+  assert service.log is None
   assert service.providers.requests == []
+  assert service.providers.http_requests == []
 
 
 async def test_startup_error_after_physical_commit_keeps_writer_stopped_and_allows_fresh_recovery(
@@ -4740,7 +5034,14 @@ async def test_startup_error_after_physical_commit_keeps_writer_stopped_and_allo
 
 
 def measured_domain(app, *, mode='stored', complete=True):
-  """Establish the source-domain result before the real database admission boundary."""
+  """Construct one explicitly completed saving result and its real per-domain measurement origin.
+
+  Fixtures own isolated app/storage resources; scenario parameters select the input or failure boundary.
+  """
+  # metrics is the production measurement module.
+  # run is the source operation owning this result.
+  # observation is the per-domain lifecycle observer.
+  # command is the result carrying explicit completion time into real admission.
   metrics = importlib.import_module('metrics.metrics')
   run = metrics.ResolutionRun(mode)
   run.select(1)
@@ -4751,9 +5052,194 @@ def measured_domain(app, *, mode='stored', complete=True):
     id=1,
     name='www.example.test',
     resolution_complete=complete,
+    last_attempt_at=datetime(2026, 1, 2, tzinfo=UTC),
     observation=observation,
   )
   return run, command
+
+
+def run_summary_records(caplog, run, kind):
+  """Select final INFO summaries for one run from caplog's captured records.
+
+  run identifies the origin rather than the latest metrics generation, and kind
+  distinguishes processing from persistence. Batch DEBUG records are excluded.
+  """
+  # record is one captured record whose positional arguments identify its origin.
+  return [
+    record
+    for record in caplog.records
+    if record.levelno == logging.INFO
+    and str(record.msg).startswith(f'Resolution {kind} run_id=')
+    and record.args[0] == run.run_id
+  ]
+
+
+@pytest.mark.parametrize('commit_before_processing', [False, True])
+async def test_multibatch_run_logs_final_persistence_once_after_both_boundaries(
+  app, store, monkeypatch, caplog, commit_before_processing
+):
+  """Keep batch details at DEBUG and summarize real SQLite commits once per run.
+
+  app/store isolate SQLite; monkeypatch chooses three-item batches, and caplog
+  captures actual output. commit_before_processing reverses the terminal event
+  order without replacing SQL, receipts, or observation code.
+  """
+  # metrics supplies the production observer; run owns seven source-domain results.
+  metrics = importlib.import_module('metrics.metrics')
+  run = metrics.ResolutionRun('new')
+  run.select(7)
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 3)
+  monkeypatch.setattr(app.settings, 'db_save_batch_timeout', 0.01)
+  # connection creates only test-owned fixture rows; value gives each selected domain an ID.
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.DomainsDbo),
+      [{'id': value, 'name': f'logged-{value}.example.test'} for value in range(1, 8)],
+    )
+  # evidence counts real transaction boundaries; commands retains receipt-bearing results.
+  evidence = instrument_sessions(store, monkeypatch)
+  commands = []
+  caplog.set_level(logging.DEBUG)
+  caplog.clear()
+  # value identifies each result; observation receives production lifecycle notifications.
+  for value in range(1, 8):
+    observation = run.observe()
+    observation.notify('processing_started', perf_counter())
+    observation.notify('success', perf_counter())
+    # command is a complete empty IPv4 result, which must still advance its checkpoint.
+    command = app.dto.DomainResult(
+      id=value,
+      name=f'logged-{value}.example.test',
+      resolution_complete=True,
+      last_attempt_at=datetime(2026, 1, 2, tzinfo=UTC),
+      observation=observation,
+    )
+    commands.append(command)
+    await store.put_domain_after_resolve(command)
+    observation.notify('processing_finished', perf_counter())
+  if not commit_before_processing:
+    run.finish(True)
+    assert len(run_summary_records(caplog, run, 'processing')) == 1
+    assert run_summary_records(caplog, run, 'persistence') == []
+  await store.start_writer()
+  await asyncio.wait_for(store.db_save_queue.join(), timeout=3)
+  if commit_before_processing:
+    assert run_summary_records(caplog, run, 'persistence') == []
+    run.finish(True)
+  assert evidence.commits == 3
+  assert [command.write_receipt.outcome.value for command in commands] == ['confirmed'] * 7
+  # connection reads committed checkpoints through the separate production read engine.
+  async with store._DataBase__read_engine.connect() as connection:
+    assert (await connection.execute(select(app.database.DomainsDbo.resolved))).scalars().all() == [True] * 7
+    assert all(
+      checkpoint is not None
+      for checkpoint in (await connection.execute(select(app.database.DomainsDbo.last_resolved_at))).scalars()
+    )  # checkpoint is each persisted completion timestamp.
+  assert len(run_summary_records(caplog, run, 'processing')) == 1
+  assert len(run_summary_records(caplog, run, 'persistence')) == 1
+  # final copies the final counters from the once-per-run persistence log.
+  final = run_summary_records(caplog, run, 'persistence')[0].args[2]
+  assert final['admitted'] == final['confirmed'] == 7
+  assert final['pending'] == final['unknown'] == final['known_not_committed'] == 0
+  # record identifies batch detail records independently of their summary payload text.
+  assert len([record for record in caplog.records if str(record.msg) == 'Resolution persistence summary=%s']) == 3
+  assert all(
+    record.levelno == logging.DEBUG
+    for record in caplog.records
+    if str(record.msg) == 'Resolution persistence summary=%s'
+  )
+
+
+@pytest.mark.parametrize(('stage', 'expected'), [('begin', 'known_not_committed'), ('after_commit', 'unknown')])
+async def test_failed_writer_logs_final_receipt_truth_once(app, store, monkeypatch, caplog, stage, expected):
+  """A writer fault reports its final receipt outcome without inventing success.
+
+  app/store use real isolated SQLite; monkeypatch injects the selected driver
+  stage, and caplog observes one final summary. expected follows whether SQLite
+  definitely did not commit or the commit acknowledgement became ambiguous.
+  """
+  await seed(app, store)
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+  # run and command carry real production observations across queue admission and writer cleanup.
+  run, command = measured_domain(app)
+
+  async def fault(current, evidence):
+    """Fail the requested driver stage; evidence retains real transaction counts."""
+    if current == stage:
+      raise RuntimeError('Synthetic driver stage failure')
+
+  instrument_sessions(store, monkeypatch, fault=fault)
+  caplog.set_level(logging.DEBUG)
+  caplog.clear()
+  await store.put_domain_after_resolve(command)
+  command.observation.notify('processing_finished', perf_counter())
+  run.finish(True)
+  assert run_summary_records(caplog, run, 'persistence') == []
+  await store.start_writer()
+  await asyncio.wait_for(asyncio.shield(store.writer_task), timeout=3)
+  assert len(run_summary_records(caplog, run, 'processing')) == 1
+  assert len(run_summary_records(caplog, run, 'persistence')) == 1
+  # final is the receipt-based final summary, independent of whether the row physically committed.
+  final = run_summary_records(caplog, run, 'persistence')[0].args[2]
+  assert final[expected] == final['admitted'] == 1
+  assert final['pending'] == final['confirmed'] == 0
+  assert command.write_receipt.outcome.value == ('final_unknown' if expected == 'unknown' else expected)
+  # current_domain reflects actual SQLite state; ambiguous acknowledgement may follow a physical commit.
+  # _ips is the returned IP snapshot, deliberately unused because this assertion concerns the checkpoint.
+  current_domain, _ips = await snapshot(app, store)
+  assert current_domain[0] is (stage == 'after_commit')
+
+
+@pytest.mark.parametrize('error_type', [RuntimeError, asyncio.CancelledError])
+@pytest.mark.parametrize('boundary', ['logger', 'collector'])
+async def test_final_summary_observation_failure_preserves_real_commit(
+  app, store, monkeypatch, caplog, error_type, boundary
+):
+  """Optional logging or gauge failures cannot change real commit receipts.
+
+  app/store isolate SQLite; monkeypatch injects error_type at boundary, while
+  caplog confirms collector failure still permits independent final logs.
+  """
+  await seed(app, store)
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+  # metrics is the production observation module; run/command retain normal source-domain truth.
+  metrics = importlib.import_module('metrics.metrics')
+  run, command = measured_domain(app)
+  # original_info keeps unrelated database lifecycle logging intact during resolution-log fault injection.
+  original_info = importlib.import_module('logger.logger').logger.info
+
+  def unavailable(*args, **kwargs):
+    """Raise the injected failure; args and kwargs accept any logger or collector call."""
+    raise error_type('Synthetic optional observation failure')
+
+  def fail_resolution_info(message, *args, **kwargs):
+    """Fail resolution INFO message values; forward other calls with their args and kwargs."""
+    if str(message).startswith('Resolution '):
+      raise error_type('Synthetic optional resolution logging failure')
+    return original_info(message, *args, **kwargs)
+
+  if boundary == 'logger':
+    monkeypatch.setattr(importlib.import_module('logger.logger').logger, 'info', fail_resolution_info)
+  else:
+    monkeypatch.setattr(metrics.run_snapshot, 'labels', unavailable)
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  await store.put_domain_after_resolve(command)
+  command.observation.notify('processing_finished', perf_counter())
+  run.finish(True)
+  await store.start_writer()
+  await asyncio.wait_for(store.db_save_queue.join(), timeout=3)
+  assert command.write_receipt.outcome.value == 'confirmed'
+  assert run.snapshot()['admitted'] == run.snapshot()['confirmed'] == 1
+  assert run.snapshot()['pending'] == 0
+  # current_domain proves the observed success reached SQLite rather than only a fake receipt.
+  # _ips is the returned IP snapshot, deliberately unused because this assertion concerns the checkpoint.
+  current_domain, _ips = await snapshot(app, store)
+  assert current_domain[0] is True
+  assert current_domain[1] is not None
+  if boundary == 'collector':
+    assert len(run_summary_records(caplog, run, 'processing')) == 1
+    assert len(run_summary_records(caplog, run, 'persistence')) == 1
 
 
 def assert_receipt_conservation(run):
@@ -4779,15 +5265,25 @@ def assert_receipt_conservation(run):
   ],
 )
 async def test_domain_receipt_is_commit_evidence_and_never_inserted_row_count(app, store, monkeypatch, stage, state):
+  """Preserve mandatory commit truth for marker-only results across driver failure stages.
+
+  app/store isolate real SQLite and metrics; monkeypatch configures one command per
+  batch. stage chooses the injected driver boundary, and state is its established
+  receipt truth, including unknown outcomes that must not be replayed.
+  """
   await seed(app, store)
+  # before preserves checkpoint and IP state independently of the newly saved attempt marker.
   before = await snapshot(app, store)
   monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+  # run owns the observation; command is an explicitly completed partial result without additions.
   run, command = measured_domain(app, complete=False)
 
   async def fault(current, evidence):
+    """Raise at current when it matches stage; evidence contains real session boundary counts."""
     if current == stage:
       raise RuntimeError('Synthetic driver failure')
 
+  # evidence observes physical commits; counts retains final processing and persistence counters.
   evidence = instrument_sessions(store, monkeypatch, fault=fault)
   await store.put_domain_after_resolve(command)
   command.observation.notify('processing_finished', perf_counter())
@@ -4812,7 +5308,7 @@ async def test_domain_receipt_is_commit_evidence_and_never_inserted_row_count(ap
   else:
     assert counts['saved_rate'] > 0
   assert evidence.commits == int(stage != 'begin')
-  # A partial result with no additions is still one committed source result, with no physical row changes.
+  # A partial result with no additions confirms one source result without changing IP/checkpoint state.
   assert await snapshot(app, store) == before
   assert store._DataBase__observations == {}
 
@@ -5324,6 +5820,13 @@ async def test_startup_fk_override_is_closed_before_runtime_connections(app, sta
 async def test_dns_job_reads_once_and_activates_committed_changes_only_for_next_job(
   app, store, resolver, monkeypatch, dns_message, mode
 ):
+  """Keep one immutable DNS snapshot per pass and reload it only for a newly eligible pass.
+
+  app/store/resolver exercise real selection, writer and coordinator behavior;
+  monkeypatch/dns_message replace external DNS only, and mode selects NEW or STALE.
+  Fixture eligibility is restored only after the preceding receipts are committed.
+  """
+  # jobs names the public scan modes; connection owns disposable setup and fixture eligibility changes.
   jobs = importlib.import_module('jobs.job_registry')
   async with store._DataBase__write_engine.begin() as connection:
     await connection.execute(insert(app.database.DnsServersDbo).values(id=42, server='192.0.2.53'))
@@ -5336,13 +5839,18 @@ async def test_dns_job_reads_once_and_activates_committed_changes_only_for_next_
           'resolved': mode == 'stale',
           'last_resolved_at': STALE_CHECKPOINT if mode == 'stale' else None,
         }
-        for index in (1, 2)
+        for index in (1, 2)  # index is each domain's stable fixture ID.
       ],
     )
+  # entered/release bracket the first DNS query; requests and selections record wire calls and DNS reads.
   entered, release = asyncio.Event(), asyncio.Event()
   requests, selections = [], []
 
   async def classic(boundary, qname, rdtype, **kwargs):
+    """Record boundary's endpoint for qname/rdtype, blocking only the first synthetic answer.
+
+    kwargs carries unused resolver options. The result is a trustworthy empty DNS response.
+    """
     requests.append((boundary.nameservers[0], qname, rdtype))
     if len(requests) == 1:
       entered.set()
@@ -5350,11 +5858,16 @@ async def test_dns_job_reads_once_and_activates_committed_changes_only_for_next_
     return SimpleNamespace(response=dns_message('nodata', query=dns.message.make_query(qname, rdtype)))
 
   def observe_select(connection, cursor, statement, parameters, context, executemany):
+    """Record DNS configuration reads from statement without changing SQL execution.
+
+    connection/cursor/parameters/context/executemany are unused SQLAlchemy event metadata.
+    """
     if 'UNION ALL' in statement and 'rdpr_dns_servers' in statement:
       selections.append(statement)
 
   monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', classic)
   event.listen(store._DataBase__read_engine.sync_engine, 'before_cursor_execute', observe_select)
+  # mode_value chooses the coordinator scan; task owns the first pass until its processing finishes.
   mode_value = getattr(jobs.Jobs, f'DOMAINS_RESOLVE_{mode.upper()}')
   task = asyncio.create_task(resolver.domains_resolve(mode_value))
   try:
@@ -5368,6 +5881,8 @@ async def test_dns_job_reads_once_and_activates_committed_changes_only_for_next_
     release.set()
     await asyncio.wait_for(task, timeout=3)
   try:
+    # expected_names is finite membership; index forms each selected domain name.
+    # name and record_type form each independently expected DNS query for the first pass.
     expected_names = {f'snapshot-{index}.example.test' for index in (1, 2)}
     assert set(requests) == {
       ('192.0.2.53', name, record_type) for name in expected_names for record_type in (dns.rdatatype.A,)
@@ -5380,15 +5895,17 @@ async def test_dns_job_reads_once_and_activates_committed_changes_only_for_next_
     await asyncio.wait_for(resolver.domains_resolve(mode_value), timeout=3)
     assert requests == []
     assert store.pending_count == 2
+    # reads_before_next_attempt preserves the DNS-read count while the prior receipts settle.
     reads_before_next_attempt = len(selections)
     await flush_queue(store)
     # Restore eligibility only after the preceding commands have known committed outcomes.
     async with store._DataBase__write_engine.begin() as connection:
       await connection.execute(
-        text('UPDATE rdpr_domains SET last_resolved_at=:checkpoint'),
-        {'checkpoint': STALE_CHECKPOINT if mode == 'stale' else None},
+        text('UPDATE rdpr_domains SET last_attempt_at=NULL, last_resolved_at=:checkpoint'),
+        {'checkpoint': STALE_CHECKPOINT.strftime('%Y-%m-%d %H:%M:%S') if mode == 'stale' else None},
       )
     await asyncio.wait_for(resolver.domains_resolve(mode_value), timeout=3)
+    # name and record_type identify each expected query after the new DNS configuration becomes active.
     assert set(requests) == {
       ('192.0.2.54', name, record_type) for name in expected_names for record_type in (dns.rdatatype.A,)
     }
@@ -5396,6 +5913,7 @@ async def test_dns_job_reads_once_and_activates_committed_changes_only_for_next_
     assert len(selections) == reads_before_next_attempt + 1
     assert store.pending_count == 2
     await flush_queue(store)
+    # rows contains final successful state; resolved/checkpoint are each row's flag and committed checkpoint.
     async with store._DataBase__read_engine.connect() as connection:
       rows = (await connection.execute(text('SELECT resolved, last_resolved_at FROM rdpr_domains ORDER BY id'))).all()
     assert len(rows) == 2
@@ -5432,11 +5950,21 @@ async def test_dns_configuration_ignores_enqueue_and_rollback_until_writer_commi
 async def test_dns_read_failure_is_typed_and_prevents_job_admission_and_persistence(
   app, store, resolver, monkeypatch, mode, caplog
 ):
+  """Reject broken DNS storage before automatic or stored resolution can enqueue writes.
+
+  app, store and resolver provide the isolated database and resolution dependencies;
+  monkeypatch supplies their shared patch scope. mode selects NEW or STALE, and
+  caplog verifies that public errors do not expose SQL details.
+  """
+  # jobs provides the public automatic-resolution modes used by this check.
   jobs = importlib.import_module('jobs.job_registry')
   await seed(app, store, resolved=mode == 'stale', checkpoint=STALE_CHECKPOINT if mode == 'stale' else None)
+  # before captures domain and IP rows that configuration failures must preserve.
   before = await snapshot(app, store)
+  # connection owns the committed test fault that removes DNS configuration storage.
   async with store._DataBase__write_engine.begin() as connection:
     await connection.execute(text('DROP TABLE rdpr_dns_servers'))
+  # failure is the typed public error whose message must hide schema and filesystem details.
   with pytest.raises(app.database.DnsConfigurationReadError) as failure:
     await store.get_dns_servers_for_resolve()
   assert 'rdpr_dns_servers' not in str(failure.value)
@@ -5444,7 +5972,8 @@ async def test_dns_read_failure_is_typed_and_prevents_job_admission_and_persiste
   with pytest.raises(app.database.DnsConfigurationReadError):
     await resolver.resolve_once('www.example.test')
   with pytest.raises(app.database.DnsConfigurationReadError):
-    await asyncio.wait_for(resolver.domains_resolve(getattr(jobs.Jobs, f'DOMAINS_RESOLVE_{mode.upper()}')), timeout=3)
+    # Bound a hung test while allowing the almost four-second STALE read measured with coverage.
+    await asyncio.wait_for(resolver.domains_resolve(getattr(jobs.Jobs, f'DOMAINS_RESOLVE_{mode.upper()}')), timeout=10)
   with pytest.raises(app.database.DnsConfigurationReadError):
     await resolver.resolve_stored_domain(1)
   assert store.pending_count == store.unknown_count == 0
@@ -5576,17 +6105,28 @@ async def test_public_dns_change_during_job_activates_after_commit_for_next_oper
 
 @pytest.mark.parametrize('error_type', [None, RuntimeError, asyncio.CancelledError])
 async def test_receipt_observer_failure_cannot_cancel_real_commit(app, store, monkeypatch, error_type):
+  """Optional observation failures cannot prevent a completed result from committing or alter mandatory receipts.
+
+  Fixtures own isolated app/storage resources; scenario parameters select the input or failure boundary.
+  """
+  # command is the explicitly completed result and optional faulty observer.
+  # domain is committed successful checkpoint fields.
+  # _ips is the IP state returned alongside the checkpoint.
   await seed(app, store)
   monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
 
   class BrokenObserver:
+    """Raise a selected synthetic error whenever optional observation is attempted."""
+
     def notify(self, event, at):
+      """Raise the selected error_type for optional event/at observation notifications."""
       raise error_type('Synthetic observer failure')
 
   command = app.dto.DomainResult(
     id=1,
     name='www.example.test',
     resolution_complete=True,
+    last_attempt_at=datetime(2026, 1, 2, tzinfo=UTC),
     observation=BrokenObserver() if error_type is not None else None,
   )
   await store.put_domain_after_resolve(command)
@@ -5833,12 +6373,12 @@ async def completed_metrics(client, *, mode, selected, previous_completed=0):
 
 @pytest.mark.e2e
 @pytest.mark.parametrize(
-  ('classic', 'doh', 'outcome', 'admitted'),
+  ('classic', 'doh', 'outcome', 'adds_address'),
   [
-    ('positive', 'positive', 'success', 1),
-    ('positive', 'servfail', 'partial', 1),
-    ('nodata', 'servfail', 'partial', 0),
-    ('servfail', 'servfail', 'failure', 0),
+    ('positive', 'positive', 'success', True),
+    ('positive', 'servfail', 'partial', True),
+    ('nodata', 'servfail', 'partial', False),
+    ('servfail', 'servfail', 'failure', False),
   ],
 )
 async def test_public_metrics_separate_processing_admission_and_real_persistence(
@@ -5846,26 +6386,44 @@ async def test_public_metrics_separate_processing_admission_and_real_persistence
   classic,
   doh,
   outcome,
-  admitted,
+  adds_address,
 ):
+  """Count one persisted saving attempt for terminal success, partial-empty and failed DNS.
+
+  e2e_service owns the real app and local classic/DoH providers. classic/doh select
+  wire evidence, outcome is its processing classification and adds_address states
+  independently whether positive DNS authorizes new IP evidence. Zero new IPs
+  still confirms a source result and contributes a positive saved rate.
+  """
+  # service and domain_id identify the real process and stored source domain.
   service = e2e_service
   domain_id = await configure_public_domain(service)
+  # before retains successful-checkpoint and IP metadata independently of the new attempt marker.
   before = public_flow_snapshot(service, domain_id)
   service.providers.classic, service.providers.doh = classic, doh
+  # client bounds HTTP calls; response acknowledges the real stored saving request.
   async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
     response = await client.post(f'/domains/{domain_id}/resolve')
     assert response.status_code == 202
+    # samples holds public Prometheus values; fields is the settled stored-run measurement.
     samples, fields = await completed_metrics(client, mode='stored', selected=1)
     assert fields['attempted'] == fields[outcome] == 1
     assert fields['success'] + fields['partial'] + fields['failure'] == 1
-    assert fields['admitted'] == fields['confirmed'] == admitted
+    assert fields['admitted'] == fields['confirmed'] == 1
     assert fields['pending'] == fields['unknown'] == fields['known_not_committed'] == 0
     assert fields['processing_rate_valid'] == fields['saved_rate_valid'] == 1
     assert fields['processing_elapsed'] > 0
     assert fields['persistence_elapsed'] >= fields['processing_elapsed']
     assert fields['processing_rate'] > 0
-    assert (fields['saved_rate'] > 0) is bool(admitted)
+    assert fields['saved_rate'] > 0
+    # saved is the actual public stored date pair, independent of the metric acknowledgement.
+    saved = (await client.get(f'/domains/{domain_id}')).json()
+    assert isinstance(saved['last_attempt_at'], (float, int))
+    assert (
+      datetime.fromisoformat(saved['last_attempt_at_hum']).strftime('%Y-%m-%d %H:%M:%S') == saved['last_attempt_at_hum']
+    )
     assert sample_total(samples, 'resolution_dns_duration_seconds_count', record_type='A') == 2
+    # kind is one configured wire outcome whose failure requires the existing CNAME fallback.
     assert sample_total(samples, 'resolution_dns_duration_seconds_count', record_type='CNAME') == sum(
       kind == 'servfail' for kind in (classic, doh)
     )
@@ -5873,19 +6431,22 @@ async def test_public_metrics_separate_processing_admission_and_real_persistence
     assert sample_total(samples, 'httpx_exchanges_started_total') == sample_total(
       samples, 'httpx_exchanges_terminal_total'
     )
+    # dns_samples retains only DNS metrics; name/labels/value are each public sample's coordinates and count.
     dns_samples = {
       (name, labels): value for (name, labels), value in samples.items() if name.startswith('resolution_dns_')
     }
     assert 'www.example.test' not in repr(dns_samples)
     assert service.dns_host not in repr(dns_samples)
     assert service.doh_url not in repr(dns_samples)
+  # after is durable checkpoint/IP state; marker admission does not itself authorize IP changes.
   after = public_flow_snapshot(service, domain_id)
-  if not admitted:
+  if not adds_address:
     assert after == before
   else:
     assert '8.8.8.8' in after[1]
     assert ('9.9.9.9' in after[1]) is (outcome == 'partial')
   # This must be the application process, not the pytest coordinator.
+  # resources is operating-system evidence for the actual child process, rather than the pytest runner.
   resources = service.resource_snapshot(application_pid(samples))
   assert resources['pid'] == application_pid(samples)
   assert resources['pid'] != os.getpid()
@@ -8171,24 +8732,53 @@ def load_assert_source_budget(measurement, configuration):
 async def test_resolution_load_source_deadline_includes_admission_selection_and_retires_tasks(
   monkeypatch, delayed_stage
 ):
-  """Time spent before source selection cannot be granted again to persistence."""
+  """Exhaust the source budget before persistence, preserving timeout and cleanup.
+
+  monkeypatch confines the controlled clock and HTTP transport to this test.
+  delayed_stage chooses whether admission or selection consumes the budget.
+  The next persistence poll is forbidden even if cancellation cleanup takes time.
+  """
+  # loop supplies a real monotonic base; clock advances only the helper's view of time.
   loop = asyncio.get_running_loop()
+  clock = SimpleNamespace(value=loop.time())
+  # selected records frozen source membership; completed marks a forbidden later poll.
   selected, completed = asyncio.Event(), asyncio.Event()
+  # pending retains both probe tasks; retired records their cancellation cleanup.
   pending, retired = set(), set()
-  timers = []
+  # probes_ready prevents the first persistence response from racing probe startup.
+  probes_ready = asyncio.Event()
+  # started distinguishes the initial scrape; source_scrapes counts subsequent source polls.
   started = False
+  source_scrapes = 0
 
   async def request(request):
-    nonlocal started
+    """Serve synthetic request routes and consume time at the selected HTTP boundary.
+
+    request contains the HTTP method and URL. Probe requests remain pending until
+    cancellation, then fail during cleanup to challenge first-error preservation.
+    The selected phase consumes 31 virtual seconds against the 30-second budget.
+    """
+    nonlocal started, source_scrapes
+    # route identifies admission, metrics, or one of the independent API probes.
     route = (request.method, request.url.path)
     if route == ('POST', '/commands/domains/resolve/stale'):
       started = True
-      timers.extend([loop.call_later(0.1, selected.set), loop.call_later(0.2, completed.set)])
       if delayed_stage == 'admission':
-        await selected.wait()
+        clock.value += 31
+        selected.set()
     if route == ('GET', '/metrics'):
-      if started and delayed_stage == 'selection':
-        await selected.wait()
+      if started:
+        if not selected.is_set():
+          assert delayed_stage == 'selection'
+          clock.value += 31
+          selected.set()
+        source_scrapes += 1
+        if source_scrapes >= 2:
+          await probes_ready.wait()
+        if source_scrapes >= 3:
+          completed.set()
+          raise AssertionError('Persistence received a renewed deadline')
+      # fields exposes selection but withholds persistence completion for the first idle poll.
       fields = {
         'selected': int(selected.is_set()),
         'processing_complete': int(completed.is_set()),
@@ -8208,49 +8798,73 @@ async def test_resolution_load_source_deadline_includes_admission_selection_and_
           [
             'fastapi_app_info{pid="7"} 1',
             f'resolution_run_elapsed_seconds_count{{mode="stale"}} {int(completed.is_set())}',
+            # key names a run field; value is its synthetic metric value.
             *(f'resolution_run_snapshot{{mode="stale",field="{key}"}} {value}' for key, value in fields.items()),
           ]
         ),
       )
     if route in {('GET', '/domains/2'), ('POST', '/domains')}:
+      # task is one probe whose retirement must precede the helper's return.
       task = asyncio.current_task()
       pending.add(task)
+      if len(pending) == 2:
+        probes_ready.set()
       try:
         await asyncio.Event().wait()
+      except asyncio.CancelledError:
+        raise ValueError('Probe failed during cancellation cleanup') from None
       finally:
         retired.add(task)
     return httpx.Response(200, json={})
 
+  # real_client retains HTTPX construction; transport confines all requests to the fake above.
   real_client = httpx.AsyncClient
   transport = httpx.MockTransport(request)
+  # The client factory forwards kwargs unchanged while injecting the isolated transport.
   monkeypatch.setattr(httpx, 'AsyncClient', lambda **kwargs: real_client(transport=transport, **kwargs))
+  # module owns the helper's asyncio binding; clocked_asyncio delegates all real asyncio operations.
+  module = sys.modules[__name__]
+  clocked_asyncio = SimpleNamespace(**vars(asyncio))
+  # The time callback exposes controlled monotonic seconds; get_running_loop returns only that clock view.
+  clock.time = lambda: clock.value
+  clocked_asyncio.get_running_loop = lambda: clock
+  monkeypatch.setattr(module, 'asyncio', clocked_asyncio)
+  # service reports constant synthetic resources; its callback accepts the observed pid without OS access.
   service = SimpleNamespace(
     url='http://deadline.test',
     resource_snapshot=lambda pid: {'rss_bytes': 1, 'peak_rss_bytes': 1, 'cpu_seconds': 0, 'source': 'controlled OS'},
   )
+  # measurement retains the helper's source failure and API verdict after cleanup.
   measurement = {}
-  try:
-    async with asyncio.timeout(1):
-      with pytest.raises(TimeoutError):
-        await load_measure_pass(
-          service,
-          SimpleNamespace(count=1),
-          {'pass_timeout': 0.15, 'probe_interval': 1, 'rss_limit_mb': 1, 'cpu_percent_limit': 100},
-          {'read': 5, 'list': 5, 'stats': 5, 'job': 5, 'write': 5},
-          mode='stale',
-          measurement=measurement,
-        )
-    assert selected.is_set()
-    assert not completed.is_set()
-    assert measurement['source_pass_status'] == 'failed'
-    assert measurement['source_failure']['type'] == 'TimeoutError'
-    assert measurement.get('api_status') != 'passed'
-    assert len(pending) == 2
-    assert retired == pending
-    assert all(task.done() for task in pending)
-  finally:
-    for timer in timers:
-      timer.cancel()
+  async with asyncio.timeout(1):
+    with pytest.raises(TimeoutError):
+      await load_measure_pass(
+        service,
+        SimpleNamespace(count=1),
+        {
+          'pass_timeout': 30,
+          'probe_interval': 1,
+          'metrics_poll_interval': 0,
+          'rss_limit_mb': 1,
+          'cpu_percent_limit': 100,
+        },
+        {'read': 5, 'list': 5, 'stats': 5, 'job': 5, 'write': 5},
+        mode='stale',
+        measurement=measurement,
+      )
+  assert selected.is_set()
+  assert source_scrapes == 2
+  assert not completed.is_set()
+  assert measurement['source_budget_seconds'] == 30
+  assert measurement['source_pass_status'] == 'failed'
+  assert measurement['source_failure']['type'] == 'TimeoutError'
+  assert measurement.get('api_status') != 'passed'
+  assert len(pending) == 2
+  assert retired == pending
+  # task ranges over the retained probes, including cleanup failures already gathered by the helper.
+  assert all(task.done() for task in pending)
+  assert all(isinstance(task.exception(), ValueError) for task in pending)
+  assert {task.exception().args for task in pending} == {('Probe failed during cancellation cleanup',)}
 
 
 async def load_measure_pass(
@@ -9100,14 +9714,32 @@ async def test_api_diagnostic_metrics_observation_is_separate_and_has_no_payload
   assert 'private metric labels' not in json.dumps(recorder.evidence)
 
 
-@pytest.mark.parametrize('outcome', ['success', 'status', 'network', 'read', 'cancel'])
+@pytest.mark.parametrize(
+  'outcome',
+  ['success', 'extra_poll', 'status', 'network', 'read', 'cancel'],
+  ids=['success', 'extra-poll-success', 'status', 'network', 'read', 'cancel'],
+)
 async def test_api_diagnostic_idle_metrics_polls_concurrently_and_retires_siblings(monkeypatch, outcome):
-  """Idle scrapes are read-only, fail promptly, and cannot outlive the idle observer."""
+  """Check concurrent read-only scrapes, primary failures, and retirement of both idle tasks.
+
+  outcome selects normal success, success with an extra in-flight poll, a metric
+  status/network failure, a read failure, or external cancellation. monkeypatch
+  replaces only this module's perf_counter so one completed read cycle ends the
+  synthetic idle window; asyncio's scheduling and timeout clocks remain real.
+  """
+  # clock holds synthetic elapsed seconds until the final read advances the idle deadline.
   clock = [0.0]
+  # read_started signals an in-flight health read; poll_started signals the first concurrent scrape.
   read_started, poll_started = asyncio.Event(), asyncio.Event()
+  # extra_poll_started releases the held health read only after a second idle poll begins.
+  extra_poll_started = asyncio.Event()
+  # requests captures HTTP methods/paths; tasks retains the reader/poller for cleanup assertions.
   requests, tasks = [], {}
+  # metric_requests counts every scrape, including the mandatory before/after observations.
   metric_requests = 0
+  # primary must escape unchanged even if cancelling its sibling raises another error.
   primary = httpx.ReadError('synthetic idle failure')
+  # metrics reports both modes fully drained; mode selects each job and key its drain field.
   metrics = '\n'.join(
     [f'resolution_run_elapsed_seconds_count{{mode="{mode}"}} 0' for mode in ('new', 'stale')]
     + [
@@ -9118,6 +9750,11 @@ async def test_api_diagnostic_idle_metrics_polls_concurrently_and_retires_siblin
   )
 
   async def request(request):
+    """Serve request through the mock transport, synchronizing reads and metric failures.
+
+    The captured outcome controls the response/error. In the extra-poll case,
+    /health stays in flight until the same poller issues a second idle scrape.
+    """
     nonlocal metric_requests
     requests.append((request.method, request.url.path))
     if request.url.path == '/metrics':
@@ -9136,11 +9773,17 @@ async def test_api_diagnostic_idle_metrics_polls_concurrently_and_retires_siblin
           finally:
             if outcome == 'read':
               raise ValueError('secondary poller cleanup error')
+      if metric_requests == 3 and outcome == 'extra_poll':
+        assert asyncio.current_task() is tasks['poller']
+        assert not tasks['reader'].done()
+        extra_poll_started.set()
       return httpx.Response(200, text=metrics)
     if request.url.path == '/health':
       tasks['reader'] = asyncio.current_task()
       read_started.set()
       await poll_started.wait()
+      if outcome == 'extra_poll':
+        await extra_poll_started.wait()
       if outcome == 'read':
         raise primary
       if outcome in {'network', 'status', 'cancel'}:
@@ -9149,8 +9792,11 @@ async def test_api_diagnostic_idle_metrics_polls_concurrently_and_retires_siblin
       clock[0] = 1
     return httpx.Response(200, json={})
 
+  # The clock callback reads test-local time without changing asyncio's real timeout clock.
   monkeypatch.setattr(sys.modules[__name__], 'perf_counter', lambda: clock[0])
+  # recorder separates API latency samples from optional metric evidence.
   recorder = ApiDiagnosticRecorder()
+  # configuration bounds the observer and retains its real metric polling interval.
   configuration = {
     'pass_timeout': 1,
     'idle_seconds': 0.2,
@@ -9158,6 +9804,7 @@ async def test_api_diagnostic_idle_metrics_polls_concurrently_and_retires_siblin
     'metrics_poll_interval': 0.05,
     'idle_metrics_polling': True,
   }
+  # client confines exchanges to request; observer owns the real idle helper and its child tasks.
   async with httpx.AsyncClient(base_url='http://test', transport=httpx.MockTransport(request)) as client:
     observer = asyncio.create_task(api_diagnostic_idle(client, SimpleNamespace(count=2), configuration, recorder))
     try:
@@ -9165,9 +9812,10 @@ async def test_api_diagnostic_idle_metrics_polls_concurrently_and_retires_siblin
         await poll_started.wait()
         if outcome == 'cancel':
           observer.cancel('cancel idle observer')
-        if outcome == 'success':
+        if outcome in {'success', 'extra_poll'}:
           await observer
         else:
+          # expected is the public failure type; caught retains its original exception for identity checks.
           expected = (
             asyncio.CancelledError
             if outcome == 'cancel'
@@ -9182,13 +9830,28 @@ async def test_api_diagnostic_idle_metrics_polls_concurrently_and_retires_siblin
           if outcome == 'cancel':
             assert caught.value.args == ('cancel idle observer',)
       assert set(tasks) == {'reader', 'poller'}
+      # task iterates the retained sibling handles, which must both be retired before returning.
       assert all(task.done() for task in tasks.values())
+      # method is each captured verb; _ discards its path while checking every exchange is read-only.
       assert all(method == 'GET' for method, _ in requests)
       assert 'metrics' not in recorder.observations
-      if outcome == 'success':
-        assert metric_requests == 3
+      # scrapes retains every completed or failed metric exchange; row iterates the evidence entries.
+      scrapes = recorder.evidence['metrics_scrapes']
+      assert metric_requests == len(scrapes)
+      assert all(row['path'] != '/metrics' for row in recorder.observations.requests)
+      if outcome in {'success', 'extra_poll'}:
+        # scopes records observation phases in request order; only idle_poll may repeat.
+        scopes = [row['scope'] for row in scrapes]
+        assert scopes.count('idle_before') == scopes.count('idle_after') == 1
+        assert scopes[0] == 'idle_before'
+        assert scopes[-1] == 'idle_after'
+        assert len(scopes[1:-1]) >= 1
+        assert set(scopes[1:-1]) == {'idle_poll'}
+        if outcome == 'extra_poll':
+          assert extra_poll_started.is_set()
+          assert scopes.count('idle_poll') >= 2
         assert recorder.evidence['idle_drained_modes_after'] == recorder.evidence['idle_drained_modes_before']
-        assert all(row['status_code'] == 200 for row in recorder.evidence['metrics_scrapes'])
+        assert all(row['status_code'] == 200 and row['error_type'] is None for row in scrapes)
     finally:
       observer.cancel()
       await asyncio.gather(observer, return_exceptions=True)
@@ -9408,32 +10071,51 @@ async def test_api_diagnostic_independent_probe_retires_on_every_observer_exit(t
 
 
 @pytest.mark.parametrize('initial_blocker', ['unknown', 'missing'])
-async def test_api_diagnostic_idle_waits_for_verified_drain_and_never_triggers_jobs(initial_blocker):
+async def test_api_diagnostic_idle_waits_for_verified_drain_and_never_triggers_jobs(initial_blocker, monkeypatch):
+  """Wait for verified drain before exactly one deterministic, read-only idle sampling cycle.
+
+  initial_blocker chooses an unknown count or a missing metric during the first
+  scrape. monkeypatch controls only this test module's monotonic clock, keeping
+  task scheduling from exhausting the synthetic idle window before reads start.
+  """
+  # calls records methods/paths; polls counts before/after metric scrapes.
   calls = []
   polls = 0
+  # clock.value is elapsed synthetic seconds; clock.reads counts produced non-metrics responses.
+  clock = SimpleNamespace(value=0.0, reads=0)
+  # The clock callback returns unchanged time until the sixth mocked read response is produced.
+  monkeypatch.setattr(sys.modules[__name__], 'perf_counter', lambda: clock.value)
 
   async def exchange(request):
+    """Return synthetic metrics for request or one read response, advancing time only after six reads."""
     nonlocal polls
     calls.append((request.method, request.url.path))
     if request.url.path == '/metrics':
       polls += 1
+      # lines is the public metric body; mode/key enumerate the required drain facts.
       lines = []
       for mode in ('new', 'stale'):
         for key in ('active', 'pending', 'admission_in_progress', 'unknown'):
           if polls == 1 and key == 'unknown' and initial_blocker == 'missing':
             continue
+          # value keeps the first scrape blocked and makes the second/final scrapes fully drained.
           value = int(polls == 1 and key == 'unknown')
           lines.append(f'resolution_run_snapshot{{mode="{mode}",field="{key}"}} {value}')
       return httpx.Response(200, text='\n'.join(lines))
     assert polls >= 2, 'Read sampling began before verified drain'
+    clock.reads += 1
+    if clock.reads == 6:
+      clock.value = 0.002
     return httpx.Response(200, json={})
 
+  # recorder collects observed endpoint labels; client preserves the real HTTPX request/response boundary.
   recorder = ApiDiagnosticRecorder()
   async with httpx.AsyncClient(transport=httpx.MockTransport(exchange), base_url='http://test') as client:
     await api_diagnostic_idle(
       client, SimpleNamespace(count=6), {'pass_timeout': 1, 'idle_seconds': 0.001, 'probe_interval': 0.001}, recorder
     )
   assert polls == 3
+  # method and path are captured request coordinates; all requests must remain read-only.
   assert all(method == 'GET' for method, path in calls)
   assert set(recorder.observations) == {'health', 'read', 'list', 'stats', 'ip_lists', 'ip_list'}
   assert len(recorder.observations.requests) == 6
@@ -10350,6 +11032,383 @@ def test_batch_comparison_startup_profile_preserves_fixed_workload_and_historica
     'DB_SAVE_BATCH_TIMEOUT': '0.1',
     'DOMAINS_UPDATE_INTERVAL': '0',
   }
+
+
+@pytest.fixture
+async def startup_boundary(tmp_path, monkeypatch, pytestconfig):
+  """Control child exit, health sockets and deadline delivery around the real startup method.
+
+  tmp_path owns the harness log; monkeypatch restores OS-boundary adapters; pytestconfig
+  locates the already loaded conftest plugin without importing application globals.
+  No application process, database or provider connection is started by this fixture.
+  """
+  # root identifies this checkout; plugin supplies the actual ServiceProcess harness.
+  root = Path(__file__).resolve().parents[2]
+  plugin = pytestconfig.pluginmanager.get_plugin(str(root / 'tests/conftest.py'))
+  assert plugin is not None
+  # loop runs the harness; original_timeout retains the real cancellable timeout manager.
+  loop = asyncio.get_running_loop()
+  original_timeout = asyncio.timeout
+  # exited wakes process.wait; health_entered identifies the first attempted socket connection.
+  exited = asyncio.Event()
+  health_entered = asyncio.Event()
+  # boundary groups the controls and observations for this single startup:
+  # child holds the OS-observed returncode, wait, kill and stdin adapters; service is the real harness.
+  # hold_connect blocks connection completion; exit_during_response publishes exit before response consumption.
+  # receive_count selects response bytes then EOF; deadlines holds outer Timeout managers.
+  # timeout_delays records requested seconds; sockets records health sockets for closure checks.
+  # health_tasks and child_waits record their owning tasks; cleanup_requests records stdin/kill actions.
+  # health_entered publishes the first connect attempt; publish_exit below exposes the child-exit control.
+  # spawn records interpreter inputs; real_spawn retains the OS adapter for isolated bootstrap checks.
+  boundary = SimpleNamespace(
+    child=SimpleNamespace(returncode=None),
+    service=plugin.ServiceProcess(root, tmp_path, {'APP_PORT': '1'}),
+    hold_connect=False,
+    exit_during_response=False,
+    receive_count=0,
+    deadlines=[],
+    timeout_delays=[],
+    sockets=[],
+    health_tasks=[],
+    child_waits=[],
+    cleanup_requests=[],
+    health_entered=health_entered,
+    spawn=AsyncMock(),
+    real_spawn=asyncio.create_subprocess_exec,
+  )
+
+  def publish_exit(code):
+    """Expose code as the child's OS-observed return code and wake every exit waiter."""
+    boundary.child.returncode = code
+    exited.set()
+
+  async def wait_child():
+    """Return the child's observed exit code after its explicit exit event."""
+    boundary.child_waits.append(asyncio.current_task())
+    await exited.wait()
+    return boundary.child.returncode
+
+  def request_shutdown(data):
+    """Record data written to child stdin and make a live child exit during cleanup."""
+    boundary.cleanup_requests.append(data)
+    if boundary.child.returncode is None:
+      publish_exit(0)
+
+  def kill_child():
+    """Represent the OS kill boundary if graceful cleanup unexpectedly falls back to it."""
+    boundary.cleanup_requests.append('kill')
+    publish_exit(-9)
+
+  async def connect_health(connection, address):
+    """Observe connection and address without opening a network connection.
+
+    When hold_connect is selected, cancellation is the only way to finish the operation.
+    """
+    assert address == ('127.0.0.1', 1)
+    boundary.sockets.append(connection)
+    boundary.health_tasks.append(asyncio.current_task())
+    health_entered.set()
+    if boundary.hold_connect:
+      await asyncio.Future()
+
+  async def receive_health(connection, maximum):
+    """Supply a valid HTTP response, optionally publishing child exit before its first byte.
+
+    connection must be the socket opened by health_ready; maximum is its bounded read size.
+    """
+    assert connection in boundary.sockets
+    assert 0 < maximum <= 4097
+    boundary.receive_count += 1
+    if boundary.receive_count == 1:
+      if boundary.exit_during_response:
+        publish_exit(3)
+      return b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'
+    return b''
+
+  def capture_timeout(delay):
+    """Preserve delay and capture only the real outer startup deadline for manual delivery."""
+    # manager owns the actual asyncio cancellation semantics, including expiry conversion.
+    manager = original_timeout(delay)
+    boundary.timeout_delays.append(delay)
+    if delay == 15:
+      boundary.deadlines.append(manager)
+    return manager
+
+  boundary.publish_exit = publish_exit
+  boundary.child.wait = wait_child
+  boundary.child.kill = kill_child
+  boundary.child.stdin = SimpleNamespace(
+    write=request_shutdown,
+    drain=AsyncMock(),
+    close=Mock(),
+    wait_closed=AsyncMock(),
+  )
+  boundary.spawn.return_value = boundary.child
+  monkeypatch.setattr(asyncio, 'create_subprocess_exec', boundary.spawn)
+  monkeypatch.setattr(asyncio, 'timeout', capture_timeout)
+  monkeypatch.setattr(loop, 'sock_connect', connect_health)
+  monkeypatch.setattr(loop, 'sock_sendall', AsyncMock())
+  monkeypatch.setattr(loop, 'sock_recv', receive_health)
+  try:
+    yield boundary
+  finally:
+    await boundary.service.stop(allow_failure=True)
+
+
+def assert_startup_resources_collected(boundary):
+  """Check that boundary's completed startup left no process, log, socket or waiter behind."""
+  assert boundary.service.process is None
+  assert boundary.service.log is None
+  # connection is each health socket; task is each child or health operation observed at its OS boundary.
+  assert all(connection.fileno() == -1 for connection in boundary.sockets)
+  assert all(task.done() for task in boundary.child_waits + boundary.health_tasks)
+
+
+@pytest.mark.parametrize('measured', [True, False], ids=['coverage-requested', 'unmeasured'])
+async def test_process_startup_gives_child_private_environment_without_coverage_autostart(startup_boundary, measured):
+  """Only the explicit bootstrap may start child coverage; caller settings remain reusable.
+
+  startup_boundary observes the real start method at the OS spawn boundary. measured
+  selects whether the caller requests subprocess coverage through its original config path.
+  """
+  # boundary supplies the controlled child and records the exact spawn environment.
+  boundary = startup_boundary
+  boundary.service.environment.update(
+    COVERAGE_FILE='owned-branch-fragments',
+    PYTHONPATH='owned-source-root',
+    TEST_SOURCE_EVIDENCE='owned-source-evidence.json',
+    DB_SHUTDOWN_TIMEOUT='20',
+  )
+  if measured:
+    boundary.service.environment['COVERAGE_PROCESS_START'] = 'owned-coverage-config.toml'
+  # original retains all caller inputs so removal or rewriting cannot be hidden by aliasing.
+  original = dict(boundary.service.environment)
+  await boundary.service.start()
+  # spawned is the mapping Python receives before .pth startup hooks can run.
+  spawned = boundary.spawn.await_args.kwargs['env']
+  assert 'COVERAGE_PROCESS_START' not in spawned
+  assert boundary.service.environment == original
+  # expected preserves every unrelated setting while assigning coverage solely to the bootstrap.
+  expected = dict(original)
+  if measured:
+    expected['TEST_COVERAGE_CONFIG'] = expected.pop('COVERAGE_PROCESS_START')
+  assert spawned == expected
+  assert boundary.service.startup_attempts[-1]['status'] == 'ready'
+  assert boundary.timeout_delays[:2] == [15, 0.5]
+
+
+@pytest.mark.parametrize('measured', [True, False], ids=['branch-coverage', 'unmeasured'])
+async def test_process_startup_bootstrap_has_one_coverage_lifetime(startup_boundary, measured):
+  """A real interpreter must have no automatic owner before or after explicit measurement.
+
+  startup_boundary captures the actual bootstrap and spawn environment. measured selects
+  explicit branch measurement of a tiny test-owned entrypoint, with fragments separated
+  from application coverage. The real interpreter executes .pth hooks and bootstrap cleanup.
+  This checks harness instrumentation, not application startup or business behavior.
+  """
+  # boundary supplies the real bootstrap without opening application sockets or databases.
+  boundary = startup_boundary
+  # directory owns the synthetic entrypoint and lifecycle reports for this one child.
+  directory = boundary.service.directory
+  # coverage_root is the configured artifact area; synthetic data must never enter pytest-cov's combined file.
+  coverage_root = boundary.service.root / '.pytest_cache' / 'coverage'
+  coverage_root.mkdir(parents=True, exist_ok=True)
+  # coverage_temporary owns a unique directory across workers and runs, removed only after handles close.
+  with TemporaryDirectory(prefix='bootstrap-lifecycle-', dir=coverage_root) as coverage_temporary:
+    # coverage_directory holds only this diagnostic's configuration and suffixed measurement data.
+    coverage_directory = Path(coverage_temporary)
+    # config requests branches with the default measurement core; fragment_base is this child's data prefix.
+    config = coverage_directory / 'coverage.ini'
+    fragment_base = coverage_directory / '.coverage'
+    # main is the only measured file, so this diagnostic cannot contribute application coverage.
+    main = directory / 'main.py'
+    config.write_text(f'[run]\nbranch = true\ninclude = {main.as_posix()}\n', encoding='utf-8')
+    # program reports the active owner and executes both outcomes of a known synthetic branch.
+    program = (
+      'import json\n'
+      'from pathlib import Path\n'
+      'from coverage import Coverage\n'
+      '# active is the explicit owner visible while the entrypoint runs.\n'
+      'active = Coverage.current()\n'
+      '# observed records whether branch measurement is enabled for that owner.\n'
+      'observed = {"active": active is not None, "branch": active.get_option("run:branch") if active else None}\n'
+      'Path("coverage-during.json").write_text(json.dumps(observed), encoding="utf-8")\n'
+      '# selected exercises each outcome; result records the selected branch value.\n'
+      'for selected in (True, False):\n'
+      '  if selected:\n'
+      '    result = 1\n'
+      '  else:\n'
+      '    result = 2\n'
+      'assert result == 2\n'
+    )
+    main.write_text(program, encoding='utf-8')
+    boundary.service.root = directory
+    # system_key names each safe Windows bootstrap setting, matching the real service fixture's allowlist.
+    boundary.service.environment.update(
+      {
+        system_key: os.environ[system_key]
+        for system_key in ('SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP')
+        if system_key in os.environ
+      }
+    )
+    boundary.service.environment['COVERAGE_FILE'] = str(fragment_base)
+    if measured:
+      boundary.service.environment['COVERAGE_PROCESS_START'] = str(config)
+    await boundary.service.start()
+    # invocation preserves the actual bootstrap and private environment handed to the spawn adapter.
+    invocation = boundary.spawn.await_args
+    await boundary.service.stop()
+    # probe observes ownership after .pth execution and at exit, without changing coverage lifecycle calls.
+    probe = (
+      'import atexit, coverage as probe_coverage, json\n'
+      'from pathlib import Path\n'
+      '# probe_before records an owner started by interpreter hooks before the bootstrap.\n'
+      'probe_before = probe_coverage.Coverage.current() is not None\n'
+      'def probe_finish():\n'
+      '  """Report whether bootstrap cleanup left or resumed a measurement owner."""\n'
+      '  Path("coverage-after.json").write_text(json.dumps({"before": probe_before, '
+      '"after": probe_coverage.Coverage.current() is not None}), encoding="utf-8")\n'
+      'atexit.register(probe_finish)\n'
+    )
+    # child executes the exact captured bootstrap plus read-only observations in a real interpreter.
+    child = await boundary.real_spawn(
+      invocation.args[0],
+      '-B',
+      '-c',
+      probe + invocation.args[3],
+      str(main),
+      cwd=directory,
+      env=invocation.kwargs['env'],
+      stdin=asyncio.subprocess.PIPE,
+      stdout=asyncio.subprocess.PIPE,
+      stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+      # output retains diagnostics; read stdout directly because communicate would close the shutdown pipe.
+      assert child.stdout is not None
+      output = await asyncio.wait_for(child.stdout.read(), timeout=10)
+      await asyncio.wait_for(child.wait(), timeout=5)
+      assert child.returncode == 0, output.decode('utf-8', errors='replace')
+    finally:
+      if child.returncode is None:
+        child.kill()
+        await asyncio.wait_for(child.wait(), timeout=5)
+      if child.stdin is not None:
+        child.stdin.close()
+        await child.stdin.wait_closed()
+    assert json.loads((directory / 'coverage-after.json').read_text(encoding='utf-8')) == {
+      'before': False,
+      'after': False,
+    }
+    assert json.loads((directory / 'coverage-during.json').read_text(encoding='utf-8')) == {
+      'active': measured,
+      'branch': True if measured else None,
+    }
+    # fragments are the saved suffixed data files from this bootstrap alone.
+    fragments = list(coverage_directory.glob('.coverage.*'))
+    if measured:
+      assert len(fragments) == 1
+      # data opens that isolated fragment; branch_line is the synthetic conditional's source position.
+      data = importlib.import_module('coverage').CoverageData(basename=str(fragments[0]))
+      data.read()
+      branch_line = program.splitlines().index('  if selected:') + 1
+      try:
+        assert data.has_arcs()
+        assert data.measured_files() == {str(main)}
+        assert {(branch_line, branch_line + 1), (branch_line, branch_line + 3)} <= set(data.arcs(str(main)))
+      finally:
+        data.close()
+    else:
+      assert fragments == []
+
+
+async def test_process_startup_rejects_health_response_after_observed_child_exit(startup_boundary):
+  """A valid health response cannot report readiness after the child has observably exited.
+
+  startup_boundary delivers the child's exit before the HTTP200 response is consumed.
+  """
+  # boundary selects the exit/response ordering; startup runs the actual harness in its own task.
+  boundary = startup_boundary
+  boundary.exit_during_response = True
+  startup = asyncio.create_task(boundary.service.start())
+  with pytest.raises(AssertionError, match='Application exited before readiness'):
+    await startup
+  assert boundary.service.startup_attempts[-1]['status'] == 'failed'
+  assert boundary.cleanup_requests == []
+  assert_startup_resources_collected(boundary)
+
+
+@pytest.mark.parametrize('exit_code', [3, None], ids=['exited-child', 'live-child'])
+async def test_process_startup_deadline_distinguishes_observed_exit_from_live_child(startup_boundary, exit_code):
+  """An exit observed before the deadline outranks timeout; a live child still times out.
+
+  startup_boundary holds a real health operation pending; exit_code selects whether the
+  OS has reported a child exit before the captured fifteen-second deadline is delivered.
+  """
+  # boundary controls the OS reports; startup is the pending real startup operation.
+  boundary = startup_boundary
+  boundary.hold_connect = True
+  startup = asyncio.create_task(boundary.service.start())
+  await asyncio.wait_for(boundary.health_entered.wait(), timeout=2)
+  assert boundary.timeout_delays == [15, 0.5]
+  if exit_code is not None:
+    boundary.publish_exit(exit_code)
+  boundary.deadlines[0].reschedule(asyncio.get_running_loop().time())
+  if exit_code is None:
+    with pytest.raises(TimeoutError):
+      await startup
+    assert boundary.cleanup_requests == [b'\n']
+  else:
+    with pytest.raises(AssertionError, match='Application exited before readiness'):
+      await startup
+    assert boundary.cleanup_requests == []
+  assert boundary.service.startup_attempts[-1]['status'] == 'failed'
+  assert_startup_resources_collected(boundary)
+
+
+@pytest.mark.parametrize('exit_code', [None, 3], ids=['live-child', 'exited-child'])
+async def test_process_startup_external_cancellation_remains_primary_and_collects_resources(
+  startup_boundary, exit_code
+):
+  """External cancellation remains cancellation while startup collects its child and socket.
+
+  startup_boundary keeps health pending; exit_code optionally publishes an exit before
+  caller cancellation, which must still propagate as the caller's CancelledError.
+  """
+  # boundary supplies a live child; startup is cancelled by its caller rather than a deadline.
+  boundary = startup_boundary
+  boundary.hold_connect = True
+  startup = asyncio.create_task(boundary.service.start())
+  await asyncio.wait_for(boundary.health_entered.wait(), timeout=2)
+  if exit_code is not None:
+    boundary.publish_exit(exit_code)
+  startup.cancel('caller cancelled startup')
+  with pytest.raises(asyncio.CancelledError, match='caller cancelled startup'):
+    await startup
+  assert boundary.service.startup_attempts[-1]['status'] == 'failed'
+  assert boundary.cleanup_requests == ([b'\n'] if exit_code is None else [])
+  assert_startup_resources_collected(boundary)
+
+
+async def test_process_startup_live_health_response_becomes_ready_and_collects_observers(startup_boundary):
+  """A live child with HTTP200 becomes ready and leaves no health or exit observer running.
+
+  startup_boundary supplies a complete response without exposing a child exit.
+  """
+  # boundary leaves the child live; startup completes through the real health parser.
+  boundary = startup_boundary
+  startup = asyncio.create_task(boundary.service.start())
+  await startup
+  assert boundary.child.returncode is None
+  assert boundary.service.process is boundary.child
+  assert boundary.service.startup_attempts[-1]['status'] == 'ready'
+  assert boundary.timeout_delays[:2] == [15, 0.5]
+  # connection is each socket consumed by health_ready; task is each temporary startup observer.
+  assert all(connection.fileno() == -1 for connection in boundary.sockets)
+  assert all(task.done() for task in boundary.child_waits + boundary.health_tasks)
+  await boundary.service.stop()
+  assert boundary.cleanup_requests == [b'\n']
+  assert_startup_resources_collected(boundary)
 
 
 @pytest.mark.e2e
@@ -12039,7 +13098,18 @@ async def test_router_put_has_no_hidden_native_connect_retries(app, monkeypatch)
 @pytest.mark.e2e
 @pytest.mark.parametrize('exhausted', [False, True])
 async def test_public_http_retries_preserve_resolution_persistence_and_logical_metrics(e2e_service, exhausted):
-  """Drive production wiring and writer against transient or exhausted wire-level failures."""
+  """Wire retry exhaustion remains a processing failure while its completed saving attempt commits.
+
+  Fixtures own isolated app/storage resources; scenario parameters select the input or failure boundary.
+  """
+  # service is the isolated real application and providers.
+  # domain_id is the stored source domain identity.
+  # before is the prior checkpoint and IP metadata.
+  # client is the bounded real HTTP client.
+  # response is the public stored-resolution acknowledgement.
+  # samples is public Prometheus samples.
+  # fields is processing and persistence counters for the completed run.
+  # after is durable checkpoint and IP metadata after the attempt.
   service = e2e_service
   await service.stop()
   service.environment.update(
@@ -12055,7 +13125,7 @@ async def test_public_http_retries_preserve_resolution_persistence_and_logical_m
     assert response.status_code == 202
     samples, fields = await completed_metrics(client, mode='stored', selected=1)
     assert fields['attempted'] == fields['failure' if exhausted else 'success'] == 1
-    assert fields['admitted'] == fields['confirmed'] == int(not exhausted)
+    assert fields['admitted'] == fields['confirmed'] == 1
     assert fields['pending'] == fields['unknown'] == 0
     assert sample_total(samples, 'httpx_exchanges_in_flight') == 0
     assert sample_total(samples, 'httpx_exchanges_started_total') == sample_total(
@@ -12079,21 +13149,38 @@ async def test_public_http_retries_preserve_resolution_persistence_and_logical_m
 @pytest.mark.e2e
 @pytest.mark.parametrize('e2e_service', [False], indirect=True)
 @pytest.mark.parametrize('slow_transport', ['classic', 'doh'])
-async def test_public_dns_deadline_keeps_stale_data_and_retry_checkpoint_then_recovers(e2e_service, slow_transport):
+@pytest.mark.parametrize('healthy_delay', [0.0, 0.25])
+async def test_public_dns_deadline_keeps_stale_data_and_retry_checkpoint_then_recovers(
+  e2e_service, slow_transport, healthy_delay
+):
+  """Keep healthy DNS evidence when the other transport fails, then recover completely.
+
+  e2e_service owns the isolated application and providers; slow_transport selects
+  the failing protocol. healthy_delay gives the healthy A answer its latency in
+  seconds, then applies that latency to the formerly failing transport on recovery.
+  """
+  # service owns the application process, temporary database and local provider controls.
   service = e2e_service
-  service.environment['DOH_OPERATION_TIMEOUT'] = '0.15'
-  service.environment['DNS_OPERATION_TIMEOUT'] = '0.15'
-  service.environment['DNS_TIMEOUT'] = '0.03'
-  service.environment['DNS_LIFETIME'] = '0.06'
+  # Only the failing transport gets a one-second operation budget. The normal
+  # classic timeout/lifetime (2/5 seconds) and DoH phase timeouts (2 seconds) stay
+  # longer so the outer deadline expires first, while recovery latency still fits.
+  service.environment['DNS_OPERATION_TIMEOUT' if slow_transport == 'classic' else 'DOH_OPERATION_TIMEOUT'] = '1'
   await service.start()
+  # domain_id identifies the seeded public domain; before_domain and before_ips retain
+  # its complete-resolution checkpoint and existing address identities/metadata.
   domain_id = await configure_public_domain(service)
   before_domain, before_ips = public_flow_snapshot(service, domain_id)
+  # healthy_transport receives the controlled A delay without changing the failing transport.
+  healthy_transport = 'doh' if slow_transport == 'classic' else 'classic'
+  service.providers.schedule[(healthy_transport, 'www.example.test', dns.rdatatype.A, service.providers.cycle)] = [
+    {'delay': healthy_delay}
+  ]
   service.providers.hold_dns = slow_transport == 'doh'
   service.providers.drop_classic = slow_transport == 'classic'
+  # client uses the public HTTP boundary; samples and fields expose the completed run.
   async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
     assert (await client.post(f'/domains/{domain_id}/resolve')).status_code == 202
-    async with asyncio.timeout(3):
-      samples, fields = await completed_metrics(client, mode='stored', selected=1)
+    samples, fields = await completed_metrics(client, mode='stored', selected=1)
     if slow_transport == 'doh':
       assert service.providers.dns_entered.is_set()
     assert fields['partial'] == fields['admitted'] == fields['confirmed'] == 1
@@ -12105,6 +13192,8 @@ async def test_public_dns_deadline_keeps_stale_data_and_retry_checkpoint_then_re
     assert (
       sample_total(samples, 'resolution_dns_duration_seconds_count', transport=slow_transport, outcome='cancelled') == 0
     )
+    # after_domain and after_ips expose durable state after each failed or recovered pass;
+    # address selects each retained address whose complete metadata must remain unchanged.
     after_domain, after_ips = public_flow_snapshot(service, domain_id)
     assert after_domain == before_domain
     assert {address: after_ips[address] for address in before_ips} == before_ips
@@ -12112,6 +13201,11 @@ async def test_public_dns_deadline_keeps_stale_data_and_retry_checkpoint_then_re
     service.providers.hold_dns = False
     service.providers.drop_classic = False
     service.providers.dns_release.set()
+    # Recovery applies the same healthy latency to the previously failing A transport.
+    service.providers.schedule[(slow_transport, 'www.example.test', dns.rdatatype.A, service.providers.cycle)] = [
+      {'delay': healthy_delay}
+    ]
+    # previous distinguishes the recovery run from the first completed metrics snapshot.
     previous = sample_total(samples, 'resolution_run_elapsed_seconds_count', mode='stored')
     assert (await client.post(f'/domains/{domain_id}/resolve')).status_code == 202
     samples, fields = await completed_metrics(client, mode='stored', selected=1, previous_completed=previous)
@@ -12121,6 +13215,83 @@ async def test_public_dns_deadline_keeps_stale_data_and_retry_checkpoint_then_re
     assert after_domain[1] != before_domain[1]
     assert set(after_ips) == {'8.8.8.8', '8.8.4.4', '2001:4860:4860::8888'}
     assert after_ips['2001:4860:4860::8888'] == before_ips['2001:4860:4860::8888']
+
+
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+async def test_doh_provider_hold_returns_dns_response_after_release(e2e_service):
+  """Release a live held DoH request and preserve its DNS wire response.
+
+  e2e_service starts only disposable protocol fakes; no application process runs.
+  """
+  # service exposes the local provider; query and encoded carry one real A wire query.
+  service = e2e_service
+  service.providers.hold_dns = True
+  query = dns.message.make_query('www.example.test', dns.rdatatype.A)
+  encoded = urlsafe_b64encode(query.to_wire()).decode('ascii').rstrip('=')
+  # client owns the real HTTPX connection; pending retains its cancellable request task.
+  async with httpx.AsyncClient(trust_env=False, timeout=10) as client:
+    pending = asyncio.create_task(
+      client.get(service.doh_url, params={'dns': encoded}, headers={'Accept': 'application/dns-message'})
+    )
+    try:
+      await asyncio.wait_for(service.providers.dns_entered.wait(), timeout=10)
+      assert service.providers.dns_active == 1
+      assert not pending.done()
+      assert not service.providers.dns_release.is_set()
+      service.providers.dns_release.set()
+      # response and answer are the HTTP and decoded DNS responses after explicit release.
+      response = await asyncio.wait_for(pending, timeout=10)
+      assert response.status_code == 200
+      assert response.headers['content-type'] == 'application/dns-message'
+      answer = dns.message.from_wire(response.content)
+      assert answer.id == query.id
+      assert answer.question == query.question
+      assert len(answer.answer) == 1
+      assert answer.answer[0].name == query.question[0].name
+      assert answer.answer[0].rdtype == dns.rdatatype.A
+      # record is each returned A value, checked against the fake's declared DoH address.
+      assert [record.to_text() for record in answer.answer[0]] == ['8.8.4.4']
+      assert service.providers.dns_active == 0
+      assert service.providers.errors == []
+    finally:
+      service.providers.dns_release.set()
+      pending.cancel()
+      await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+async def test_doh_provider_hold_retires_cancelled_client_without_release(e2e_service):
+  """Retire a held DoH exchange after client cancellation without a provider error.
+
+  e2e_service supplies local protocol fakes without starting the application.
+  The finite idle wait is a hang safeguard, not a provider latency requirement.
+  """
+  # service exposes the local provider; query and encoded carry one real A wire query.
+  service = e2e_service
+  service.providers.hold_dns = True
+  query = dns.message.make_query('www.example.test', dns.rdatatype.A)
+  encoded = urlsafe_b64encode(query.to_wire()).decode('ascii').rstrip('=')
+  # client owns the real HTTPX connection; pending retains the request until cancellation completes.
+  async with httpx.AsyncClient(trust_env=False, timeout=10) as client:
+    pending = asyncio.create_task(
+      client.get(service.doh_url, params={'dns': encoded}, headers={'Accept': 'application/dns-message'})
+    )
+    try:
+      await asyncio.wait_for(service.providers.dns_entered.wait(), timeout=10)
+      assert service.providers.dns_active == 1
+      assert not service.providers.dns_release.is_set()
+      pending.cancel()
+      with pytest.raises(asyncio.CancelledError):
+        await pending
+      async with asyncio.timeout(10):
+        while service.providers.dns_active:
+          await asyncio.sleep(0.01)
+      assert not service.providers.dns_release.is_set()
+      assert service.providers.errors == []
+    finally:
+      service.providers.dns_release.set()
+      pending.cancel()
+      await asyncio.gather(pending, return_exceptions=True)
 
 
 @pytest.mark.e2e
@@ -12287,3 +13458,489 @@ async def test_ripe_operation_deadline_includes_real_http_pool_wait_and_allows_r
       writer.close()
     if handlers:
       await asyncio.wait_for(asyncio.gather(*tuple(handlers)), timeout=2)
+
+
+async def attempt_state(app, store, domain_id=1):
+  """Read typed attempt, checkpoint and update dates for domain_id in isolated store.
+
+  app supplies mapped columns; this query is independent of API serialization.
+  """
+  # connection owns the read transaction until the three date fields are copied.
+  async with store._DataBase__read_engine.connect() as connection:
+    return (
+      await connection.execute(
+        select(
+          app.database.DomainsDbo.last_attempt_at,
+          app.database.DomainsDbo.last_resolved_at,
+          app.database.DomainsDbo.updated_at,
+        ).where(app.database.DomainsDbo.id == domain_id)
+      )
+    ).one()
+
+
+@pytest.mark.parametrize('complete', [False, True])
+async def test_attempt_marker_and_ips_roll_back_together_on_timestamp_failure(app, store, monkeypatch, complete):
+  """Rejecting the attempt UPDATE rolls back IP changes and never confirms its receipt.
+
+  app/store own disposable real SQLite; monkeypatch selects one command per batch,
+  and complete covers both additive partial and authoritative complete evidence.
+  """
+  await seed(app, store, checkpoint=STALE_CHECKPOINT)
+  # before and dates preserve independent IP/checkpoint and timestamp rollback oracles.
+  before = await snapshot(app, store)
+  dates = await attempt_state(app, store)
+  # connection installs a fault only in the disposable test database.
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      text(
+        'CREATE TRIGGER refuse_attempt BEFORE UPDATE OF last_attempt_at ON rdpr_domains '
+        "BEGIN SELECT RAISE(ABORT, 'synthetic attempt rejection'); END"
+      )
+    )
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+  # command would add an IP, and a complete command would also withdraw old supports.
+  command = await queue_resolution(app, store, 1, ['8.8.4.4'], complete=complete)
+  await store.start_writer()
+  await asyncio.wait_for(asyncio.shield(store.writer_task), timeout=3)
+  assert store.writer_state == 'FAILED'
+  assert store.writer_failure.committed is False
+  assert command.write_receipt.outcome.value == 'known_not_committed'
+  assert await snapshot(app, store) == before
+  assert await attempt_state(app, store) == dates
+
+
+async def test_latest_admitted_attempt_survives_regrouping_mutation_and_lock_retry(app, store, monkeypatch):
+  """Use admission order, preserve the complete checkpoint and retry frozen terminal times.
+
+  app/store provide the real writer and SQLite; monkeypatch injects a precommit
+  BUSY fault and controls retry delay without changing reconciliation behavior.
+  """
+  await add_support_domains(app, store)
+  # first and last intentionally reverse wall-clock order: admission order is authoritative.
+  first = await queue_resolution(app, store, 1, ['8.8.8.8'])
+  last = app.dto.DomainResult(
+    id=1,
+    name='domain-1.example.test',
+    resolution_complete=False,
+    storage_ips=('9.9.9.9',),
+    last_attempt_at=datetime(2025, 12, 31, 23, 59, 59, 654321, tzinfo=UTC),
+  )
+  await store.put_domain_after_resolve(last)
+  # expected is copied before caller mutation; the writer must not retain the mutable DTO.
+  expected = last.last_attempt_at.replace(tzinfo=None)
+  first.last_attempt_at = datetime(2040, 1, 1, tzinfo=UTC)
+  last.last_attempt_at = datetime(2041, 1, 1, tzinfo=UTC)
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 2)
+  monkeypatch.setattr(app.settings, 'db_save_batch_timeout', 3600)
+  # attempts records actual timestamps visible at each rollback-complete retry boundary.
+  attempts = []
+
+  async def fault(stage, evidence):
+    """Reject the first insert before commit starts, preserving known rollback/retry semantics."""
+    if stage == 'after_insert' and evidence.begins == 1:
+      raise lock_error()
+
+  async def retry(delay):
+    """Observe rollback state during bounded backoff delay without sleeping."""
+    attempts.append(await attempt_state(app, store))
+
+  monkeypatch.setattr(app.database, 'sleep', retry)
+  # evidence counts real commits and rollbacks under the controlled driver fault.
+  evidence = instrument_sessions(store, monkeypatch, fault=fault)
+  await store.start_writer()
+  await asyncio.wait_for(store.db_save_queue.join(), timeout=3)
+  assert evidence.begins == 2
+  assert evidence.commits == 1
+  assert len(attempts) == 1
+  assert attempts[0] == (None, None, None)
+  # actual, checkpoint and updated are the committed marker, successful date and runtime update date.
+  actual, checkpoint, updated = await attempt_state(app, store)
+  assert actual == expected
+  assert checkpoint is not None
+  assert updated is not None
+  assert first.write_receipt.outcome.value == last.write_receipt.outcome.value == 'confirmed'
+  assert await support_snapshot(store) == {('8.8.8.8', 1, None), ('9.9.9.9', 1, None)}
+
+
+async def test_missing_terminal_timestamp_cannot_be_admitted(app, store):
+  """Reject a producer contract violation before queue ownership or date mutation.
+
+  app/store provide DTO construction and the real admission boundary.
+  """
+  await seed(app, store)
+  # command deliberately lacks the terminal time required of every saving producer.
+  command = app.dto.DomainResult(id=1, name='www.example.test', resolution_complete=False)
+  with pytest.raises(app.database.DatabaseWriteError):
+    await store.put_domain_after_resolve(command)
+  assert store.db_save_queue.empty()
+  assert store.pending_count == 0
+  assert await attempt_state(app, store) == (None, None, None)
+
+
+async def test_automatic_selection_and_id_helper_share_attempt_boundaries(app, store, monkeypatch):
+  """At exactly two days, attempted unresolved rows become STALE in effective-date order.
+
+  app/store exercise real SQL and the by-ID helper; monkeypatch preserves the
+  configured default interval. The SQLite clock is fixed on each read connection.
+  """
+  monkeypatch.setattr(app.settings, 'domains_update_interval', 172800)
+  # fixed is SQLite's UTC now; engine owns only test read connections.
+  fixed = '2026-01-03 00:00:00'
+  engine = store._DataBase__read_engine.sync_engine
+
+  def clock(connection, record):
+    """Override CURRENT_TIMESTAMP only on this disposable engine's physical connections."""
+    connection.create_function('current_timestamp', 0, lambda: fixed)
+
+  event.listen(engine, 'connect', clock)
+  try:
+    # rows independently specify NEW, boundary, recent, historical-fallback and precedence cases.
+    rows = [
+      (0, None, None, False),
+      (1, None, None, False),
+      (2, '2026-01-01 00:00:00', None, False),
+      (3, '2026-01-01 00:00:01', None, False),
+      (4, None, '2025-12-31 23:59:59', True),
+      (5, '2026-01-02 00:00:00', '2000-01-01 00:00:00', True),
+      (6, '2026-01-01 00:00:00', '2026-01-02 00:00:00', True),
+      (7, '2025-12-31 23:59:59', None, False),
+      (8, None, None, True),
+    ]
+    # connection seeds raw dates without invoking any ORM update-time hooks.
+    async with store._DataBase__write_engine.begin() as connection:
+      # identifier, attempt, checkpoint and resolved describe each independent scheduling case.
+      for identifier, attempt, checkpoint, resolved in rows:
+        await connection.execute(
+          text(
+            'INSERT INTO rdpr_domains(id,name,resolved,last_attempt_at,last_resolved_at) '
+            'VALUES(:id,:name,:resolved,:attempt,:checkpoint)'
+          ),
+          dict(
+            id=identifier,
+            name=f'eligibility-{identifier}.example.test',
+            resolved=resolved,
+            attempt=attempt,
+            checkpoint=checkpoint,
+          ),
+        )
+    # row is each detached candidate returned by the two real automatic selection queries.
+    assert [row.id for row in await store.get_new_domains_for_resolve()] == [1, 8]
+    assert [row.id for row in await store.get_stale_domains_for_resolve()] == [4, 7, 2, 6]
+    # identifier selects one seeded case; new chooses the optional helper eligibility mode.
+    for identifier in range(9):
+      for new in (True, False, None):
+        # selected and allowed compare helper behavior to independently enumerated memberships.
+        selected = await store.get_domain_candidate_for_resolve(identifier, new=new)
+        allowed = identifier in ({1, 8} if new is True else {2, 4, 6, 7} if new is False else set(range(1, 9)))
+        assert (selected is not None) is allowed, (identifier, new)
+    assert await store.get_domain_candidate_for_resolve(999) is None
+  finally:
+    event.remove(engine, 'connect', clock)
+
+
+@pytest.mark.parametrize('attempt', [None, datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)])
+async def test_domain_api_lists_search_and_detail_expose_nullable_attempt_dates(app, store, resource_api, attempt):
+  """Both domain projections expose the same date pair using existing date conversion.
+
+  app/store seed isolated data; resource_api calls the actual routers and response
+  models, and attempt covers explicit NULL and a distinct successful-checkpoint date.
+  """
+  # checkpoint and updated are distinct controls that expose field-order or projection mistakes.
+  checkpoint = datetime(2001, 2, 3, 4, 5, 6, tzinfo=UTC)
+  updated = datetime(2002, 3, 4, 5, 6, 7, tzinfo=UTC)
+  # expected follows the established naive SQLite timestamp conversion in the current host timezone.
+  expected = None if attempt is None else attempt.replace(tzinfo=None).timestamp()
+  # connection seeds three distinct dates, including a NULL attempt with a nonNULL successful checkpoint.
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.DomainsDbo).values(
+        id=1,
+        name='date-visible.example.test',
+        last_attempt_at=attempt,
+        last_resolved_at=checkpoint,
+        updated_at=updated,
+      )
+    )
+  # path selects each public projection; response and payload hold its serialized domain record.
+  for path in ('/domains', '/domains/search?text=date-visible', '/domains/1'):
+    response = await resource_api.get(path)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    if path != '/domains/1':
+      payload = payload['payload'][0]
+    assert 'last_attempt_at' in payload
+    assert 'last_attempt_at_hum' in payload
+    assert payload['last_attempt_at'] == expected
+    assert payload['last_attempt_at_hum'] == (None if attempt is None else '2026-01-02 03:04:05')
+    assert payload['last_resolved_at_hum'] == '2001-02-03 04:05:06'
+    assert payload['updated_at_hum'] == '2002-03-04 05:06:07'
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+@pytest.mark.parametrize('prefix', ['rdpr_', ''])
+@pytest.mark.parametrize('old_column', [False, True], ids=['fresh-column', 'previous-schema'])
+async def test_attempt_migration_backfills_only_eligible_history_and_never_repeats(e2e_service, prefix, old_column):
+  """Upgrade previous/fresh schemas, preserving historical updates, defaults and migration history.
+
+  e2e_service owns real startup and disposable SQLite; prefix covers supported names
+  and old_column chooses a preexisting schema without the new field.
+  """
+  # service starts and stops around test-owned physical fixture preparation only.
+  service = e2e_service
+  service.environment['DB_TABLE_PREFIX'] = prefix
+  await service.start()
+  await service.stop()
+  # migration is the sole pending upgrade; all SQL below enumerates both supported prefix variants.
+  migration = 'migration_202618042125.py'
+  # connection prepares ordinary dated/undated, default and already-attempted historical rows.
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    connection.execute(
+      {'rdpr_': 'DELETE FROM rdpr_migrations WHERE name=?', '': 'DELETE FROM migrations WHERE name=?'}[prefix],
+      (migration,),
+    )
+    connection.execute(
+      {
+        'rdpr_': (
+          "UPDATE rdpr_domains SET last_resolved_at='2001-01-01 01:02:03', updated_at='2002-02-02 02:03:04' WHERE id=0"
+        ),
+        '': "UPDATE domains SET last_resolved_at='2001-01-01 01:02:03', updated_at='2002-02-02 02:03:04' WHERE id=0",
+      }[prefix]
+    )
+    connection.executemany(
+      {
+        'rdpr_': (
+          'INSERT INTO rdpr_domains(id,name,resolved,last_resolved_at,last_attempt_at,updated_at) VALUES(?,?,?,?,?,?)'
+        ),
+        '': 'INSERT INTO domains(id,name,resolved,last_resolved_at,last_attempt_at,updated_at) VALUES(?,?,?,?,?,?)',
+      }[prefix],
+      [
+        (1, 'history.example.test', 1, '2003-03-03 03:04:05.123456', None, '2004-04-04 04:05:06'),
+        (2, 'undated.example.test', 0, None, None, '2004-04-04 04:05:06'),
+        (
+          3,
+          'retained.example.test',
+          0,
+          '2005-05-05 05:06:07',
+          None if old_column else '2006-06-06 06:07:08',
+          '2004-04-04 04:05:06',
+        ),
+      ],
+    )
+    if old_column:
+      connection.execute(
+        {
+          'rdpr_': 'ALTER TABLE rdpr_domains DROP COLUMN last_attempt_at',
+          '': 'ALTER TABLE domains DROP COLUMN last_attempt_at',
+        }[prefix]
+      )
+    # before captures all old fields and old_history includes complete applied metadata.
+    before = connection.execute(
+      {
+        'rdpr_': 'SELECT id,name,resolved,created_at,updated_at,last_resolved_at FROM rdpr_domains ORDER BY id',
+        '': 'SELECT id,name,resolved,created_at,updated_at,last_resolved_at FROM domains ORDER BY id',
+      }[prefix]
+    ).fetchall()
+    old_history = connection.execute(
+      {'rdpr_': 'SELECT * FROM rdpr_migrations ORDER BY id', '': 'SELECT * FROM migrations ORDER BY id'}[prefix]
+    ).fetchall()
+  await service.start()
+  await service.stop()
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    assert (
+      connection.execute(
+        {
+          'rdpr_': 'SELECT id,name,resolved,created_at,updated_at,last_resolved_at FROM rdpr_domains ORDER BY id',
+          '': 'SELECT id,name,resolved,created_at,updated_at,last_resolved_at FROM domains ORDER BY id',
+        }[prefix]
+      ).fetchall()
+      == before
+    )
+    assert connection.execute(
+      {
+        'rdpr_': 'SELECT id,last_attempt_at FROM rdpr_domains ORDER BY id',
+        '': 'SELECT id,last_attempt_at FROM domains ORDER BY id',
+      }[prefix]
+    ).fetchall() == [
+      (0, None),
+      (1, '2003-03-03 03:04:05.123456'),
+      (2, None),
+      (3, '2005-05-05 05:06:07' if old_column else '2006-06-06 06:07:08'),
+    ]
+    assert (
+      connection.execute(
+        {
+          'rdpr_': 'SELECT * FROM rdpr_migrations WHERE name<>? ORDER BY id',
+          '': 'SELECT * FROM migrations WHERE name<>? ORDER BY id',
+        }[prefix],
+        (migration,),
+      ).fetchall()
+      == old_history
+    )
+    # column is SQLite's declared type/nullability/default/PK tuple; row is each inspected PRAGMA result.
+    column = next(
+      row
+      for row in connection.execute(
+        {'rdpr_': 'PRAGMA table_info(rdpr_domains)', '': 'PRAGMA table_info(domains)'}[prefix]
+      )
+      if row[1] == 'last_attempt_at'
+    )
+    assert column[2:] == ('TIMESTAMP', 0, None, 0)
+    assert (
+      connection.execute(
+        {
+          'rdpr_': 'SELECT applied_at FROM rdpr_migrations WHERE name=?',
+          '': 'SELECT applied_at FROM migrations WHERE name=?',
+        }[prefix],
+        (migration,),
+      ).fetchone()[0]
+      is not None
+    )
+    # A completed restart cannot backfill a date intentionally cleared after migration completion.
+    connection.execute(
+      {
+        'rdpr_': 'UPDATE rdpr_domains SET last_attempt_at=NULL WHERE id=1',
+        '': 'UPDATE domains SET last_attempt_at=NULL WHERE id=1',
+      }[prefix]
+    )
+  # committed includes the cleared attempt and all history/schema evidence before restart.
+  committed = sqlite_snapshot(service.db_path)
+  await service.start()
+  await service.stop()
+  assert sqlite_snapshot(service.db_path) == committed
+
+
+@pytest.mark.parametrize('old_target', [False, True], ids=['new-ddl', 'previous-ddl'])
+async def test_pending_legacy_import_accepts_exact_old_or_new_domain_schema(app, startup_store, old_target):
+  """The pending legacy preflight accepts both exact approved domain DDL versions.
+
+  app/startup_store run real startup on disposable legacy data; old_target removes
+  only the newly introduced column from the empty current target schema.
+  """
+  # path is the isolated database; connection contexts own fixture setup/verification.
+  path = Path(app.settings.db_path)
+  create_legacy_database(path)
+  async with startup_store._DataBase__write_engine.begin() as connection:
+    await connection.run_sync(app.database.DomainsDbo.metadata.create_all)
+    if old_target:
+      await connection.execute(text('ALTER TABLE rdpr_domains DROP COLUMN last_attempt_at'))
+  await startup_store.setup()
+  await startup_store.close(timeout=2)
+  assert_legacy_import(path)
+  with closing(sqlite3.connect(path)) as connection:
+    assert connection.execute('SELECT id,last_attempt_at FROM rdpr_domains ORDER BY id').fetchall() == [
+      (0, None),
+      (7, '2002-03-04 05:06:07'),
+    ]
+
+
+async def test_cancelled_unadmitted_marker_never_changes_date(app, store):
+  """Cancelling a full-queue producer leaves no attempt behind after existing work drains.
+
+  app/store provide real admission and SQLite with one disposable occupied queue slot.
+  """
+  await seed(app, store)
+  # entered signals the actual blocked put rather than depending on scheduling sleeps.
+  entered = asyncio.Event()
+
+  class FullQueue(asyncio.Queue):
+    """Expose entry into a real bounded queue without changing its admission behavior."""
+
+    async def put(self, item):
+      """Signal the put of item and preserve the standard cancellable waiting contract."""
+      if self.full():
+        entered.set()
+      await super().put(item)
+
+  store.db_save_queue = FullQueue(maxsize=1)
+  await enqueue_names(app, store, ['occupies-capacity.example.test'])
+  # command is a completed failure marker; producer owns only its unadmitted enqueue.
+  command = app.dto.DomainResult(
+    id=1,
+    name='www.example.test',
+    resolution_complete=False,
+    last_attempt_at=datetime(2026, 1, 2, tzinfo=UTC),
+  )
+  producer = asyncio.create_task(store.put_domain_after_resolve(command))
+  try:
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    producer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await asyncio.wait_for(producer, timeout=2)
+    assert command.write_receipt.admitted is False
+    await flush_queue(store)
+    assert await attempt_state(app, store) == (None, None, None)
+    assert store.pending_count == 0
+  finally:
+    producer.cancel()
+    await asyncio.gather(producer, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+  'column_sql',
+  [
+    'last_attempt_at TEXT',
+    'last_attempt_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+    "last_attempt_at TIMESTAMP NOT NULL DEFAULT '2000-01-01 00:00:00'",
+    'last_attempt_at TIMESTAMP GENERATED ALWAYS AS (last_resolved_at) VIRTUAL',
+  ],
+)
+async def test_incompatible_attempt_column_aborts_startup_atomically(app, startup_store, column_sql):
+  """Reject incompatible type/default/nullability/generated shapes without changing history.
+
+  app/startup_store run the real migration owner; column_sql is a fixed synthetic
+  DDL variant in the disposable fixture, never user-supplied SQL.
+  """
+  # connection prepares the incompatible schema before the caller-owned startup transaction.
+  async with startup_store._DataBase__write_engine.begin() as connection:
+    await connection.run_sync(app.database.DomainsDbo.metadata.create_all)
+    await connection.execute(text('ALTER TABLE rdpr_domains DROP COLUMN last_attempt_at'))
+    await connection.execute(text('ALTER TABLE rdpr_domains ADD COLUMN ' + column_sql))
+  # before includes every physical table, value and migration-history row before rejection.
+  before = sqlite_snapshot(app.settings.db_path)
+  with pytest.raises(app.database.DatabaseWriteError, match='Database initialization failed'):
+    await startup_store.setup()
+  assert startup_store.writer_task is None
+  assert sqlite_snapshot(app.settings.db_path) == before
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+async def test_attempt_backfill_failure_rolls_back_column_and_history_then_recovers(e2e_service):
+  """A failed backfill leaves the old schema/data/history intact and a fresh process can retry.
+
+  e2e_service owns the actual startup process and its disposable previous-schema database.
+  """
+  # service is stopped before fixture SQL so no application connection observes intermediate DDL.
+  service = e2e_service
+  await service.start()
+  await service.stop()
+  # connection prepares one historical row and a trigger that rejects the new migration UPDATE.
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    connection.execute(
+      'INSERT INTO rdpr_domains(id,name,resolved,last_resolved_at,updated_at) '
+      "VALUES(1,'historical.example.test',1,'2001-02-03 04:05:06','2002-03-04 05:06:07')"
+    )
+    connection.execute("DELETE FROM rdpr_migrations WHERE name='migration_202618042125.py'")
+    connection.execute('ALTER TABLE rdpr_domains DROP COLUMN last_attempt_at')
+    connection.execute(
+      'CREATE TRIGGER fail_attempt BEFORE UPDATE OF last_attempt_at ON rdpr_domains '
+      "BEGIN SELECT RAISE(ABORT,'synthetic historical backfill rejection'); END"
+    )
+  # before includes the absent column, trigger and all preexisting migration metadata.
+  before = sqlite_snapshot(service.db_path)
+  with pytest.raises(AssertionError, match='Application exited before readiness'):
+    await service.start()
+  assert sqlite_snapshot(service.db_path) == before
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    connection.execute('DROP TRIGGER fail_attempt')
+  await service.start()
+  await service.stop()
+  with closing(sqlite3.connect(service.db_path)) as connection:
+    assert connection.execute(
+      'SELECT last_attempt_at,last_resolved_at,updated_at FROM rdpr_domains WHERE id=1'
+    ).fetchone() == (
+      '2001-02-03 04:05:06',
+      '2001-02-03 04:05:06',
+      '2002-03-04 05:06:07',
+    )

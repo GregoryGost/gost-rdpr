@@ -12,6 +12,7 @@ from base64 import urlsafe_b64decode
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
+from itertools import pairwise
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, mock_open
 
@@ -28,6 +29,400 @@ from prometheus_client import REGISTRY
 pytestmark = pytest.mark.unit
 
 ROS_RETRY_METHODS = frozenset({'GET', 'POST', 'PATCH', 'DELETE'})
+
+
+@pytest.mark.parametrize('configured', [None, '3', '17'])
+async def test_resolution_progress_limit_uses_default_and_environment(app, monkeypatch, configured):
+  """Read the intermediate-message budget from the environment, defaulting to ten.
+
+  app blocks secret-file loading; monkeypatch restores the configured environment.
+  configured selects an absent override or one of two valid integer budgets.
+  """
+  # settings_type constructs an isolated settings value without changing application globals.
+  settings_type = type(app.settings)
+  monkeypatch.delenv('RESOLVE_DOMAINS_LOG_EVERY', raising=False)
+  if configured is not None:
+    monkeypatch.setenv('RESOLVE_DOMAINS_LOG_EVERY', configured)
+  assert settings_type(_env_file=None).resolve_domains_log_every == (10 if configured is None else int(configured))
+
+
+@pytest.mark.parametrize('configured', ['-10', '-1', '0', '1', '2', '3.5', 'invalid'])
+async def test_resolution_progress_limit_rejects_values_below_three_or_nonintegers(app, monkeypatch, configured):
+  """Reject invalid configured budgets before starting any saving pass.
+
+  app prevents .env reads, monkeypatch isolates RESOLVE_DOMAINS_LOG_EVERY, and
+  configured covers the lower boundary and invalid integer representations.
+  """
+  from pydantic import ValidationError
+
+  monkeypatch.setenv('RESOLVE_DOMAINS_LOG_EVERY', configured)
+  with pytest.raises(ValidationError, match='resolve_domains_log_every'):
+    type(app.settings)(_env_file=None)
+
+
+@pytest.mark.parametrize('mode_name', ['DOMAINS_RESOLVE_NEW', 'DOMAINS_RESOLVE_STALE'])
+async def test_empty_resolution_pass_logs_only_explicit_empty_message(app, saving_boundary, caplog, mode_name):
+  """An empty NEW or STALE pass emits only the requested empty-pass message.
+
+  app and saving_boundary isolate I/O; caplog captures INFO records, and
+  mode_name chooses the automatic pass whose selected membership is empty.
+  """
+  # mode is the public coordinator scan kind; records holds INFO text; record is one captured log entry.
+  mode = getattr(importlib.import_module('jobs.job_registry').Jobs, mode_name)
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  await saving_boundary.resolver.domains_resolve(mode)
+  records = [record.getMessage() for record in caplog.records if record.levelno == logging.INFO]
+  assert records == ['Нет доменов для обработки']
+  saving_boundary.repository.get_dns_servers_for_resolve.assert_not_awaited()
+
+
+def resolution_log_records(caplog, kind, *, run_id=None, level=logging.INFO):
+  """Return captured resolution records for kind, optional run_id, and level.
+
+  caplog owns the captured records. Only the stable message prefix and origin
+  identifier are selected; summary wording and elapsed values remain unconstrained.
+  """
+  # record is each emitted logging record examined for the requested event kind.
+  return [
+    record
+    for record in caplog.records
+    if record.levelno == level
+    and str(record.msg).startswith(f'Resolution {kind} ')
+    and (run_id is None or record.args[0] == run_id)
+  ]
+
+
+@pytest.mark.parametrize('mode_name', ['DOMAINS_RESOLVE_NEW', 'DOMAINS_RESOLVE_STALE'])
+@pytest.mark.parametrize(('total', 'limit'), [(1, 10), (2, 10), (3, 3), (4, 3), (7, 3), (11, 3), (37, 10)])
+async def test_resolution_progress_fairly_spans_completed_membership(
+  app, saving_boundary, caplog, monkeypatch, mode_name, total, limit
+):
+  """Spread bounded intermediate INFO across the whole nonempty pass.
+
+  total and limit cover short passes and uneven divisions; mode_name selects NEW
+  or STALE. app/saving_boundary isolate I/O, monkeypatch sets the budget, and
+  caplog observes logs independently of Prometheus snapshot fields.
+  """
+  # boundary provides the real coordinator with fake DNS and repository boundaries.
+  boundary = saving_boundary
+  # mode identifies the public automatic pass; getter selects its repository query.
+  mode = getattr(importlib.import_module('jobs.job_registry').Jobs, mode_name)
+  getter = (
+    boundary.repository.get_new_domains_for_resolve
+    if mode_name == 'DOMAINS_RESOLVE_NEW'
+    else boundary.repository.get_stale_domains_for_resolve
+  )
+  # value assigns a distinct selected ID to each member.
+  getter.return_value = [boundary.candidate(value) for value in range(1, total + 1)]
+  monkeypatch.setattr(app.settings, 'resolve_domains_log_every', limit)
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  await boundary.resolver.domains_resolve(mode)
+  # run is the originating operation, even if a newer run later replaces the gauge.
+  run = boundary.commands[0].observation.run
+  # progress contains the emitted counts; record extracts each captured argument tuple.
+  progress = [record.args[2] for record in resolution_log_records(caplog, 'progress', run_id=run.run_id)]
+  assert len(progress) <= min(limit, total - 1)
+  assert bool(progress) is (total > 1)
+  assert progress == sorted(set(progress))
+  assert all(0 < completed < total for completed in progress)  # completed is one intermediate count.
+  # boundaries includes start and final completion; gaps measures fair spacing between reports.
+  # left and right are consecutive reported boundaries, including the two endpoints.
+  boundaries = [0, *progress, total]
+  gaps = [right - left for left, right in pairwise(boundaries)]
+  assert max(gaps) - min(gaps) <= 1
+  assert len(resolution_log_records(caplog, 'selected', run_id=run.run_id)) == 1
+  assert resolution_log_records(caplog, 'selected', run_id=run.run_id)[0].args[2] == total
+  # record contains total and remaining beside each intermediate completed count.
+  for record in resolution_log_records(caplog, 'progress', run_id=run.run_id):
+    assert record.args[3] == total
+    assert record.args[4] == total - record.args[2]
+  assert len(resolution_log_records(caplog, 'processing', run_id=run.run_id)) == 1
+  assert len(resolution_log_records(caplog, 'persistence', run_id=run.run_id)) == 1
+  assert len([record for record in caplog.records if record.levelno == logging.INFO]) == len(progress) + 3
+  assert run.snapshot()['selected'] == run.snapshot()['attempted'] == run.snapshot()['covered'] == total
+  assert run.snapshot()['success'] == total
+  assert run.snapshot()['active'] == 0
+
+
+async def test_failed_dns_pass_confirms_marker_only_results(app, saving_boundary, caplog):
+  """A failed DNS pass retains processing failures while confirming attempt markers.
+
+  app/saving_boundary preserve the real DNS classifier behind synthetic SERVFAIL
+  responses, and caplog observes separate processing and persistence summaries.
+  """
+  # boundary provides the real coordinator; jobs chooses the NEW scan.
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  # admit is the receipt-preserving repository fake; its wrapper adds the real observation contract.
+  admit = boundary.repository.put_domain_after_resolve.side_effect
+
+  async def observed_admission(domain):
+    """Admit domain through the receipt fake and publish the repository's normal lifecycle events."""
+    app.resolver.notify_observation(domain.observation, 'admission_started', app.resolver.perf_counter())
+    await admit(domain)
+    # event advances admission and confirmed persistence independently of processing failure.
+    for event in ('admitted', 'confirmed'):
+      app.resolver.notify_observation(domain.observation, event, app.resolver.perf_counter())
+
+  boundary.repository.put_domain_after_resolve.side_effect = observed_admission
+  # value identifies each domain whose A and CNAME evidence both fail.
+  boundary.repository.get_new_domains_for_resolve.return_value = [boundary.candidate(value) for value in (1, 2, 3)]
+  for value in (1, 2, 3):
+    boundary.outcomes[f'domain-{value}.example.test'] = 'servfail'
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  await boundary.resolver.domains_resolve(jobs.DOMAINS_RESOLVE_NEW)
+  assert [command.id for command in boundary.commands] == [1, 2, 3]  # command is one finished failure.
+  assert all(command.last_attempt_at is not None for command in boundary.commands)
+  # processing and persistence are primitive aggregate snapshots at their distinct boundaries.
+  processing = resolution_log_records(caplog, 'processing')[0].args[2]
+  persistence = resolution_log_records(caplog, 'persistence')[0].args[2]
+  assert len(resolution_log_records(caplog, 'processing')) == len(resolution_log_records(caplog, 'persistence')) == 1
+  assert processing['failure'] == processing['completed_membership'] == 3
+  assert persistence['not_required'] == 0
+  assert persistence['admitted'] == persistence['confirmed'] == 3
+  assert persistence['pending'] == persistence['unknown'] == 0
+
+
+async def test_resolution_progress_waits_for_out_of_order_completions(app, saving_boundary, caplog, monkeypatch):
+  """Starting or covering members cannot advance completed progress.
+
+  app/saving_boundary block four real DNS classifications, monkeypatch permits
+  four workers, and caplog records each deliberately released completion.
+  """
+  # boundary supplies isolated DNS gates; jobs names the public NEW scan entrypoint.
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 4)
+  monkeypatch.setattr(app.settings, 'resolve_domains_log_every', 3)
+  # value names each domain whose completion is controlled independently.
+  boundary.repository.get_new_domains_for_resolve.return_value = [boundary.candidate(value) for value in (1, 2, 3, 4)]
+  for value in (1, 2, 3, 4):
+    boundary.gates[f'domain-{value}.example.test'] = asyncio.Event()
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_NEW, resolver=boundary.resolver)
+  # The predicate waits until all four workers have reached their blocked DNS queries.
+  await await_condition(lambda: len(boundary.queries) == 4)
+  assert resolution_log_records(caplog, 'progress') == []
+  assert resolution_log_records(caplog, 'processing') == []
+  # completed is the actual completion count; value deliberately differs from selection order.
+  for completed, value in enumerate((3, 1, 4, 2), start=1):
+    # before identifies the records already checked at an earlier completion boundary.
+    before = len(resolution_log_records(caplog, 'progress'))
+    boundary.gates[f'domain-{value}.example.test'].set()
+    # The admission predicate freezes completed and waits for this result to reach the repository.
+    await await_condition(lambda completed=completed: len(boundary.commands) == completed)
+    # The active-work predicate waits for the same completion to retire its worker reservation.
+    await await_condition(lambda completed=completed: len(boundary.coordinator._active) == 4 - completed)
+    # record is each newly emitted progress update; it must reflect this actual completed count.
+    for record in resolution_log_records(caplog, 'progress')[before:]:
+      assert record.args[2] == completed < 4
+      assert record.args[4] == 4 - completed
+  await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+  assert 1 <= len(resolution_log_records(caplog, 'progress')) <= 3
+  assert [command.id for command in boundary.commands] == [3, 1, 4, 2]  # command is one admitted source result.
+
+
+async def test_promoted_stale_member_completes_pass_without_becoming_its_attempt(app, saving_boundary, caplog):
+  """A stored promotion completes STALE membership while retaining its own origin.
+
+  app and saving_boundary isolate the real coordinator; caplog verifies that
+  the automatic summary distinguishes completion from physical attempts.
+  """
+  # boundary controls DNS and repository results; jobs identifies the STALE scan.
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  # value is each selected stale domain; the callback reloads id and ignores unused query kwargs.
+  boundary.repository.get_stale_domains_for_resolve.return_value = [boundary.candidate(value) for value in (1, 2, 3)]
+  boundary.repository.get_domain_candidate_for_resolve.side_effect = lambda id, **kwargs: boundary.candidate(id)
+  # release holds the first physical attempt while the second reservation is promoted.
+  release = boundary.gates['domain-1.example.test'] = asyncio.Event()
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_STALE, resolver=boundary.resolver)
+  # The predicate waits for the first blocked stale attempt before promoting another member.
+  await await_condition(lambda: len(boundary.queries) == 1)
+  await boundary.coordinator.submit_stored(2, resolver=boundary.resolver)
+  assert resolution_log_records(caplog, 'progress') == []
+  release.set()
+  await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+  # stale is the origin of the unpromoted members; stored owns the promoted attempt.
+  stale = boundary.commands[0].observation.run
+  stored = boundary.commands[1].observation.run
+  assert stale is not stored
+  assert stale.snapshot()['selected'] == stale.snapshot()['covered'] == 3
+  assert stale.snapshot()['attempted'] == 2
+  assert stored.snapshot()['selected'] == stored.snapshot()['attempted'] == 1
+  # summary holds the final STALE log, whose additional count does not alter metric fields.
+  summary = resolution_log_records(caplog, 'processing', run_id=stale.run_id)[0].args[2]
+  assert summary['completed_membership'] == 3
+  assert summary['remaining_membership'] == 0
+  assert 'completed_membership' not in stale.snapshot()
+
+
+async def test_shared_active_members_delay_logs_without_delaying_new_pass_return(
+  app, saving_boundary, caplog, monkeypatch
+):
+  """Logical coverage preserves its boundary while logs await shared completion.
+
+  app/saving_boundary isolate the coordinator; monkeypatch permits two workers,
+  and caplog must not mislabel either running shared member as completed.
+  """
+  # boundary controls the two active stored operations; jobs supplies the NEW mode.
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 2)
+  # value identifies membership; the callback reloads id and ignores unused query kwargs.
+  boundary.repository.get_domain_candidate_for_resolve.side_effect = lambda id, **kwargs: boundary.candidate(id)
+  boundary.repository.get_new_domains_for_resolve.return_value = [boundary.candidate(value) for value in (1, 2)]
+  for value in (1, 2):
+    boundary.gates[f'domain-{value}.example.test'] = asyncio.Event()
+  await boundary.coordinator.submit_stored(1, resolver=boundary.resolver)
+  await boundary.coordinator.submit_stored(2, resolver=boundary.resolver)
+  # The predicate waits for both shared stored operations to enter DNS before NEW adopts them.
+  await await_condition(lambda: len(boundary.queries) == 2)
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  await asyncio.wait_for(boundary.resolver.domains_resolve(jobs.DOMAINS_RESOLVE_NEW), timeout=1)
+  # run is the latest NEW metrics origin, whose existing coverage contract is already satisfied.
+  run = importlib.import_module('metrics.metrics').ResolutionRun._latest['new']
+  assert run.snapshot()['selected'] == run.snapshot()['covered'] == 2
+  assert run.snapshot()['attempted'] == 0
+  assert run.snapshot()['processing_complete'] is True
+  assert resolution_log_records(caplog, 'progress', run_id=run.run_id) == []
+  assert resolution_log_records(caplog, 'processing', run_id=run.run_id) == []
+  boundary.gates['domain-2.example.test'].set()
+  # The predicate waits for the first shared completion's progress record before inspecting its counts.
+  await await_condition(lambda: len(resolution_log_records(caplog, 'progress', run_id=run.run_id)) == 1)
+  assert resolution_log_records(caplog, 'progress', run_id=run.run_id)[0].args[2] == 1
+  assert resolution_log_records(caplog, 'processing', run_id=run.run_id) == []
+  boundary.gates['domain-1.example.test'].set()
+  await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+  assert len(resolution_log_records(caplog, 'processing', run_id=run.run_id)) == 1
+  assert len(resolution_log_records(caplog, 'persistence', run_id=run.run_id)) == 1
+  assert run.snapshot()['attempted'] == 0
+
+
+@pytest.mark.parametrize('terminal', ['confirmed', 'known_not_committed', 'final_unknown'])
+async def test_provisional_unknown_is_not_final_and_late_receipt_keeps_original_log(app, caplog, terminal):
+  """Late final receipts settle only their originating run, once.
+
+  app isolates imports, caplog captures final INFO, and terminal chooses the
+  final truth after a provisional unknown. Duplicate events must be harmless.
+  """
+  # metrics creates production observations; old owns the receipt and observation receives its events.
+  metrics = importlib.import_module('metrics.metrics')
+  old = metrics.ResolutionRun('stored')
+  old.select(1)
+  observation = old.observe()
+  # event walks one legitimate processing/admission lifecycle before a late outcome.
+  for event in ('processing_started', 'success', 'admission_started', 'admitted', 'processing_finished'):
+    observation.notify(event, old.started_at)
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  old.finish(True)
+  observation.notify('unknown', old.started_at + 1)
+  assert resolution_log_records(caplog, 'persistence', run_id=old.run_id) == []
+  # newer supersedes only gauge ownership, not old's pending final summary.
+  newer = metrics.ResolutionRun('stored')
+  observation.notify(terminal, old.started_at + 2)
+  observation.notify(terminal, old.started_at + 3)
+  assert len(resolution_log_records(caplog, 'processing', run_id=old.run_id)) == 1
+  assert len(resolution_log_records(caplog, 'persistence', run_id=old.run_id)) == 1
+  # final is the original run's final primitive summary, not the newer gauge snapshot.
+  final = resolution_log_records(caplog, 'persistence', run_id=old.run_id)[0].args[2]
+  assert final['unknown' if terminal == 'final_unknown' else terminal] == 1
+  assert final['pending'] == 0
+  assert newer.snapshot()['admitted'] == newer.snapshot()['confirmed'] == 0
+
+
+async def test_cancelled_pass_never_reports_unstarted_members_as_completed(app, saving_boundary, caplog):
+  """Cancellation logs interruption without claiming completion of queued members.
+
+  app/saving_boundary hold one active member and two unstarted reservations;
+  caplog checks final counters after the caller's cancellation cleanup.
+  """
+  # boundary holds the first DNS request; jobs chooses NEW; operation is the caller-owned pass.
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  # value assigns the three members selected before cancellation.
+  boundary.repository.get_new_domains_for_resolve.return_value = [boundary.candidate(value) for value in (1, 2, 3)]
+  boundary.gates['domain-1.example.test'] = asyncio.Event()
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  operation = asyncio.create_task(boundary.resolver.domains_resolve(jobs.DOMAINS_RESOLVE_NEW))
+  # The predicate waits for the first DNS attempt so cancellation leaves two members unstarted.
+  await await_condition(lambda: len(boundary.queries) == 1)
+  operation.cancel()
+  with pytest.raises(asyncio.CancelledError):
+    await asyncio.wait_for(operation, timeout=3)
+  # summary preserves selected/attempted accounting despite cancellation before admission.
+  summary = resolution_log_records(caplog, 'processing')[0].args[2]
+  assert summary['selected'] == 3
+  assert summary['attempted'] == summary['cancelled_processing'] == 1
+  assert summary['completed_membership'] <= 1
+  assert summary['remaining_membership'] == summary['selected'] - summary['completed_membership']
+  assert summary['interrupted'] is True
+  assert boundary.commands == []
+
+
+async def test_repeated_new_generations_keep_progress_and_late_persistence_separate(
+  app, saving_boundary, caplog, monkeypatch
+):
+  """A queued NEW successor has its own budget and cannot steal late receipt logs.
+
+  app/saving_boundary isolate DNS and repository boundaries; monkeypatch installs
+  real observation events around controlled pending receipts. caplog verifies
+  each generation's origin while the coordinator never waits for commit.
+  """
+  # boundary supplies the actual coordinator; jobs identifies NEW; queue_dto supplies receipt outcomes.
+  boundary = saving_boundary
+  jobs = importlib.import_module('jobs.job_registry').Jobs
+  queue_dto = importlib.import_module('models.dto.queue_dto')
+  # value identifies the same three selected domains across both finite generations.
+  boundary.repository.get_new_domains_for_resolve.return_value = [boundary.candidate(value) for value in (1, 2, 3)]
+  # release prevents the first generation from completing before the successor is accepted.
+  release = boundary.gates['domain-1.example.test'] = asyncio.Event()
+
+  async def admit_pending(domain):
+    """Admit domain with a real receipt while deliberately withholding commit truth."""
+    boundary.commands.append(domain)
+    domain.observation.notify('admission_started', domain.observation.run.started_at)
+    domain.write_receipt.mark_admitted()
+    domain.observation.notify('admitted', domain.observation.run.started_at)
+
+  monkeypatch.setattr(boundary.repository.put_domain_after_resolve, 'side_effect', admit_pending)
+  caplog.set_level(logging.INFO)
+  caplog.clear()
+  await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_NEW, resolver=boundary.resolver)
+  # The predicate waits for blocked first-generation DNS before accepting its NEW successor.
+  await await_condition(lambda: len(boundary.queries) == 1)
+  await boundary.coordinator.submit_scan(jobs.DOMAINS_RESOLVE_NEW, resolver=boundary.resolver)
+  release.set()
+  await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
+  # first owns all physical writes; second is the latest completed logical generation.
+  first = boundary.commands[0].observation.run
+  second = importlib.import_module('metrics.metrics').ResolutionRun._latest['new']
+  assert first is not second
+  assert boundary.repository.get_new_domains_for_resolve.await_count == 2
+  assert len(boundary.queries) == len(boundary.commands) == 3
+  assert first.snapshot()['attempted'] == first.snapshot()['pending'] == 3
+  assert second.snapshot()['selected'] == second.snapshot()['covered'] == 3
+  assert second.snapshot()['attempted'] == 0
+  assert len(resolution_log_records(caplog, 'processing', run_id=first.run_id)) == 1
+  assert len(resolution_log_records(caplog, 'processing', run_id=second.run_id)) == 1
+  assert resolution_log_records(caplog, 'persistence', run_id=first.run_id) == []
+  assert len(resolution_log_records(caplog, 'persistence', run_id=second.run_id)) == 1
+  # command settles each first-generation receipt after the second generation already completed.
+  for command in boundary.commands:
+    command.write_receipt.set_outcome(queue_dto.WriteOutcome.CONFIRMED)
+    command.observation.notify('confirmed', command.observation.run.started_at + 1)
+  assert len(resolution_log_records(caplog, 'persistence', run_id=first.run_id)) == 1
+  assert first.snapshot()['confirmed'] == 3
+  assert second.snapshot()['confirmed'] == 0
 
 
 @pytest.mark.parametrize('inside_root', [False, True])
@@ -482,11 +877,20 @@ async def test_unknown_write_never_replays_same_id_or_expires_ownership(app, sav
 
 
 async def test_failed_real_attempt_crossing_select_covers_old_eligible_row(app, saving_boundary):
+  """A completed failed stored operation covers a stale snapshot and saves one marker.
+
+  app and saving_boundary isolate the coordinator and permit a deliberately delayed SELECT.
+  """
+  # boundary owns synthetic DNS and receipts; jobs identifies the stale scan kind.
   boundary = saving_boundary
   jobs = importlib.import_module('jobs.job_registry').Jobs
+  # selected announces SELECT entry; release delays its finite result until stored completion.
   selected, release = asyncio.Event(), asyncio.Event()
+  # name is a queried domain name; _ discards endpoint/query-type fields already covered elsewhere.
+  # The candidate callback maps id to the current descriptor; kwargs carries unused helper options.
 
   async def stale_selection():
+    """Return the original two-member snapshot after the competing attempt finishes."""
     selected.set()
     await release.wait()
     return [boundary.candidate(1), boundary.candidate(2)]
@@ -498,7 +902,7 @@ async def test_failed_real_attempt_crossing_select_covers_old_eligible_row(app, 
   await asyncio.wait_for(selected.wait(), timeout=1)
   await boundary.resolver.resolve_stored_domain(1)
   assert [name for name, _, _ in boundary.queries] == ['domain-1.example.test', 'domain-1.example.test']
-  assert boundary.commands == []
+  assert [command.id for command in boundary.commands] == [1]  # command is the failed stored attempt.
   release.set()
   await asyncio.wait_for(boundary.coordinator.wait_idle(), timeout=3)
   assert [name for name, _, _ in boundary.queries] == [
@@ -506,7 +910,7 @@ async def test_failed_real_attempt_crossing_select_covers_old_eligible_row(app, 
     'domain-1.example.test',
     'domain-2.example.test',
   ]
-  assert [command.id for command in boundary.commands] == [2]
+  assert [command.id for command in boundary.commands] == [1, 2]
 
 
 async def test_cancelled_reservation_without_attempt_cannot_revive_late_snapshot_row(app, saving_boundary):
@@ -680,6 +1084,12 @@ async def test_repeated_new_waits_current_list_processing_then_scans_once_withou
 async def test_full_finite_pass_attempts_every_failed_member_once_with_bounded_heavy_state(
   app, saving_boundary, monkeypatch, dns_message
 ):
+  """Finish every failed member once while retaining only lightweight admitted evidence.
+
+  app/saving_boundary isolate real coordinator logic; monkeypatch and dns_message
+  provide failed wire replies without retaining completed DomainResult objects.
+  """
+  # boundary supplies the real coordinator; jobs selects NEW and candidates is its finite membership.
   boundary = saving_boundary
   jobs = importlib.import_module('jobs.job_registry').Jobs
   monkeypatch.setattr(app.settings, 'domains_resolve_worker_limit', 4)
@@ -688,12 +1098,25 @@ async def test_full_finite_pass_attempts_every_failed_member_once_with_bounded_h
     app.dto.DomainCandidate(id=value, name=f'finite-failure-{value}.example.test') for value in range(1, 2106)
   ]
   boundary.repository.get_new_domains_for_resolve.return_value = candidates
+  # value assigns each candidate ID; heavy_counts records live processing objects at two boundaries.
   heavy_counts = []
+  # receipts preserves the real stub acknowledgement behavior without retaining its result arguments.
+  receipts = boundary.repository.put_domain_after_resolve.side_effect
+
+  async def release_result(domain):
+    """Confirm domain, retaining only its immutable identifying and terminal evidence."""
+    await receipts(domain)
+    boundary.commands[-1] = SimpleNamespace(id=domain.id, last_attempt_at=domain.last_attempt_at)
+    boundary.repository.put_domain_after_resolve.reset_mock()
+
+  boundary.repository.put_domain_after_resolve.side_effect = release_result
 
   async def failed(boundary_resolver, qname, rdtype, **kwargs):
+    """Classify qname/rdtype as SERVFAIL and sample processing allocations at fixed query counts."""
     boundary.queries.append((qname, boundary_resolver.nameservers[0], rdtype))
     if len(boundary.queries) in {1, 4209}:
       gc.collect()
+      # value is each GC-tracked object inspected for an active heavy processing allocation.
       heavy_counts.append(
         sum(
           isinstance(value, app.dto.DomainResult) and value.name.startswith('finite-failure-')
@@ -704,6 +1127,7 @@ async def test_full_finite_pass_attempts_every_failed_member_once_with_bounded_h
 
   monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', failed)
   await asyncio.wait_for(boundary.resolver.domains_resolve(jobs.DOMAINS_RESOLVE_NEW), timeout=10)
+  # candidate identifies a selected domain; rdtype enumerates the required A/fallback CNAME queries.
   assert sorted(boundary.queries) == sorted(
     (candidate.name, '192.0.2.53', rdtype)
     for candidate in candidates
@@ -711,7 +1135,8 @@ async def test_full_finite_pass_attempts_every_failed_member_once_with_bounded_h
   )
   assert boundary.repository.get_new_domains_for_resolve.await_count == 1
   assert boundary.repository.get_dns_servers_for_resolve.await_count == 1
-  assert boundary.commands == []
+  # command is retained lightweight admission evidence; count is one sampled live-object total.
+  assert sorted(command.id for command in boundary.commands) == list(range(1, 2106))
   assert len(heavy_counts) == 2
   assert all(0 < count <= 4 for count in heavy_counts), heavy_counts
   assert metric_total('resolution_run_snapshot', mode='new', field='selected') == 2105
@@ -1208,7 +1633,26 @@ async def test_typed_writer_failure_stops_bulk_admission_and_releases_job(
 async def test_a_first_discovery_preserves_aliases_and_independent_ip_evidence(
   app, resolver, repository, network, monkeypatch, transport, entrypoint, kind
 ):
-  """Alias discovery cannot promote incomplete A evidence into deletion permission."""
+  """Alias discovery never promotes failed A evidence into deletion permission; saving attempts still get dates.
+
+  Test fixtures isolate repository and network boundaries; scenario parameters select the evidence under test.
+  """
+  # endpoint is the selected classic or DoH address.
+  # failure is the transport-specific timeout.
+  # requests is observed DNS query types.
+  # server is the selected configured endpoint.
+  # domains is finite automatic membership.
+  # aliases is reachable names expected independently from each wire scenario.
+  # addresses is the trustworthy IPv4 evidence.
+  # result is the diagnostic response that must remain unsaved.
+  # jobs is the public automatic job enumeration.
+  # discovered is alias writes collected from the repository boundary.
+  # alias is one discovered alias DTO.
+  # call is one alias-admission call.
+  # name is one expected reachable alias name.
+  # queued is the completed saving result.
+  # record_type is one observed DNS record type.
+  # _ is unused endpoint tuple entries.
   endpoint = '192.0.2.53' if transport == 'classic' else 'https://dns.example.test/dns-query'
   failure = dns.exception.Timeout() if transport == 'classic' else httpx.ReadTimeout('Synthetic A timeout')
   requests = network(
@@ -1261,7 +1705,9 @@ async def test_a_first_discovery_preserves_aliases_and_independent_ip_evidence(
       assert queued.result.A == addresses
       assert queued.insert.ips_delete == [10]
     else:
-      repository.put_domain_after_resolve.assert_not_awaited()
+      repository.put_domain_after_resolve.assert_awaited_once()
+      assert repository.put_domain_after_resolve.await_args.kwargs['domain'].resolution_complete is False
+      assert repository.put_domain_after_resolve.await_args.kwargs['domain'].storage_ips == ()
       repository.get_all_ips_for_domain.assert_not_awaited()
   assert [record_type for _, record_type in requests] == (
     [dns.rdatatype.A, dns.rdatatype.CNAME] if kind in {'timeout', 'alias-cycle'} else [dns.rdatatype.A]
@@ -1271,6 +1717,16 @@ async def test_a_first_discovery_preserves_aliases_and_independent_ip_evidence(
 async def test_job_reuses_one_classic_resolver_for_domains_and_fallback_but_reloads_next_job(
   app, resolver, repository, dns_message, monkeypatch
 ):
+  """Reuse a classic resolver within a pass and reload configuration for the next pass, including failed attempts."""
+  # jobs is the public job enumeration.
+  # domains is two finite source records.
+  # index is one source domain ID.
+  # servers is mutable configuration returned to each snapshot read.
+  # instances is created classic resolver objects.
+  # queries is observed resolver settings and query types.
+  # original is the real resolver constructor.
+  # instance is one resolver created by the recording constructor.
+  # row is one captured resolver/query observation.
   jobs = importlib.import_module('jobs.job_registry')
   domains = [app.dto.DomainResult(id=index, name=f'domain-{index}.example.test') for index in (1, 2)]
   repository.get_new_domains_for_resolve = AsyncMock(return_value=domains)
@@ -1280,11 +1736,13 @@ async def test_job_reuses_one_classic_resolver_for_domains_and_fallback_but_relo
   original = dns.asyncresolver.Resolver
 
   def create(*args, **kwargs):
+    """Construct and record a real resolver from args and kwargs."""
     instance = original(*args, **kwargs)
     instances.append(instance)
     return instance
 
   async def classic(boundary, qname, rdtype, **kwargs):
+    """Record boundary settings for qname/rdtype, then fail A or return the alias response."""
     queries.append((boundary, boundary.nameservers[0], boundary.timeout, boundary.lifetime, qname, rdtype))
     servers[:] = [app.Server(server='192.0.2.54', id=42)]
     monkeypatch.setattr(app.settings, 'dns_timeout', 0.7)
@@ -1306,7 +1764,7 @@ async def test_job_reuses_one_classic_resolver_for_domains_and_fallback_but_relo
   assert len(instances) == 2
   assert len(queries) == 4
   assert all(row[:4] == (instances[1], '192.0.2.54', 0.7, 0.9) for row in queries)
-  repository.put_domain_after_resolve.assert_not_awaited()
+  assert repository.put_domain_after_resolve.await_count == 4
 
 
 @pytest.mark.parametrize('transport', ['classic', 'doh'])
@@ -2315,12 +2773,20 @@ async def test_doh_http_failure_does_not_log_response_body(app, resolver, caplog
   ],
 )
 async def test_cycle_completion_controls_mutation(app, resolver, repository, network, kinds, complete, ips):
+  """Nonempty DNS configurations save terminal dates without widening IP completeness.
+
+  app/resolver/repository/network isolate processing; kinds supplies endpoint evidence,
+  complete is the independent completeness oracle and ips is the allowed addition set.
+  """
+  # servers names the synthetic endpoints; index allocates their stable addresses.
+  # value is each configured endpoint; ip is each prepared address addition in the saved payload.
   servers = [f'192.0.2.{index + 1}' for index in range(len(kinds))]
   network(dict(zip(servers, kinds, strict=True)))
   repository.get_all_ips_for_domain.return_value = [
     app.Ip(id=10, ip_address='9.9.9.9', addr_type=4),
     app.Ip(id=11, ip_address='2001:4860:4860::8888', addr_type=6),
   ]
+  # domain receives operation-local evidence and the terminal timestamp.
   domain = app.dto.DomainResult(id=1, name='www.example.test')
   await resolver._DomainsResolver__dns_main_tasker(
     domain=domain,
@@ -2328,11 +2794,14 @@ async def test_cycle_completion_controls_mutation(app, resolver, repository, net
     doh_dns_servers=[],
   )
   assert domain.resolution_complete is complete
-  if complete or ips:
+  if kinds:
+    # queued is the sole saving result, including marker-only failures.
+    repository.put_domain_after_resolve.assert_awaited_once()
     queued = repository.put_domain_after_resolve.await_args.kwargs['domain']
     assert {ip.ip_address for ip in queued.insert.ips_insert} == ips
     assert set(queued.insert.ips_delete) == ({10} if complete else set())
     assert queued.resolution_complete is complete
+    assert queued.last_attempt_at.tzinfo is UTC
   else:
     repository.put_domain_after_resolve.assert_not_awaited()
 
@@ -2356,15 +2825,135 @@ async def test_distinct_server_addresses_are_unioned_before_reconciliation(
   assert {ip.ip_address for ip in queued.insert.ips_insert} == {'8.8.8.8', '9.9.9.9'}
 
 
-async def test_storage_read_failure_enqueues_nothing(app, resolver, repository, network):
+@pytest.mark.parametrize('failure_site', ['read', 'preparation'])
+async def test_storage_read_failure_enqueues_only_attempt_marker(app, resolver, repository, network, failure_site):
+  """A post-DNS read/preparation error saves completion without unsafe IP or checkpoint changes.
+
+  app/resolver/repository/network isolate successful DNS; failure_site selects a
+  typed read error or a malformed repository record that fails real preparation.
+  """
   network({'192.0.2.53': 'positive'})
-  repository.get_all_ips_for_domain.side_effect = app.database.DomainIpReadError('Unable to read domain IPs')
+  if failure_site == 'read':
+    repository.get_all_ips_for_domain.side_effect = app.database.DomainIpReadError('Unable to read domain IPs')
+  else:
+    repository.get_all_ips_for_domain.return_value = [SimpleNamespace()]
   await resolver._DomainsResolver__dns_main_tasker(
     domain=app.dto.DomainResult(id=1, name='www.example.test'),
     default_dns_servers=[app.Server(server='192.0.2.53')],
     doh_dns_servers=[],
   )
-  repository.put_domain_after_resolve.assert_not_awaited()
+  # queued contains no usable reconciliation evidence after the failed snapshot read.
+  repository.put_domain_after_resolve.assert_awaited_once()
+  queued = repository.put_domain_after_resolve.await_args.kwargs['domain']
+  assert queued.resolution_complete is False
+  assert queued.storage_ips == ()
+  assert queued.last_attempt_at.tzinfo is UTC
+
+
+@pytest.mark.parametrize('kind', ['positive', 'nodata', 'servfail'])
+async def test_terminal_date_precedes_blocked_admission_and_is_not_recomputed(
+  app, resolver, repository, network, monkeypatch, kind
+):
+  """Freeze successful, empty and failed completion before a delayed writer admission.
+
+  app/resolver/repository/network isolate the boundary; monkeypatch controls UTC time
+  and kind selects independently classified DNS evidence.
+  """
+  # instant is the processing completion; later represents arbitrary queue backpressure.
+  instant = datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC)
+  later = instant.replace(day=3)
+  # clock changes only after the result reaches the admission boundary.
+  clock = SimpleNamespace(now=instant)
+
+  class Clock:
+    """Return controlled UTC wall time without changing asyncio's scheduling clock."""
+
+    @staticmethod
+    def now(tz):
+      """Return the selected time in the requested timezone tz."""
+      return clock.now.astimezone(tz)
+
+  monkeypatch.setattr(app.resolver, 'datetime', Clock)
+  network({'192.0.2.53': kind})
+  # entered/release bracket enqueue waiting; domain holds the result whose frozen date is inspected.
+  entered, release = asyncio.Event(), asyncio.Event()
+  domain = app.dto.DomainResult(id=1, name='completion.example.test')
+
+  async def admit(domain):
+    """Block this domain's admission after its completion time must already be frozen."""
+    assert domain.last_attempt_at == instant
+    entered.set()
+    await release.wait()
+
+  repository.put_domain_after_resolve.side_effect = admit
+  # operation owns processing and is always reaped, including assertion failures.
+  operation = asyncio.create_task(
+    resolver._DomainsResolver__dns_main_tasker(domain, [app.Server(server='192.0.2.53')], [])
+  )
+  try:
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    clock.now = later
+    release.set()
+    await asyncio.wait_for(operation, timeout=2)
+    assert domain.last_attempt_at == instant
+    repository.put_domain_after_resolve.assert_awaited_once()
+  finally:
+    operation.cancel()
+    await asyncio.gather(operation, return_exceptions=True)
+
+
+async def test_reused_result_clears_prior_date_before_unfinished_dns(app, resolver, repository, network, monkeypatch):
+  """A new execution cannot save an earlier completion when DNS is cancelled unfinished.
+
+  app/resolver/repository/network provide a prior completed cycle; monkeypatch
+  blocks the next DNS operation before it can return trustworthy terminal evidence.
+  """
+  network({'192.0.2.53': 'nodata'})
+  # domain is deliberately reused so stale operation state is observable.
+  domain = app.dto.DomainResult(id=1, name='reuse.example.test')
+  await resolver._DomainsResolver__dns_main_tasker(domain, [app.Server(server='192.0.2.53')], [])
+  assert domain.last_attempt_at is not None
+  repository.put_domain_after_resolve.reset_mock()
+  # entered signals unfinished DNS; blocker prevents accidental terminal completion.
+  entered, blocker = asyncio.Event(), asyncio.Event()
+
+  async def blocked(*args, **kwargs):
+    """Hold a synthetic DNS request until its owning operation cancels it."""
+    assert domain.last_attempt_at is None
+    entered.set()
+    await blocker.wait()
+
+  monkeypatch.setattr(dns.asyncresolver.Resolver, 'resolve', blocked)
+  # operation owns the second execution and is cancelled only after actual DNS entry.
+  operation = asyncio.create_task(
+    resolver._DomainsResolver__dns_main_tasker(domain, [app.Server(server='192.0.2.53')], [])
+  )
+  try:
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    operation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await asyncio.wait_for(operation, timeout=2)
+    assert domain.last_attempt_at is None
+    repository.put_domain_after_resolve.assert_not_awaited()
+  finally:
+    operation.cancel()
+    await asyncio.gather(operation, return_exceptions=True)
+
+
+async def test_admission_error_never_creates_a_second_fallback_marker(app, resolver, repository, network):
+  """An ordinary enqueue exception cannot be mistaken for a processing failure.
+
+  app/resolver/repository/network isolate successful DNS and fail only its saving boundary.
+  """
+  network({'192.0.2.53': 'nodata'})
+  repository.put_domain_after_resolve.side_effect = RuntimeError('Synthetic admission failure')
+  # domain must retain its prepared result and exactly one admission attempt.
+  domain = app.dto.DomainResult(id=1, name='admission.example.test')
+  with pytest.raises(RuntimeError, match='Synthetic admission failure'):
+    await resolver._DomainsResolver__dns_main_tasker(domain, [app.Server(server='192.0.2.53')], [])
+  repository.put_domain_after_resolve.assert_awaited_once()
+  assert domain.resolution_complete is True
+  assert domain.last_attempt_at.tzinfo is UTC
 
 
 async def test_storage_mapping_failure_is_typed_and_session_is_released(app, monkeypatch):
@@ -2439,7 +3028,12 @@ async def test_partial_cycle_preserves_existing_representation_without_enrichmen
 async def test_full_storage_payload_preserves_existing_filtered_match_but_never_adds_blocked_address(
   app, resolver, repository, monkeypatch, dns_message, complete, existing
 ):
+  """Save every filtered terminal result while retaining only already-supported blocked addresses."""
+
+  # servers is one or two endpoint descriptors controlling completeness.
+  # domain is the processed result with policy-filtered storage evidence.
   async def classic(boundary, qname, rdtype, **kwargs):
+    """Return blocked address evidence or a negative answer according to boundary endpoint."""
     if boundary.nameservers[0] == '192.0.2.54':
       raise dns.exception.Timeout()
     return SimpleNamespace(response=dns_message(query=dns.message.make_query(qname, rdtype), addresses=('127.0.0.1',)))
@@ -2456,10 +3050,9 @@ async def test_full_storage_payload_preserves_existing_filtered_match_but_never_
   assert domain.resolution_complete is complete
   assert domain.storage_ips == (('127.0.0.1',) if existing else ())
   assert domain.insert.ips_insert == []
-  if complete or existing:
-    assert repository.put_domain_after_resolve.await_args.kwargs['domain'].storage_ips == domain.storage_ips
-  else:
-    repository.put_domain_after_resolve.assert_not_awaited()
+  repository.put_domain_after_resolve.assert_awaited_once()
+  assert repository.put_domain_after_resolve.await_args.kwargs['domain'].storage_ips == domain.storage_ips
+  assert domain.last_attempt_at.tzinfo is UTC
 
 
 async def test_partial_payload_contains_all_matching_representations_and_no_unobserved_old_address(
@@ -2744,6 +3337,15 @@ async def test_processing_outcomes_do_not_conflate_reliable_absence_partial_and_
   kinds,
   expected,
 ):
+  """Keep DNS processing classifications independent of marker-only writer admissions."""
+  # metrics is the production measurement module.
+  # run is the current NEW operation.
+  # observation is per-domain processing and persistence accounting.
+  # servers is endpoint addresses for the evidence scenario.
+  # index is one endpoint position.
+  # domain is the processed saving result.
+  # server is one configured endpoint.
+  # snapshot is final primitive counters for the run.
   metrics = importlib.import_module('metrics.metrics')
   run = metrics.ResolutionRun('new')
   run.select(1)
@@ -2762,6 +3364,9 @@ async def test_processing_outcomes_do_not_conflate_reliable_absence_partial_and_
   assert snapshot['success'] + snapshot['partial'] + snapshot['failure'] == 1
   if kinds in (['nodata', 'servfail'], ['servfail'], []):
     repository.get_all_ips_for_domain.assert_not_awaited()
+  if kinds:
+    repository.put_domain_after_resolve.assert_awaited_once()
+  else:
     repository.put_domain_after_resolve.assert_not_awaited()
 
 

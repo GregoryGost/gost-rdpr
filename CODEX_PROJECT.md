@@ -537,6 +537,11 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
   mandatory DB receipts and sticky writer-failure wakeups are separate from optional metrics. Unknown outcomes retain
   ownership without TTL/replay. Worker completion does not wait commit. Shutdown cleans coordinator preadmission work
   before writer drain and retains outcome bookkeeping through native cleanup before closing HTTP clients.
+- Automatic NEW selection requires both `last_attempt_at` and `last_resolved_at` to be NULL. STALE uses
+  `COALESCE(last_attempt_at, last_resolved_at)` and the existing `domains_update_interval`, including unresolved
+  domains. STALE order is the effective date then ID; domain `0` is excluded. Existing optional by-ID eligibility
+  predicates agree with these rules; manual saved-ID requests bypass the interval. Keep finite snapshots without
+  introducing per-ID automatic rechecks.
 - Public API docs: runtime `/docs` and `/docs/openapi.json`; checked-in export `docs/OPENAPI.json`.
   Contract changes must reconcile models, route metadata, tests, and the export when applicable.
 - Active FastAPI rule/skill: `python_fastapi.md` + `python-fastapi-expert`.
@@ -590,6 +595,11 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
   atomically. Completed legacy import skips its preflight; pending historical imports retain their full validation.
   Previously discarded secondary owners can be learned only from later DNS evidence. An old app on the upgraded
   database and automatic downgrade are unsupported; rollback requires restoring the paired prior app and database.
+- Attempt-date migration: `migration_202618042125.py` adds nullable `last_attempt_at` without a default. Its one-time
+  backfill copies existing `last_resolved_at` only for ordinary domains whose attempt date is NULL; historical
+  `updated_at`, existing attempt dates and other data remain unchanged. These values are inherited checkpoints,
+  not a reconstructed history. Pending legacy preflight accepts exactly the prior and current domain-table DDL;
+  completed-import fast skips and all other schema checks remain unchanged.
 - Active database toolkit skill: `python-sqlalchemy-core`.
 - Active database-specific skill: `python-sqlalchemy-sqlite`.
 - Dependency versions source: `pyproject.toml` and `poetry.lock`.
@@ -611,11 +621,18 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
   batch-size/time based writes; this queue is not durable.
 - Transaction policy: batch writer uses `BEGIN IMMEDIATE` and owns commit/rollback.
   Enqueue completion is not a commit acknowledgement and does not guarantee immediate read-after-write.
-- Resolution payload: admission freezes domain ID, completeness and the full prepared `storage_ips` tuple.
+- Resolution payload: admission freezes domain ID, completeness, the full prepared `storage_ips` tuple and the UTC
+  `last_attempt_at` captured at terminal processing completion. Preserve that time through regrouping and retries.
+  Normal terminal failures and partial results without usable IP also enqueue an incomplete empty result.
   Resolution intents reconcile supports in admission order inside the existing category phases. Complete IPv4
   evidence withdraws only that domain's absent supports and advances its checkpoint; partial evidence only adds,
-  failures preserve prior state, and IPv6 is untouched. Orphan cleanup/projection repair follows all successful
+  failures preserve prior IP/checkpoint state, and IPv6 is untouched. All attempt dates update before direct domain
+  deletions; complete-only `resolved`/`last_resolved_at` updates remain after deletions. Domain `updated_at` retains its
+  existing `onupdate`, including attempt-only writes. Orphan cleanup/projection repair follows all successful
   batch phases, preserving retained IP IDs/metadata and avoiding incidental `updated_at` changes.
+- Attempt persistence retains existing admission/commit guarantees: pre-processing failures, unfinished cancellation
+  and abnormal unfinished DNS aggregation create no saved attempt. Cancellation before queue admission does not
+  persist the result; already admitted commands remain writer-owned. No additional durable queue or recovery is added.
 - Deployment process/worker assumption: one Python application process per database.
   Verify again before any multi-worker/process change.
 - Writer lifecycle: `DataBase` owns its queue, pending batch and writer/cleanup tasks; setup starts one writer.
