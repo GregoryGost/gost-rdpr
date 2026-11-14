@@ -38,10 +38,17 @@ Use this mode in a project that consumes rules, skills, and the project profile 
 - An active rule or skill may narrow the selected request mode, allowed surfaces, side effects, or output format, but cannot broaden authorization from the current user message.
 - Before a mutation, the candidate action must satisfy both request routing and every applicable active material. A prohibition from either boundary wins.
 
-## Subagents For Code Changes
+## Subagents For Code Changes And Read-Only Assessments
 
-- When a target project enables delegated executable code/test work, `.codex/rules/subagent_coordination.md` becomes mandatory bootstrap support before the primary dispatches or a specialist acts. It does not require an optional Active Rules entry; missing it blocks delegation but never authorizes unrelated writes.
-- Delegate only within authorized executable application/test-code work. Do not delegate documentation-only, comment-only, docstring-only, instruction-only or unrelated tasks. The primary chooses relevant roles rather than launching all agents; preserve active rule/skill activation and request_routing.md in every handoff. Delegation never expands user authorization, sandbox permissions or allowed side effects.
+- When a target project enables delegated executable code/test work or standalone read-only assessments,
+  `.codex/rules/subagent_coordination.md` becomes mandatory before dispatch. No optional Active Rules entry is needed;
+  missing coordination rules block delegation and never authorize unrelated writes.
+- Delegate only authorized executable application/test-code work or profile-enabled standalone read-only research,
+  assessment, analysis and review. A read-only assignment does not require permission to change code.
+  Do not delegate documentation-only, comment-only, docstring-only or instruction-only authoring/editing
+  or unrelated work.
+  The primary selects relevant roles and preserves active materials and request_routing.md in every handoff.
+  Delegation never expands user authorization, sandbox permissions or allowed side effects.
 - Before dependent work, the primary explicitly selects a scope-specific Architecture Gate state: NOT_REQUIRED when architects are not appointed, or PENDING immediately when both architects are appointed (even mid-task). PENDING, REOPENED and architecture BLOCKED bar affected downstream design, test scenario authoring, code/test edits, testing and acceptance by the PRIMARY and all subagents. Bounded authorized read-only research, architecture proposals/critique and factual diagnosis remain permitted.
 - When a target selects `database_architect`, the primary must screen data-impacting code/test work: material data design, migration, transactional integrity, privacy/tenant isolation, resilience or substantial performance risk requires a scoped database assessment. Keep `db_assessment_status` separate from Architecture Gate; a required PENDING, CHANGES_REQUIRED, BLOCKED or STALE assessment blocks affected DOWNSTREAM implementation planning, code/test edits, test execution and acceptance, including with Architecture Gate NOT_REQUIRED. Bounded read-only architecture proposals, specialist review and factual investigation remain permitted while existing Architecture Gate rules allow them. Before APPROVED require DBA CLEAR for the exact canonical candidate when mandatory. DBA is NOT a third general-architect endorsement; do not waive a required specialist solely because both architects agree.
 - BOTH architects must endorse the identical canonical final design revision; only then may the primary issue an approved, scoped Architecture Handoff with an explicit decision_version. Pass its current scope/version/contracts to downstream agents. If approvals, scope or source of truth cannot be verified, stop dependent work; never silently deselect architects to bypass the gate.
@@ -67,7 +74,8 @@ Keep `AGENTS.md` small. Detailed workflows belong in `.codex/rules/`, `.agents/s
 
 - `.codex/rules/request_routing.md` must exist and be applied for every new user message in both repository modes.
 - Never omit, disable, replace, or set the mandatory request-routing rule to `none` in a target project's `CODEX_PROJECT.md`.
-- `.codex/rules/subagent_coordination.md` is conditionally mandatory when a target project enables delegated code/test work; this rule cannot expand the current request's permissions.
+- `.codex/rules/subagent_coordination.md` is conditionally mandatory for delegated code/test work and standalone
+  read-only assessments; this rule cannot expand the current request's permissions.
 - `.codex/rules/material_dependencies.md` is conditionally mandatory whenever an active artifact declares hard dependencies; it does not require a separate `Active Rules` entry.
 - Do not apply a dependent artifact when the validator file or any required rule or skill is missing, inactive, disabled, ambiguous, or set to `none`.
 - Do not silently activate missing dependencies or unrelated overlays.

@@ -67,6 +67,14 @@ async def resource_api(app, store, monkeypatch):
 
 @pytest.mark.parametrize('count', [0, 1, 3])
 async def test_statistics_routeros_total_counts_real_configurations(app, store, resource_api, count):
+  """Preserve empty-domain statistics while counting real RouterOS configurations.
+
+  app/store provide isolated mappings and SQLite; resource_api reads the actual
+  statistics route, and count selects the number of synthetic RouterOS records.
+  """
+  # connection seeds only this fixture's database; index distinguishes synthetic hosts.
+  # session reads the real aggregate independently of HTTP serialization.
+  # response is the public statistics response; payload contains its decoded counters.
   if count:
     async with store._DataBase__write_engine.begin() as connection:
       await connection.execute(
@@ -88,7 +96,14 @@ async def test_statistics_routeros_total_counts_real_configurations(app, store, 
   payload = response.json()
   assert payload['ros'] == {'total': count}
   assert payload['dns'] == {'total': 0, 'classic': 0, 'doh': 0}
-  assert payload['domains'] == {'total': 0, 'resolved': 0, 'unresolved': 0, 'lists_total': 0, 'per_list': []}
+  assert payload['domains'] == {
+    'total': 0,
+    'resolved': 0,
+    'unresolved': 0,
+    'unprocessed': 0,
+    'lists_total': 0,
+    'per_list': [],
+  }
   assert payload['ips'] == {
     'total': 0,
     'v4_total': 0,
@@ -662,15 +677,24 @@ async def test_growth_http_rejects_invalid_filter_combinations(resource_api, que
 
 
 async def test_catalog_statistics_aggregate_all_resources_and_per_list_counts(catalog_store, resource_api):
+  """Check every catalog aggregate while preserving all existing list breakdowns.
+
+  catalog_store seeds a temporary mixed catalog; resource_api reads its public
+  statistics response. Positive IDs 1 and 3 have neither processing date, so
+  they alone contribute to the unprocessed count.
+  """
+  # response is the actual statistics HTTP reply; payload holds its decoded catalog sections.
   response = await resource_api.get('/stats')
   assert response.status_code == 200
   payload = response.json()
   assert payload['dns'] == {'total': 3, 'classic': 2, 'doh': 1}
   assert payload['ros'] == {'total': 4}
+  # key and value enumerate each section's named scalar counter, excluding its list breakdown.
   assert {key: value for key, value in payload['domains'].items() if key != 'per_list'} == {
     'total': 4,
     'resolved': 1,
     'unresolved': 3,
+    'unprocessed': 2,
     'lists_total': 3,
   }
   assert {key: value for key, value in payload['ips'].items() if key != 'per_list'} == {
@@ -681,6 +705,7 @@ async def test_catalog_statistics_aggregate_all_resources_and_per_list_counts(ca
     'standalone': 0,
     'lists_total': 3,
   }
+  # Both sorting callbacks read each row's list_id; index constructs the independently expected list entries.
   assert sorted(payload['domains']['per_list'], key=lambda row: row['list_id']) == [
     {
       'list_id': index,
@@ -13944,3 +13969,365 @@ async def test_attempt_backfill_failure_rolls_back_column_and_history_then_recov
       '2001-02-03 04:05:06',
       '2002-03-04 05:06:07',
     )
+
+
+@pytest.fixture
+async def unprocessed_domain_rows(app, store):
+  """Seed independent date, status, list and creation-date cases in isolated SQLite.
+
+  app supplies the real mappings and store owns the temporary database. Undated
+  positive IDs 1, 7, 8 and 9 are the unprocessed set, even when resolved is true.
+  """
+  # known marks an ordinary processing date; epoch serializes as the known timestamp zero.
+  known = datetime(2024, 1, 5, tzinfo=UTC)
+  epoch = datetime.fromtimestamp(0, UTC).astimezone().replace(tzinfo=None)
+  # cases explicitly distinguish service records, one-date records, epoch dates and undated rows.
+  cases = [
+    (-1, 'alpha-service', False, None, None, 1),
+    (0, 'alpha-default', True, None, None, 1),
+    (1, 'alpha-new', False, None, None, 1),
+    (2, 'alpha-attempted', False, known, None, 1),
+    (3, 'alpha-checkpoint', True, None, known, 1),
+    (4, 'alpha-complete', True, known, known, 1),
+    (5, 'alpha-epoch-attempt', False, epoch, None, 1),
+    (6, 'alpha-epoch-checkpoint', False, None, epoch, 1),
+    (7, 'alpha-undated-resolved', True, None, None, 2),
+    (8, 'beta-new', False, None, None, 3),
+    (9, 'alpha-later', False, None, None, 4),
+  ]
+  # identifier is the stored ID, name the synthetic DNS label, and status the existing resolved flag.
+  # attempt/checkpoint supply the two processing dates; day sets creation in January 2024.
+  # connection owns these test-setup writes to the disposable database.
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.DomainsListsDbo).values(
+        id=10, name='source-list', url='https://lists.example.test/source', attempts=2
+      )
+    )
+    await connection.execute(
+      insert(app.database.DomainsDbo),
+      [
+        {
+          'id': identifier,
+          'name': f'{name}.example.test',
+          'resolved': status,
+          'last_attempt_at': attempt,
+          'last_resolved_at': checkpoint,
+          'created_at': datetime(2024, 1, day, tzinfo=UTC),
+          'domain_list_id': 10 if identifier in (1, 2) else None,
+        }
+        for identifier, name, status, attempt, checkpoint, day in cases
+      ],
+    )
+
+
+@pytest.mark.usefixtures('unprocessed_domain_rows')
+@pytest.mark.parametrize('path', ['/domains', '/domains/search'])
+@pytest.mark.parametrize(
+  ('options', 'expected_ids', 'query_total'),
+  [
+    ({'unprocessed': 'true', 'limit': 2, 'offset': 0}, [1, 7], 4),
+    ({'unprocessed': 'true', 'limit': 2, 'offset': 2}, [8, 9], 4),
+    ({'unprocessed': 'true', 'limit': 2, 'offset': 4}, [], 4),
+    ({'unprocessed': 'true', 'resolved': 'false'}, [1, 8, 9], 3),
+    ({'unprocessed': 'true', 'resolved': 'true'}, [7], 1),
+    (
+      {'unprocessed': 'true', 'start_date': '2024-01-02 00:00:00', 'end_date': '2024-01-03 23:59:59'},
+      [7, 8],
+      2,
+    ),
+    ({'unprocessed': 'true', 'start_date': '2025-01-01 00:00:00'}, [], 0),
+    ({'unprocessed': 'true', 'end_date': '2024-01-01 23:59:59'}, [1], 1),
+    ({'unprocessed': 'true', 'start_date': '2024-01-04 00:00:00'}, [9], 1),
+    ({'unprocessed': 'false', 'resolved': 'false'}, [-1, 1, 2, 5, 6, 8, 9], 7),
+    ({'resolved': 'true'}, [0, 3, 4, 7], 4),
+    ({}, [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 11),
+    ({'unprocessed': 'false'}, [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 11),
+  ],
+)
+async def test_unprocessed_domain_http_filter_counts_before_pagination(
+  resource_api, path, options, expected_ids, query_total
+):
+  """Apply the optional date-null filter by AND while preserving existing global totals.
+
+  resource_api uses real routers and SQLite. path covers list and search; options
+  selects one filter/page boundary, expected_ids enumerates its independent result,
+  and query_total counts every match before limit/offset. Only the enabled subset
+  promises ID ordering; omitted/false requests retain the established behavior.
+  """
+  # params combines page defaults, the required matching search text and this case's options.
+  params = {'limit': 100, 'offset': 0, **({'text': 'example.test'} if path.endswith('/search') else {}), **options}
+  # response and payload hold the real HTTP status and serialized page.
+  response = await resource_api.get(path, params=params)
+  assert response.status_code == 200, response.text
+  payload = response.json()
+  assert (payload['total'], payload['total_resolved'], payload['total_query'], payload['count']) == (
+    11,
+    4,
+    query_total,
+    len(expected_ids),
+  )
+  assert (payload['limit'], payload['offset']) == (params['limit'], params['offset'])
+  # identifiers records row identities; row is each returned public domain projection.
+  identifiers = [row['id'] for row in payload['payload']]
+  assert (identifiers if options.get('unprocessed') == 'true' else sorted(identifiers)) == expected_ids
+  if options.get('unprocessed') == 'true':
+    for row in payload['payload']:
+      assert row['last_attempt_at'] is row['last_resolved_at'] is None
+      assert row['id'] > 0
+
+
+@pytest.mark.usefixtures('unprocessed_domain_rows')
+@pytest.mark.parametrize(('text_value', 'expected_ids'), [('alpha', [1, 7, 9]), ('beta', [8]), ('absent', [])])
+async def test_unprocessed_domain_search_intersects_name_and_status(resource_api, text_value, expected_ids):
+  """Search within the complete unprocessed set rather than within a loaded page.
+
+  resource_api reads isolated real data; text_value selects matching or absent
+  names, and expected_ids explicitly lists the full filtered result.
+  """
+  # response is the actual search response; payload carries rows and unpaginated match count.
+  response = await resource_api.get('/domains/search', params={'text': text_value, 'unprocessed': 'true'})
+  assert response.status_code == 200, response.text
+  payload = response.json()
+  # row denotes one public result whose identity must satisfy both predicates.
+  assert [row['id'] for row in payload['payload']] == expected_ids
+  assert (payload['count'], payload['total_query'], payload['total'], payload['total_resolved']) == (
+    len(expected_ids),
+    len(expected_ids),
+    11,
+    4,
+  )
+
+
+@pytest.mark.usefixtures('unprocessed_domain_rows')
+@pytest.mark.parametrize(
+  ('start_date', 'end_date', 'offset', 'expected_ids'),
+  [
+    ('2024-01-02 00:00:00', '2024-01-04 23:59:59', 0, [9]),
+    ('2024-01-02 00:00:00', '2024-01-04 23:59:59', 1, []),
+    ('2024-01-01 00:00:00', '2024-01-03 23:59:59', 0, [1]),
+    ('2024-01-01 00:00:00', '2024-01-03 23:59:59', 1, []),
+  ],
+)
+async def test_unprocessed_domain_search_combines_status_dates_and_pagination(
+  resource_api, start_date, end_date, offset, expected_ids
+):
+  """Intersect every domain filter before counting and paginating the search.
+
+  resource_api reads the real handlers and isolated SQLite. start_date/end_date
+  select two creation windows; offset selects the first or exhausted page, and
+  expected_ids lists its independently expected identities. In the later window,
+  name excludes ID 8, status excludes ID 7 and the start date excludes ID 1.
+  The earlier window excludes ID 9 by its end date and excludes dated records
+  through unprocessed. Each complete selection has one match, even on an empty page.
+  """
+  # params enables all filters together and requests one item from the selected page.
+  params = {
+    'text': 'alpha',
+    'unprocessed': 'true',
+    'resolved': 'false',
+    'start_date': start_date,
+    'end_date': end_date,
+    'limit': 1,
+    'offset': offset,
+  }
+  # response contains the actual HTTP result; payload holds its rows and catalog counts.
+  response = await resource_api.get('/domains/search', params=params)
+  assert response.status_code == 200, response.text
+  payload = response.json()
+  # row is each returned public domain whose identity must satisfy the complete intersection.
+  assert [row['id'] for row in payload['payload']] == expected_ids
+  assert (payload['limit'], payload['offset']) == (1, offset)
+  assert (payload['count'], payload['total_query'], payload['total'], payload['total_resolved']) == (
+    len(expected_ids),
+    1,
+    11,
+    4,
+  )
+
+
+@pytest.mark.usefixtures('unprocessed_domain_rows')
+async def test_unprocessed_statistics_remain_global_and_preserve_existing_counters(resource_api):
+  """Keep global category and list statistics independent of list/search page requests.
+
+  resource_api uses the fixture's real SQLite data, including dated epoch-zero
+  records and service IDs that must never contribute to the new category.
+  """
+  # expected preserves all old counters and the original per-list breakdown.
+  expected = {
+    'total': 11,
+    'resolved': 4,
+    'unresolved': 7,
+    'unprocessed': 4,
+    'lists_total': 1,
+    'per_list': [
+      {'list_id': 10, 'list_name': 'source-list', 'total': 2, 'resolved': 0, 'unresolved': 2, 'attempts': 2}
+    ],
+  }
+  # path/params select different page/search/status/date contexts; response is each public response.
+  for path, params in (
+    ('/domains', {'unprocessed': 'true', 'limit': 1, 'offset': 3}),
+    ('/domains', {'resolved': 'true', 'limit': 1}),
+    ('/domains/search', {'text': 'beta', 'unprocessed': 'true'}),
+    ('/domains/search', {'text': 'absent', 'start_date': '2025-01-01 00:00:00'}),
+  ):
+    response = await resource_api.get(path, params=params)
+    assert response.status_code == 200, response.text
+    response = await resource_api.get('/stats')
+    assert response.status_code == 200, response.text
+    assert response.json()['domains'] == expected
+    assert type(response.json()['domains']['unprocessed']) is int
+  # identifier/field select the two dated controls; detail proves their public value is exactly zero.
+  for identifier, field in ((5, 'last_attempt_at'), (6, 'last_resolved_at')):
+    detail = await resource_api.get(f'/domains/{identifier}')
+    assert detail.status_code == 200, detail.text
+    assert detail.json()[field] == 0
+
+
+async def test_unprocessed_statistics_zero_with_only_service_or_dated_domains(app, store, resource_api):
+  """Return integer zero for a nonempty database without eligible ordinary domains.
+
+  app/store seed only isolated data; resource_api exercises the aggregate and
+  enabled filter, including exclusion of both zero and negative service IDs.
+  """
+  # connection seeds two undated service rows and one ordinary domain with an attempt date.
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(
+      insert(app.database.DomainsDbo),
+      [
+        {'id': -1, 'name': 'service.example.test', 'last_attempt_at': None},
+        {'id': 0, 'name': 'default', 'last_attempt_at': None},
+        {'id': 1, 'name': 'attempted.example.test', 'last_attempt_at': datetime(2024, 1, 1, tzinfo=UTC)},
+      ],
+    )
+  # response is each public response; value is the JSON counter whose null/bool coercion is forbidden.
+  response = await resource_api.get('/stats')
+  assert response.status_code == 200, response.text
+  value = response.json()['domains']['unprocessed']
+  assert type(value) is int
+  assert value == 0
+  response = await resource_api.get('/domains', params={'unprocessed': 'true'})
+  assert response.status_code == 200, response.text
+  assert (response.json()['total_query'], response.json()['count'], response.json()['payload']) == (0, 0, [])
+
+
+@pytest.mark.parametrize('path', ['/domains', '/domains/search'])
+async def test_unprocessed_domain_http_rejects_invalid_boolean(resource_api, store, path):
+  """Reject an invalid enabling flag at the HTTP schema boundary without writes.
+
+  resource_api calls actual routers; store exposes the isolated writer queue,
+  and path covers both public query models.
+  """
+  # params keeps required search text valid so the only error concerns the enabling flag.
+  params = {'unprocessed': 'undated', **({'text': 'example.test'} if path.endswith('/search') else {})}
+  # response contains FastAPI's validation details for the invalid boolean flag.
+  response = await resource_api.get(path, params=params)
+  assert response.status_code == 422, response.text
+  assert response.json()['detail'][0]['loc'] == ['query', 'unprocessed']
+  assert store.db_save_queue.qsize() == 0
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+  ('classic', 'doh', 'outcome'),
+  [('positive', 'positive', 'success'), ('positive', 'servfail', 'partial'), ('servfail', 'servfail', 'failure')],
+)
+async def test_public_saved_attempt_removes_unprocessed_category_but_diagnostic_preserves_it(
+  e2e_service, classic, doh, outcome
+):
+  """Observe diagnostics and committed success/partial/failure through the real service.
+
+  e2e_service runs main.py, migrations, production routers, lifespan and writer
+  with temporary SQLite and local DNS/DoH/RIPE providers. classic/doh choose wire
+  responses and outcome states the expected terminal processing classification.
+  """
+  # service owns the process/providers; domain_id identifies the initially undated ordinary domain.
+  service = e2e_service
+  service.providers.classic, service.providers.doh = classic, doh
+  domain_id = await configure_public_domain(service, resolved=False)
+  # client bounds public HTTP exchanges; phase selects an observable lifecycle boundary.
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    for phase in ('initial', 'diagnostic', 'saved'):
+      # response is each public acknowledgement or read at this boundary.
+      if phase == 'diagnostic':
+        response = await client.post('/domains/resolve/check', json={'id': domain_id})
+        assert response.status_code == 200, response.text
+      elif phase == 'saved':
+        response = await client.post(f'/domains/{domain_id}/resolve')
+        assert response.status_code == 202, response.text
+        # samples is the public metric snapshot; fields confirms real processing and commit completion.
+        samples, fields = await completed_metrics(client, mode='stored', selected=1)
+        assert fields[outcome] == fields['admitted'] == fields['confirmed'] == 1
+        assert fields['pending'] == fields['unknown'] == fields['known_not_committed'] == 0
+        assert sample_total(samples, 'resolution_run_elapsed_seconds_count', mode='stored') == 1
+      # unprocessed_count is the remaining category size; resolved_total includes the default
+      # record and becomes two only after a complete successful resolution.
+      unprocessed_count = 0 if phase == 'saved' else 1
+      resolved_total = 2 if phase == 'saved' and outcome == 'success' else 1
+      response = await client.get(f'/domains/{domain_id}')
+      assert response.status_code == 200, response.text
+      # domain carries the actual persisted date/status pair, rather than a queue acknowledgement.
+      domain = response.json()
+      assert domain['resolved'] is (phase == 'saved' and outcome == 'success')
+      if phase == 'saved':
+        assert isinstance(domain['last_attempt_at'], (int, float))
+        assert (domain['last_resolved_at'] is not None) is (outcome == 'success')
+      else:
+        assert domain['last_attempt_at'] is domain['last_resolved_at'] is None
+      # path/params cover both enabled public projections; payload is their current page.
+      # row is a returned domain whose identity is compared with the original ordinary domain.
+      for path, params in (
+        ('/domains', {'unprocessed': 'true', 'limit': 1}),
+        ('/domains/search', {'text': 'www.example.test', 'unprocessed': 'true', 'limit': 1}),
+      ):
+        response = await client.get(path, params=params)
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert [row['id'] for row in payload['payload']] == ([domain_id] if unprocessed_count else [])
+        assert (payload['count'], payload['total_query'], payload['total'], payload['total_resolved']) == (
+          unprocessed_count,
+          unprocessed_count,
+          2,
+          resolved_total,
+        )
+        response = await client.get('/stats')
+        assert response.status_code == 200, response.text
+        assert response.json()['domains'] == {
+          'total': 2,
+          'resolved': resolved_total,
+          'unresolved': 2 - resolved_total,
+          'unprocessed': unprocessed_count,
+          'lists_total': 0,
+          'per_list': [],
+        }
+  await service.stop()
+  await service.start()
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    response = await client.get('/domains', params={'unprocessed': 'true'})
+    assert response.status_code == 200, response.text
+    assert (response.json()['total_query'], response.json()['payload']) == (0, [])
+    response = await client.get('/stats')
+    assert response.status_code == 200, response.text
+    assert response.json()['domains']['unprocessed'] == 0
+
+
+async def test_unprocessed_openapi_describes_optional_filter_and_global_integer_counter(resource_api):
+  """Expose the agreed query default and statistics field through actual router schemas.
+
+  resource_api publishes OpenAPI from the production routers/models, so a field
+  present only in the database or only one query model cannot satisfy this test.
+  """
+  # response and schema contain the generated HTTP contract from the real resource routers.
+  response = await resource_api.get('/openapi.json')
+  assert response.status_code == 200, response.text
+  schema = response.json()
+  # path selects each public list projection; parameters indexes its declared query fields.
+  # parameter is one OpenAPI request parameter, keyed by its external name.
+  for path in ('/domains', '/domains/search'):
+    parameters = {parameter['name']: parameter for parameter in schema['paths'][path]['get']['parameters']}
+    assert parameters['unprocessed']['in'] == 'query'
+    assert parameters['unprocessed']['required'] is False
+    assert parameters['unprocessed']['schema']['type'] == 'boolean'
+    assert parameters['unprocessed']['schema']['default'] is False
+  assert schema['components']['schemas']['StatsDomainsData']['properties']['unprocessed']['type'] == 'integer'
+  assert schema['components']['schemas']['StatsDomainsData']['properties']['unprocessed']['default'] == 0

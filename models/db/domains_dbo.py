@@ -84,6 +84,7 @@ class DomainsDbo(Dbo):
     end_date: str | None = None,
     default: bool | None = None,
     search_text: str | None = None,
+    unprocessed: bool = False,
   ) -> tuple[
     Sequence[Row[int, int | None, bool, str, str | None, datetime, datetime | None, datetime | None, datetime | None]],
     int,
@@ -91,8 +92,11 @@ class DomainsDbo(Dbo):
     """Read a filtered domain page and matching count within the caller's session.
 
     limit and offset bound the page; resolved, start_date, end_date, default and
-    search_text preserve the existing optional filters. The detached projection
-    includes both checkpoint and attempt dates for the shared public response.
+    search_text preserve the existing optional filters. unprocessed=True adds
+    the positive-ID, both-dates-NULL predicate and orders that subset by ID. False
+    adds no filter. All selected filters apply together to the page and count.
+    The detached projection includes both checkpoint and attempt dates.
+    Execution errors propagate to the database response boundary.
     """
     try:
       # select_stmt projects the domain fields in the order consumed by the response converter.
@@ -126,6 +130,11 @@ class DomainsDbo(Dbo):
       if search_text is not None:
         select_stmt = select_stmt.where(cls.name.contains(search_text))
         select_query_total_stmt = select_query_total_stmt.where(cls.name.contains(search_text))
+      if unprocessed:
+        # unprocessed_conditions matches NEW scheduling without consulting the resolved flag.
+        unprocessed_conditions = (cls.id > 0, cls.last_attempt_at.is_(None), cls.last_resolved_at.is_(None))
+        select_stmt = select_stmt.where(*unprocessed_conditions).order_by(cls.id)
+        select_query_total_stmt = select_query_total_stmt.where(*unprocessed_conditions)
       # select_limit_stmt applies page bounds without changing the count query.
       select_limit_stmt = select_stmt.limit(limit).offset(offset)
       # result_query_total is the full match count; result contains only the selected page.
@@ -253,19 +262,25 @@ class DomainsDbo(Dbo):
       raise err
 
   @classmethod
-  async def get_stats(cls: type[Self], db_session: AsyncSession) -> Row[int, int, int, int, Any]:
+  async def get_stats(cls: type[Self], db_session: AsyncSession) -> Row[int, int, int, int, Any, int]:
+    """Read global domain counts and per-list data in the caller-owned session.
+
+    The unprocessed count uses the same positive-ID, both-dates-NULL predicate
+    as NEW scheduling, regardless of the resolved flag. Existing totals and
+    per-list counts retain their meaning. Execution errors propagate to the caller.
+    """
     try:
-      #
-      # CTE 1
-      #
+      # domain_stats_cte computes all global counts in the existing domain-table aggregate.
       domain_stats_cte: CTE = select(
         func.count(cls.id).label('total'),
         func.sum(case((cls.resolved.is_(True), 1), else_=0)).label('resolved'),
         func.sum(case((cls.resolved.is_(False), 1), else_=0)).label('unresolved'),
+        func.coalesce(
+          func.sum(case(((cls.id > 0) & cls.last_attempt_at.is_(None) & cls.last_resolved_at.is_(None), 1), else_=0)),
+          0,
+        ).label('unprocessed'),
       ).cte('domain_stats')
-      #
-      # CTE 2
-      #
+      # per_list_stats_cte retains counts for every configured list, including empty lists.
       per_list_stats_cte: CTE = (
         select(
           DomainsListsDbo.id.label('list_id'),
@@ -284,13 +299,9 @@ class DomainsDbo(Dbo):
         .group_by(DomainsListsDbo.id)
         .cte('per_list_stats')
       )
-      #
-      # Lists
-      #
+      # lists_total_scalar counts configured lists independently of domain membership.
       lists_total_scalar: ScalarSelect[int] = select(func.count(DomainsListsDbo.id)).scalar_subquery()
-      #
-      # JSON per_list
-      #
+      # per_list_json_scalar serializes the unchanged per-list columns for the response converter.
       per_list_json_scalar: ScalarSelect[Any] = (
         select(
           func.json_group_array(
@@ -313,18 +324,19 @@ class DomainsDbo(Dbo):
         .select_from(per_list_stats_cte)
         .scalar_subquery()
       )
-      #
-      # Final
-      #
-      select_stmt: Select[int, int, int, int, Any] = select(
+      # select_stmt appends the new count after the five existing positional result columns.
+      select_stmt: Select[int, int, int, int, Any, int] = select(
         domain_stats_cte.c.total,
         domain_stats_cte.c.resolved,
         domain_stats_cte.c.unresolved,
         lists_total_scalar.label('lists_total'),
         per_list_json_scalar.label('per_list'),
+        domain_stats_cte.c.unprocessed,
       )
-      exec_result: Result[int, int, int, int, Any] = await db_session.execute(select_stmt)
+      # exec_result contains one aggregate row, even when the domain table is empty.
+      exec_result: Result[int, int, int, int, Any, int] = await db_session.execute(select_stmt)
       return exec_result.one()
+    # err is passed to the database response boundary without changing its established behavior.
     except Exception as err:
       raise err
 

@@ -33,11 +33,25 @@ class StatsDomainsListItem(StatsBase):
 
 
 class StatsDomainsData(StatsBase):
+  """Expose global domain counts and the existing per-list breakdown."""
+
+  # total includes every stored domain context, preserving the catalog's existing total.
   total: int = Field(default=0, description='Total domain records')
+  # resolved counts domains whose stored resolution flag is true.
   resolved: int = Field(default=0, description='Resolved domains')
+  # unresolved counts domains whose stored resolution flag is false.
   unresolved: int = Field(default=0, description='Unresolved domains')
+  # lists_total counts configured domain lists, including empty lists.
   lists_total: int = Field(default=0, description='Total domain lists')
+  # per_list reports the existing counts and download attempts for each domain list.
   per_list: list[StatsDomainsListItem] = Field(default_factory=list, description='Per-list breakdown for bar chart')
+  # unprocessed counts positive-ID domains with neither a saved attempt nor a resolution checkpoint.
+  unprocessed: int = Field(
+    default=0,
+    description=(
+      'Domains with a positive ID and no last attempt or last resolution date, regardless of the resolved flag'
+    ),
+  )
 
 
 class StatsIpsListItem(StatsBase):
