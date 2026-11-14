@@ -4,7 +4,7 @@
     "title": "GOST-RDPR (Resolve Domains Per Records)",
     "summary": "A utility for working with Mikrotik RouterOS and BGP protocol for announcing IP addresses",
     "description": "The utility provides parsing of domain names into IP addresses, processing of domain lists and their \n    subsequent parsing, processing of individual IP addresses and summarized IP groups. Updates firewall address list \n    and routing table",
-    "version": "2.2.1"
+    "version": "2.3.1"
   },
   "paths": {
     "/metrics": {
@@ -4465,6 +4465,33 @@
               }
             ],
             "title": "Last Resolved At Hum"
+          },
+          "last_attempt_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Attempt At",
+            "description": "Last completed saving attempt in epoch seconds; null when no attempt date is recorded."
+          },
+          "last_attempt_at_hum": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Attempt At Hum",
+            "description": "Last completed saving attempt formatted as YYYY-MM-DD HH:MM:SS; null when no date is recorded."
           }
         },
         "type": "object",
@@ -4475,7 +4502,8 @@
           "created_at",
           "created_at_hum"
         ],
-        "title": "DomainElementResp"
+        "title": "DomainElementResp",
+        "description": "Expose a stored domain, its supported addresses and nullable lifecycle dates."
       },
       "DomainResolveReq": {
         "properties": {
