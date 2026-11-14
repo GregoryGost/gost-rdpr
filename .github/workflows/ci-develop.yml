@@ -34,6 +34,8 @@ jobs:
       contents: write
     env:
       UI_REPOSITORY: GregoryGost/gost-rdpr-ui
+      # UI_BRANCH selects the frontend branch cloned by the Docker UI builder.
+      UI_BRANCH: develop
       DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
     steps:
       - name: Checkout release commit and tags
@@ -48,7 +50,7 @@ jobs:
         with:
           python-version: '3.15'
 
-      - name: Read base version and recover this run's source revisions
+      - name: Read base version and recover this run's release tag
         id: version
         shell: python
         env:
@@ -61,79 +63,71 @@ jobs:
           import tomllib
           from pathlib import Path
 
+          # name identifies each required Docker Hub repository variable.
           for name in ('DOCKERHUB_USERNAME', 'DOCKERHUB_IMAGE'):
             if not os.environ.get(name, '').strip():
               raise SystemExit(f'Missing repository variable: {name}')
           if not re.fullmatch(r'[0-9a-f]{40}', os.environ['BACKEND_SHA']):
             raise SystemExit('Missing or invalid merged backend commit')
 
+          # version is the backend release base; component rejects noncanonical SemVer numbers.
           version = tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version']
           component = r'(0|[1-9][0-9]*)'
           if not isinstance(version, str) or not re.fullmatch(rf'{component}\.{component}\.{component}', version):
             raise SystemExit('project.version must be a stable SemVer base such as 2.3.0')
 
+          # result lists development tags attached to this backend commit.
           result = subprocess.run(
             ['git', 'tag', '--points-at', os.environ['BACKEND_SHA'], '--list', f'v{version}-dev.*'],
             check=True,
             capture_output=True,
             text=True,
           )
+          # pattern selects valid development tags; releases collects reservations belonging to this run.
           pattern = re.compile(rf'v{re.escape(version)}-dev\.([1-9][0-9]*)')
           releases = []
+          # tag is one candidate reservation for the current backend version.
           for tag in result.stdout.splitlines():
             if not pattern.fullmatch(tag):
               continue
+            # annotation contains the Git object type and the release metadata stored in its message.
             annotation = subprocess.run(
               ['git', 'for-each-ref', f'refs/tags/{tag}', '--format=%(objecttype)%00%(contents)'],
               check=True,
               capture_output=True,
               text=True,
             ).stdout
+            # object_type distinguishes annotated tags; message holds JSON; _ discards the separator.
             object_type, _, message = annotation.partition('\0')
             if object_type != 'tag':
               continue
             try:
+              # release is the decoded reservation, checked before it can be reused.
               release = json.loads(message)
             except json.JSONDecodeError:
               continue
             if not isinstance(release, dict) or release.get('run_id') != os.environ['GITHUB_RUN_ID']:
               continue
+            # expected binds the reservation to this backend, UI branch and destination image.
             expected = {
-              'schema': 1,
+              'schema': 2,
               'tag': tag,
               'backend_sha': os.environ['BACKEND_SHA'],
               'ui_repository': os.environ['UI_REPOSITORY'],
+              'ui_branch': os.environ['UI_BRANCH'],
               'image': os.environ['DOCKERHUB_IMAGE'],
             }
+            # key and value identify each required reservation field and its expected value.
             if any(release.get(key) != value for key, value in expected.items()):
               raise SystemExit('The reserved release does not match this workflow run')
-            if not isinstance(release.get('ui_sha'), str) or not re.fullmatch(r'[0-9a-f]{40}', release['ui_sha']):
-              raise SystemExit('The reserved release has an invalid UI commit')
             releases.append(release)
           if len(releases) > 1:
             raise SystemExit('Multiple development tags belong to the same workflow run')
+          # existing_tag lets a retry reuse its reserved version instead of allocating another one.
           existing_tag = releases[0]['tag'] if releases else ''
-          ui_sha = releases[0]['ui_sha'] if releases else ''
+          # output exposes the version and optional reservation to subsequent steps.
           with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as output:
-            output.write(f'version={version}\nexisting_tag={existing_tag}\nui_sha={ui_sha}\n')
-
-      - name: Resolve the exact UI commit
-        id: ui
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        env:
-          RESERVED_UI_SHA: ${{ steps.version.outputs.ui_sha }}
-        with:
-          script: |
-            const [owner, repo] = process.env.UI_REPOSITORY.split('/');
-            let sha = process.env.RESERVED_UI_SHA;
-            if (!sha) {
-              const branch = await github.rest.repos.getBranch({owner, repo, branch: 'develop'});
-              sha = branch.data.commit.sha;
-            }
-            if (!/^[0-9a-f]{40}$/.test(sha)) {
-              throw new Error('Invalid UI commit');
-            }
-            core.setOutput('sha', sha);
+            output.write(f'version={version}\nexisting_tag={existing_tag}\n')
 
       - name: Log in to Docker Hub
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
@@ -155,34 +149,33 @@ jobs:
           postfix: dev
           dryrun: true
 
-      - name: Reserve the development tag with both source revisions
+      - name: Reserve the development tag with the backend revision and UI branch
         id: release
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           BASE_VERSION: ${{ steps.version.outputs.version }}
           DEV_TAG: ${{ steps.version.outputs.existing_tag || steps.tag.outputs.newtag }}
           EXISTING_TAG: ${{ steps.version.outputs.existing_tag }}
-          UI_COMMIT: ${{ steps.ui.outputs.sha }}
         with:
           script: |
+            // tag is this run's release version; base escapes the stable version for validation.
             const tag = process.env.DEV_TAG;
             const base = process.env.BASE_VERSION.replaceAll('.', '\\.');
             if (!new RegExp(`^v${base}-dev\\.[1-9][0-9]*$`).test(tag)) {
               throw new Error('Missing or invalid development tag');
             }
-            if (!/^[0-9a-f]{40}$/.test(process.env.UI_COMMIT)) {
-              throw new Error('Invalid UI commit');
-            }
             if (!process.env.EXISTING_TAG) {
+              // message records the backend revision and the UI branch selected at build time.
               const message = JSON.stringify({
-                schema: 1,
+                schema: 2,
                 run_id: process.env.GITHUB_RUN_ID,
                 tag,
                 backend_sha: process.env.BACKEND_SHA,
                 ui_repository: process.env.UI_REPOSITORY,
-                ui_sha: process.env.UI_COMMIT,
+                ui_branch: process.env.UI_BRANCH,
                 image: process.env.DOCKERHUB_IMAGE
               });
+              // object is the annotated tag whose SHA is used when creating the release ref.
               const object = await github.rest.git.createTag({
                 ...context.repo, tag, message, object: process.env.BACKEND_SHA, type: 'commit'
               });
@@ -197,7 +190,6 @@ jobs:
         shell: python
         env:
           DEV_TAG: ${{ steps.release.outputs.tag }}
-          UI_COMMIT: ${{ steps.ui.outputs.sha }}
         run: |
           import json
           import os
@@ -205,27 +197,33 @@ jobs:
           import subprocess
           from pathlib import Path
 
+          # reference names the immutable version; result contains its registry lookup outcome.
           reference = f'{os.environ["DOCKERHUB_IMAGE"]}:{os.environ["DEV_TAG"]}'
           result = subprocess.run(
             ['docker', 'buildx', 'imagetools', 'inspect', reference, '--format', '{{json .Manifest}}'],
             capture_output=True,
             text=True,
           )
+          # digest remains empty only when the versioned image has not been published.
           digest = ''
           if result.returncode:
+            # error normalizes the lookup failure; reason enumerates recognized missing-image responses.
             error = result.stderr.lower()
             if not any(reason in error for reason in ('manifest unknown', 'manifest_unknown', ': not found')):
               raise SystemExit(f'Cannot determine whether the versioned image exists: {result.stderr}')
           else:
+            # manifest is the published index; expected lists the release metadata required for reuse.
             manifest = json.loads(result.stdout)
             expected = {
               'org.opencontainers.image.revision': os.environ['BACKEND_SHA'],
               'org.opencontainers.image.version': os.environ['DEV_TAG'],
-              'io.github.gregorygost.gost-rdpr.ui.revision': os.environ['UI_COMMIT'],
+              'io.github.gregorygost.gost-rdpr.ui.branch': os.environ['UI_BRANCH'],
             }
+            # annotations holds index metadata; key and value select each required matching field.
             annotations = manifest.get('annotations', {})
             if any(annotations.get(key) != value for key, value in expected.items()):
-              raise SystemExit('The published version has different or missing source revisions; refusing to overwrite it')
+              raise SystemExit('The published version has different or missing release metadata; refusing to overwrite it')
+            # platforms collects OS/architecture pairs; item is one descriptor in the published index.
             platforms = {
               (item.get('platform', {}).get('os'), item.get('platform', {}).get('architecture'))
               for item in manifest.get('manifests', [])
@@ -235,6 +233,7 @@ jobs:
             digest = manifest.get('digest', '')
             if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
               raise SystemExit('The published version has an invalid image digest')
+          # output tells later steps whether to build or reuse the verified published digest.
           with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as output:
             output.write(f'exists={str(bool(digest)).lower()}\ndigest={digest}\n')
 
@@ -254,12 +253,13 @@ jobs:
           push: true
           tags: ${{ env.DOCKERHUB_IMAGE }}:${{ steps.release.outputs.tag }}
           build-args: |
-            UI_BRANCH=develop
-            UI_COMMIT=${{ steps.ui.outputs.sha }}
+            UI_BRANCH=${{ env.UI_BRANCH }}
           annotations: |
             index:org.opencontainers.image.revision=${{ env.BACKEND_SHA }}
             index:org.opencontainers.image.version=${{ steps.release.outputs.tag }}
-            index:io.github.gregorygost.gost-rdpr.ui.revision=${{ steps.ui.outputs.sha }}
+            index:io.github.gregorygost.gost-rdpr.ui.branch=${{ env.UI_BRANCH }}
+          # Refresh the selected UI branch even when an earlier build populated the cache.
+          no-cache-filters: ui-builder
           cache-from: type=gha,scope=develop
           cache-to: type=gha,scope=develop,mode=max,ignore-error=true
 
@@ -269,21 +269,22 @@ jobs:
         env:
           BASE_VERSION: ${{ steps.version.outputs.version }}
           DEV_TAG: ${{ steps.release.outputs.tag }}
-          UI_COMMIT: ${{ steps.ui.outputs.sha }}
         with:
           script: |
-            const [owner, repo] = process.env.UI_REPOSITORY.split('/');
+            // backend is the current develop head; tags lists published or reserved backend versions.
             const backend = await github.rest.repos.getBranch({...context.repo, branch: 'develop'});
-            const ui = await github.rest.repos.getBranch({owner, repo, branch: 'develop'});
             const tags = await github.paginate(github.rest.repos.listTags, {...context.repo, per_page: 100});
+            // base escapes the stable version; pattern selects its development tags; number is this release suffix.
             const base = process.env.BASE_VERSION.replaceAll('.', '\\.');
             const pattern = new RegExp(`^v${base}-dev\\.([1-9][0-9]*)$`);
             const number = BigInt(process.env.DEV_TAG.match(pattern)[1]);
+            // newer detects a later reservation; the callback's tag is one candidate and match holds its suffix.
             const newer = tags.some(tag => {
               const match = tag.name.match(pattern);
               return match && BigInt(match[1]) > number;
             });
-            const current = !newer && backend.data.commit.sha === process.env.BACKEND_SHA && ui.data.commit.sha === process.env.UI_COMMIT;
+            // current permits moving dev only while this backend revision and release remain current.
+            const current = !newer && backend.data.commit.sha === process.env.BACKEND_SHA;
             core.setOutput('update', String(current));
             if (!current) core.info('Keeping dev unchanged because a newer source revision or release exists');
 

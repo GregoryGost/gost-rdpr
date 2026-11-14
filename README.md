@@ -458,12 +458,33 @@ The [Dockerfile](./Dockerfile) fetches and builds the UI, then packages it with 
 Build arguments include `UI_REPO_URL`, `UI_BRANCH`, `PYTHON_VERSION`, `NODE_VERSION`,
 `PNPM_VERSION` and `POETRY_VERSION`.
 
+The UI builder uses Node.js `26.13.1` and pnpm `12.18.0`; the current UI requires Node.js `>=26.12.1`.
+pnpm is installed through npm because Node.js 26 does not bundle Corepack.
+Dependencies are installed with `pnpm install --frozen-lockfile`, and `pnpm build:docker` builds the UI without
+running the TypeScript check.
+
+`UI_BRANCH` defaults to `main`:
+
 ```powershell
-docker buildx build --platform linux/amd64 --load -t gost-rdpr:local .
+docker buildx build --platform linux/amd64 --no-cache-filter ui-builder --load -t gost-rdpr:local .
 ```
 
+To build the UI from `develop`:
+
+```powershell
+docker buildx build --platform linux/amd64 --no-cache-filter ui-builder `
+  --build-arg UI_BRANCH=develop --load -t gost-rdpr:local .
+```
+
+`--no-cache-filter ui-builder` fetches the selected branch again instead of reusing a previously cloned UI.
+The Python stages retain their normal build cache.
 Use `linux/arm64` when targeting that platform.
 Run the result using the quick-start options with image `gost-rdpr:local`.
+
+The development-image workflow selects the UI `develop` branch and refreshes the UI builder cache in the same way.
+It runs after backend pull requests are merged into `develop` or through a manual workflow dispatch on that branch.
+An update only to the UI requires a new manual workflow run; a retry reuses the versioned image if it was already
+published by that run.
 
 Codex contributors should start with [AGENTS.md](./AGENTS.md) and [CODEX_PROJECT.md](./CODEX_PROJECT.md).
 
