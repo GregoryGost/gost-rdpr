@@ -56,8 +56,10 @@ The full source catalog and template are not active profiles.
 ## Agent Roles And Model Selection
 
 - Subagents enabled: yes
-- Delegation scope: authorized executable application/test-code changes only (not documentation-only, comment-only,
-  docstring-only or instruction-only tasks).
+- Delegation scope: authorized executable application/test-code changes and standalone read-only research, assessment,
+  analysis and review. A read-only assessment does not require an implementation request or a proposed patch.
+- Scope exclusions: documentation-only, comment-only, docstring-only and instruction-only authoring/editing workflows
+  remain nondelegated.
 - Primary agent model/effort: gpt-6.1-sol / xhigh (select in the client or target .codex/config.toml; this entry alone
   does not configure the running session).
 - Selected role files: all ten exact paths in the role table below.
@@ -83,11 +85,15 @@ The full source catalog and template are not active profiles.
 
 ### Delegation And Ownership
 
-- `.codex/rules/subagent_coordination.md` is mandatory when subagents are enabled for authorized code/test changes, even
-  if not listed in Active Rules. Load it before delegation; a missing copy blocks delegation. Send a bounded task packet
-  with current verified predecessor reports, not the parent chat. Only the primary may publish verified completed
-  handoff files.
-- Before delegating a scoped code-change workflow, the primary decides whether architecture is needed, records the
+- `.codex/rules/subagent_coordination.md` is mandatory for authorized code/test delegation and standalone read-only
+  assessments, even if not listed in Active Rules. Load it before delegation; a missing copy blocks delegation.
+  Send a bounded task packet with current verified predecessor reports, not the parent chat. Only the primary may
+  publish verified completed handoff files.
+- Standalone `review-only` and `analysis-only` assignments use the selected read-only specialist roles within their
+  expertise. Implementers and `test_engineer` retain their authorized code/test-change scope. Assign no writable files;
+  prohibit file edits, generated artifacts, mutating tests, installations, Git mutations and external-system writes.
+  Return findings in-session; the local-ephemeral setting does not authorize assessment report files or fixes.
+- Before delegating a scoped workflow, the primary decides whether architecture is needed, records the
   Architecture Gate state and dependencies, determines required test/review roles based on risk and the active project
   policy, and verifies allowed side effects. Spawn only relevant agents. The gate applies to the PRIMARY as well as all
   downstream agents.
@@ -338,7 +344,7 @@ Database and security skills are selected explicitly below; do not invent additi
 Conditional bootstrap support files:
 
 - `.codex/rules/material_dependencies.md` for hard-dependency validation.
-- `.codex/rules/subagent_coordination.md` before authorized code/test delegation.
+- `.codex/rules/subagent_coordination.md` before authorized code/test delegation or standalone read-only assessment.
 
 ## Active Skills
 

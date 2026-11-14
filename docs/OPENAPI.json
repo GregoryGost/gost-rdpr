@@ -3,7 +3,7 @@
   "info": {
     "title": "GOST-RDPR (Resolve Domains Per Records)",
     "summary": "A utility for working with Mikrotik RouterOS and BGP protocol for announcing IP addresses",
-    "description": "The utility provides parsing of domain names into IP addresses, processing of domain lists and their \n    subsequent parsing, processing of individual IP addresses and summarized IP groups. Updates firewall address list \n    and routing table",
+    "description": "The utility provides parsing of domain names into IP addresses, processing of domain lists and their\n    subsequent parsing, processing of individual IP addresses and summarized IP groups. Updates firewall address list\n    and routing table",
     "version": "2.3.1"
   },
   "paths": {
@@ -1240,6 +1240,21 @@
               ],
               "title": "View resolved domains"
             }
+          },
+          {
+            "name": "unprocessed",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "title": "View unprocessed domains",
+              "description": "When true, include only domains with a positive ID and no last attempt or last resolution date. False or omission adds no filter. Other filters, including resolved, apply together.",
+              "examples": [
+                true
+              ],
+              "default": false
+            },
+            "description": "When true, include only domains with a positive ID and no last attempt or last resolution date. False or omission adds no filter. Other filters, including resolved, apply together."
           }
         ],
         "responses": {
@@ -1498,6 +1513,21 @@
               "description": "Search text for fields \"name\""
             },
             "description": "Search text for fields \"name\""
+          },
+          {
+            "name": "unprocessed",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "title": "View unprocessed domains",
+              "description": "When true, include only domains with a positive ID and no last attempt or last resolution date. False or omission adds no filter. Other filters, including resolved, apply together.",
+              "examples": [
+                true
+              ],
+              "default": false
+            },
+            "description": "When true, include only domains with a positive ID and no last attempt or last resolution date. False or omission adds no filter. Other filters, including resolved, apply together."
           }
         ],
         "responses": {
@@ -4296,7 +4326,7 @@
       },
       "DnsServerId": {
         "type": "integer",
-        "minimum": 0
+        "minimum": 0.0
       },
       "DnsServerResolveResultResp": {
         "properties": {
@@ -4528,7 +4558,7 @@
             "anyOf": [
               {
                 "type": "integer",
-                "exclusiveMinimum": 0
+                "exclusiveMinimum": 0.0
               },
               {
                 "type": "null"
@@ -5441,7 +5471,7 @@
             "anyOf": [
               {
                 "type": "integer",
-                "exclusiveMinimum": 0
+                "exclusiveMinimum": 0.0
               },
               {
                 "type": "null"
@@ -5710,10 +5740,17 @@
             "type": "array",
             "title": "Per List",
             "description": "Per-list breakdown for bar chart"
+          },
+          "unprocessed": {
+            "type": "integer",
+            "title": "Unprocessed",
+            "description": "Domains with a positive ID and no last attempt or last resolution date, regardless of the resolved flag",
+            "default": 0
           }
         },
         "type": "object",
-        "title": "StatsDomainsData"
+        "title": "StatsDomainsData",
+        "description": "Expose global domain counts and the existing per-list breakdown."
       },
       "StatsDomainsListItem": {
         "properties": {
@@ -5848,7 +5885,7 @@
             "type": "number",
             "title": "Duration",
             "description": "Time taken to compute the response",
-            "default": 0
+            "default": 0.0
           }
         },
         "type": "object",
@@ -5984,7 +6021,7 @@
           "ros"
         ],
         "title": "StatsResp",
-        "description": "Example:\n```json\n{\n  \"generated_at\": \"2025-01-15 10:30:00\",\n  \"dns\": {\n    \"total\": 5,\n    \"classic\": 3,\n    \"doh\": 2\n  },\n  \"domains\": {\n    \"total\": 1500,\n    \"resolved\": 1200,\n    \"unresolved\": 300,\n    \"lists_total\": 4,\n    \"per_list\": [\n      { \"list_id\": 1, \"list_name\": \"voice-domains\", \"total\": 500, \"resolved\": 450, \"unresolved\": 50, \"attempts\": 3 },\n      { \"list_id\": 2, \"list_name\": \"social-domains\", \"total\": 1000, \"resolved\": 750, \"unresolved\": 250, \"attempts\": 1 }\n    ]\n  },\n  \"ips\": {\n    \"total\": 2000,\n    \"v4_total\": 1800,\n    \"v6_total\": 200,\n    \"linked_to_domain\": 1500,\n    \"standalone\": 500,\n    \"lists_total\": 3,\n    \"per_list\": [\n      { \"list_id\": 1, \"list_name\": \"ips-list\", \"total\": 800, \"v4_count\": 700, \"v6_count\": 100 }\n    ]\n  },\n  \"ros\": {\n    \"total\": 2\n  }\n}\n```"
+        "description": "Example:\n```json\n{\n  \"generated_at\": \"2025-01-15 10:30:00\",\n  \"dns\": {\n    \"total\": 5,\n    \"classic\": 3,\n    \"doh\": 2\n  },\n  \"domains\": {\n    \"total\": 1500,\n    \"resolved\": 1200,\n    \"unresolved\": 300,\n    \"lists_total\": 4,\n    \"per_list\": [\n      {\n        \"list_id\": 1, \"list_name\": \"voice-domains\", \"total\": 500,\n        \"resolved\": 450, \"unresolved\": 50, \"attempts\": 3\n      },\n      {\n        \"list_id\": 2, \"list_name\": \"social-domains\", \"total\": 1000,\n        \"resolved\": 750, \"unresolved\": 250, \"attempts\": 1\n      }\n    ]\n  },\n  \"ips\": {\n    \"total\": 2000,\n    \"v4_total\": 1800,\n    \"v6_total\": 200,\n    \"linked_to_domain\": 1500,\n    \"standalone\": 500,\n    \"lists_total\": 3,\n    \"per_list\": [\n      { \"list_id\": 1, \"list_name\": \"ips-list\", \"total\": 800, \"v4_count\": 700, \"v6_count\": 100 }\n    ]\n  },\n  \"ros\": {\n    \"total\": 2\n  }\n}\n```"
       },
       "StatsRosData": {
         "properties": {

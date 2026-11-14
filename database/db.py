@@ -1305,11 +1305,14 @@ class DataBase:
     end_date: str | None = None,
     default: bool | None = None,
     search_text: str | None = None,
+    unprocessed: bool = False,
   ) -> DomainsPayloadResp:
     """Convert a filtered domain page to the shared list/search HTTP response.
 
-    before_time supplies duration timing; pagination and filters are passed to
-    the mapped read. All date fields retain the existing epoch/display conversion.
+    before_time supplies duration timing; limit and offset bound the page.
+    resolved, start_date, end_date, default and search_text are passed to the
+    mapped read. unprocessed=True adds the undated positive-ID subset; false
+    adds no filter. All filters apply together. Dates retain their existing conversion.
     A read error keeps the established empty-response behavior and closes the session.
     """
     logger.debug('Try get all Domains ...')
@@ -1335,6 +1338,7 @@ class DataBase:
           end_date=end_date,
           default=default,
           search_text=search_text,
+          unprocessed=unprocessed,
         )
         # domains is the selected page, while query_total records its unpaginated size.
         domains = domains_and_query[0]
@@ -2243,7 +2247,14 @@ class DataBase:
   # Stats
 
   async def stats(self: Self) -> StatsResp:
+    """Convert committed catalog aggregates to the public statistics response.
+
+    Reads use a short-lived session. Domain unprocessed counts exclude the
+    default context and require both attempt and checkpoint dates to be absent.
+    A read failure preserves the established partially populated response.
+    """
     logger.debug('Try get all statistics ...')
+    # result starts with zero-valued sections and receives each detached catalog aggregate.
     result: StatsResp = StatsResp(
       generated_at=datetime.now(UTC).astimezone().strftime(DATE_FORMAT),
       dns=StatsDnsData(),
@@ -2251,15 +2262,19 @@ class DataBase:
       ips=StatsIpsData(),
       ros=StatsRosData(),
     )
+    # db_session owns the aggregate reads and is closed before returning the response.
     db_session: AsyncSession | None = None
     try:
       db_session = await self.__read_connect()
-      #
+      # dns_stats contains total, classic and DoH counts from the DNS aggregate.
       dns_stats: Row[int, int, int] = cast(Row[int, int, int], await DnsServersDbo.get_stats(db_session=db_session))
-      domains_stats: Row[int, int, int, int, Any] = await DomainsDbo.get_stats(db_session=db_session)
+      # domains_stats includes the existing domain/list counts and the new undated-domain count.
+      domains_stats: Row[int, int, int, int, Any, int] = await DomainsDbo.get_stats(db_session=db_session)
+      # ips_stats contains global address counts and the serialized per-list breakdown.
       ips_stats: Row[int, int, int, int, int, int, str] = cast(
         Row[int, int, int, int, int, int, str], await IpRecordsDbo.get_stats(db_session=db_session)
       )
+      # ros_stats contains the number of configured RouterOS devices.
       ros_stats: Row[int] = cast(Row[int], await RosConfigsDbo.get_stats(db_session=db_session))
       #
       result.dns = StatsDnsData(total=dns_stats.total, classic=dns_stats.classic, doh=dns_stats.doh)
@@ -2268,7 +2283,9 @@ class DataBase:
         resolved=domains_stats.resolved or 0,
         unresolved=domains_stats.unresolved or 0,
         lists_total=domains_stats.lists_total,
+        # item is one decoded list aggregate used to build its public domain-list entry.
         per_list=[StatsDomainsListItem(**item) for item in loads(domains_stats.per_list or '[]')],
+        unprocessed=domains_stats.unprocessed or 0,
       )
       result.ips = StatsIpsData(
         total=ips_stats.total,
@@ -2277,11 +2294,13 @@ class DataBase:
         linked_to_domain=ips_stats.linked_to_domain or 0,
         standalone=ips_stats.standalone or 0,
         lists_total=ips_stats.lists_total,
+        # item is one decoded list aggregate used to build its public IP-list entry.
         per_list=[StatsIpsListItem(**item) for item in loads(ips_stats.per_list or '[]')],
       )
       result.ros = StatsRosData(total=ros_stats.total)
       #
       return result
+    # err preserves the existing logging, rollback and partial-response boundary.
     except Exception as err:
       logger.error(f'Try get all statistics failed : {err}', exc_info=True)
       if db_session is not None:

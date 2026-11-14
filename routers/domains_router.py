@@ -56,18 +56,27 @@ class DomainsRouter(BaseRouter):
       responses={status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}},
     )
     async def get_all_domains(query: Annotated[DomainsQueryReq, Query()]) -> JSONResponse:
+      """Return a domain page using the validated, conjunctive filters in query.
+
+      The unprocessed flag enables the undated subset only when true.
+      Database response conversion and route error handling retain their existing behavior.
+      """
       logger.debug('Call API route: GET /domains')
       try:
+        # before_time anchors the response duration before the database read.
         before_time: float = monotonic()
+        # return_data is the detached page, full filtered count and global catalog totals.
         return_data: DomainsPayloadResp = await db.get_all_domains(
           before_time=before_time,
           limit=query.limit,
           offset=query.offset,
           resolved=query.resolved,
+          unprocessed=query.unprocessed,
           start_date=query.start_date,
           end_date=query.end_date,
         )
         return JSONResponse(return_data.to_dict(), status.HTTP_200_OK)
+      # err is translated by the established route error response helper.
       except Exception as err:
         logger.error('Domain API request failed', exc_info=True)
         return self.errorResp(err)
@@ -80,19 +89,28 @@ class DomainsRouter(BaseRouter):
       responses={status.HTTP_500_INTERNAL_SERVER_ERROR: {'model': ErrorResp}},
     )
     async def search_domains(query: Annotated[DomainsSearchQueryReq, Query()]) -> JSONResponse:
+      """Search domain names within the validated pagination and status filters in query.
+
+      The unprocessed flag combines with the search and other filters when true.
+      Database response conversion and route error handling retain their existing behavior.
+      """
       logger.debug('Call API route: GET /domains/search')
       try:
+        # before_time anchors the response duration before the database read.
         before_time: float = monotonic()
+        # return_data is the detached page, full filtered count and global catalog totals.
         return_data: DomainsPayloadResp = await db.get_all_domains(
           before_time=before_time,
           limit=query.limit,
           offset=query.offset,
           resolved=query.resolved,
+          unprocessed=query.unprocessed,
           start_date=query.start_date,
           end_date=query.end_date,
           search_text=query.text,
         )
         return JSONResponse(return_data.to_dict(), status.HTTP_200_OK)
+      # err is translated by the established route error response helper.
       except Exception as err:
         logger.error('Domain API request failed', exc_info=True)
         return self.errorResp(err)

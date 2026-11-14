@@ -2,8 +2,17 @@
 
 ## Activation and authorization
 
-- This conditional bootstrap support rule is mandatory when a target project's `CODEX_PROJECT.md` enables subagents for authorized executable application/test-code work. `AGENTS.md` activates it without an optional `Active Rules` entry. If it is missing, do not delegate; report the incomplete setup.
-- The PRIMARY reads it before delegating; each subagent reads it after `request_routing.md` and `AGENTS.md`. This rule never authorizes delegation for documentation-only, comments-only, instruction-only or unrelated work, or new repository/external/Obsidian writes. The current user's request and every applicable gate remain controlling.
+- This conditional bootstrap rule is mandatory when `CODEX_PROJECT.md` enables delegated application/test-code work
+  or standalone read-only assessments. `AGENTS.md` activates it without an optional `Active Rules` entry.
+  If it is missing, do not delegate; report the incomplete setup.
+- The PRIMARY reads it before delegating; each subagent reads it after `request_routing.md` and `AGENTS.md`.
+  This rule does not authorize documentation-only, comment-only, docstring-only or instruction-only authoring/editing,
+  unrelated work or new repository/external/Obsidian writes. The current request and applicable gates still control.
+- Profile-enabled standalone read-only research, assessment, analysis and review need no implementation request
+  or proposed patch. Use a selected read-only role, assign no writable files and return its report in-session.
+  File edits, generated artifacts, mutating tests, installations, Git mutations and external-system writes remain
+  forbidden. Findings and recommendations never authorize fixes; role restrictions and
+  architecture/specialist gates apply.
 - A fresh subagent thread has no inherited conversation turns, but still uses applicable system and project instructions, tools, permissions, workspace and external state. Its OWN long work may still undergo context compaction.
 - Editing policy files in this template repository does not itself activate subagent work.
 
