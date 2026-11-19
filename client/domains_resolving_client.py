@@ -251,6 +251,7 @@ def classify_dns_response(
 class DomainsResolver:
   __semaphore: Semaphore = Semaphore(settings.domains_resolve_semaphore_limit)
 
+  # __http_client prefers HTTP/2 for DoH and shares one retry budget with H1 fallback.
   __http_client: AsyncClient = HttpClient.get_client(
     'domains_resolver',
     timeout=Timeout(
@@ -261,6 +262,7 @@ class DomainsResolver:
     ),
     connection_retries=settings.doh_connection_retries,
     retry_total_timeout=settings.doh_retry_total_timeout,
+    prefer_http2=True,
   )
 
   __ripe_stat_client: RipeStatClient = RipeStatClient()

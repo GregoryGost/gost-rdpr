@@ -1,6 +1,6 @@
 [project]
 name = "gost-rdpr"
-version = "2.3.1"
+version = "2.3.2"
 description = "The utility provides parsing of domain names into IP addresses, processing of domain lists and their subsequent parsing, processing of individual IP addresses and summarized IP groups. Updates firewall address list and routing table"
 authors = [
     {name = "GregoryGost <info@gregory-gost.ru>"}
@@ -16,7 +16,7 @@ dependencies = [
     "aiosqlite (>=0.22.1,<0.23.0)",
     "dnspython (>=2.9.1,<3.0.0)",
     "uvicorn (>=0.54.0,<0.55.0)",
-    "httpx (>=0.28.1,<0.29.0)",
+    "httpx[http2] (>=0.28.1,<0.29.0)",
     "pydantic-settings (>=2.16.1,<3.0.0)",
     "cashews (>=7.6.0,<8.0.0)",
     "toml (>=0.10.2,<0.11.0)",

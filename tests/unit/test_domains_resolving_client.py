@@ -5202,3 +5202,65 @@ async def test_file_checksum_hashes_utf8_content_with_sha256(app, monkeypatch):
   path = Path('synthetic-list.txt')
   assert module.calculate_checksum(path) == 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
   opened.assert_called_once_with(path, encoding='utf-8')
+
+
+@pytest.mark.parametrize(
+  'error_type', [httpx.PoolTimeout, httpx.LocalProtocolError, ValueError, asyncio.CancelledError]
+)
+async def test_http2_preference_never_replays_local_failures_or_cancellation(http_factory, error_type):
+  """Keep pool pressure, local misuse and caller cancellation outside protocol fallback.
+
+  http_factory isolates the wire; error_type chooses a terminal failure whose
+  identity must survive the preferred-protocol transport unchanged.
+  """
+  # error is the exact terminal exception; client owns both protocol pools under one retry policy.
+  error = error_type('Synthetic terminal failure')
+
+  def upstream(request):
+    """Raise the selected terminal exception for the fixture-owned request."""
+    raise error
+
+  client = http_factory.install(upstream, prefer_http2=True, connection_retries=1)
+  with pytest.raises(error_type) as caught:
+    # caught exposes exception identity rather than only its class.
+    await client.get('https://provider.example.test/dns-query')
+  assert caught.value is error
+  assert len(http_factory.calls) == 1
+  assert metric_total('httpx_exchanges_in_flight') == 0
+
+
+async def test_named_http2_policy_conflicts_and_both_pools_close(http_factory):
+  """A named client's HTTP policy is immutable and its two owned pools close once.
+
+  http_factory replaces the wire and records actual pool close calls.
+  """
+  # client is the preferred-protocol profile; its callback returns a healthy synthetic response for any request.
+  client = http_factory.install(lambda request: httpx.Response(200), name='doh', prefer_http2=True)
+  assert http_factory.factory.get_client('doh', prefer_http2=True) is client
+  with pytest.raises(ValueError, match='doh'):
+    http_factory.factory.get_client('doh', prefer_http2=False)
+  await http_factory.factory.close()
+  assert client.is_closed
+  assert len(http_factory.closes) == 2
+  assert http_factory.closes[0] is not http_factory.closes[1]
+  await http_factory.factory.close()
+  assert len(http_factory.closes) == 2
+
+
+@pytest.mark.parametrize('retries', [0, 1, 2])
+async def test_http2_fallback_shares_one_additional_attempt_budget(http_factory, retries):
+  """Persistent wire failure consumes exactly the configured shared attempt budget.
+
+  http_factory records each request; retries is the number of extra attempts,
+  including any transition from the preferred protocol to HTTP/1.1.
+  """
+
+  def unavailable(request):
+    """Reject every synthetic wire attempt with the same retryable failure."""
+    raise httpx.ConnectError('Synthetic unavailable endpoint')
+
+  # client uses the explicit extra-attempt count and no nested resolver retry layer.
+  client = http_factory.install(unavailable, prefer_http2=True, connection_retries=retries)
+  with pytest.raises(httpx.ConnectError):
+    await client.get('https://provider.example.test/dns-query')
+  assert len(http_factory.calls) == retries + 1

@@ -676,15 +676,22 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
 - Retry owner: `RetryTransport` wraps a base `AsyncHTTPTransport` with native retries disabled and configured pool
   limits. Ordinary profiles allow `GET`/`HEAD`; RouterOS allows `GET`/`POST`/`PATCH`/`DELETE`, never `PUT`.
   RouterOS currently uses `POST` only for `/print` reads and `PUT` for creation; preserve this operation boundary.
-  Only explicitly selected statuses/exceptions retry; `PoolTimeout`, cancellation and returned response-body failures
-  do not. Backoff, jitter and `Retry-After` are bounded; `req_retry_total_timeout` limits cumulative sleep, not full
-  request duration. DoH and RIPEstat select their own retry counts and sleep budgets through the same transport owner.
+  Only explicitly selected statuses/exceptions retry; `PoolTimeout`, cancellation and ordinary returned response-body
+  failures do not. DoH buffers successful HTTP/2 response bodies inside its retry boundary so a body transport failure
+  can consume the next available attempt through HTTP/1.1. Backoff, jitter and `Retry-After` are bounded;
+  `req_retry_total_timeout` limits cumulative sleep, not full request duration. DoH and RIPEstat select their own
+  retry counts and sleep budgets through the same transport owner.
   Their client/resolver operation budgets remain outside the retry transport and cover body consumption plus relevant
   semaphore/cache-lock waits. DNS query budgets cover A/CNAME and bulk/stored/one-shot entrypoints. Expiry is failed
   evidence, while external cancellation propagates. Budgets are per query/lookup, not per whole domain/job.
   Independent eligible RIPEstat lookups use bounded workers and the existing shared semaphore; timeout/error handling
   retains the stored-CIDR/host policy and never caches failures as successful empty results.
-- Named client profiles are immutable: reuse matching effective configuration and reject conflicting configuration.
+- DoH prefers HTTP/2 through TLS ALPN with HTTP/1.1 allowed and no preliminary HEAD request. Eligible transport
+  failures switch the next available retry to an HTTP/1.1-only pool. The same attempt/sleep/operation budgets apply;
+  the default allows two HTTP attempts and zero retries disables fallback. DNS validation and HTTP status outcomes
+  do not cause protocol fallback. Per-query state resets before each exchange, including reuse of a Request object.
+- Named client profiles are immutable, including HTTP protocol preference: reuse matching effective configuration
+  and reject conflicting configuration.
   Limits apply independently to each pool; HTTPcore caps idle connections by the open-connection limit.
 - `ObservedAsyncTransport` stays outside the retry layer, preserving one measured exchange across its attempts.
   Environment certificate configuration remains supported, while environment proxy mounts remain disabled.
