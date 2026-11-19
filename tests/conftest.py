@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import socket
+import ssl
 import sys
 from base64 import urlsafe_b64decode
 from collections import Counter
@@ -36,6 +37,9 @@ import dns.rrset
 import dotenv
 import httpx
 import pytest
+from h2.config import H2Configuration
+from h2.connection import H2Connection
+from h2.events import DataReceived, RequestReceived
 from pydantic_settings.sources import DotEnvSettingsSource
 
 _coverage_migration_directories = set()
@@ -1375,3 +1379,234 @@ async def e2e_service(tmp_path, dns_message, request):
         async with asyncio.timeout(5):
           await http_server.wait_closed()
       assert providers.errors == []
+
+
+# This certificate/key pair identifies only the disposable loopback provider, never a real service.
+_DOH_TEST_CERTIFICATE = """-----BEGIN CERTIFICATE-----
+MIIDJTCCAg2gAwIBAgIUMOFU8ipIIpbMTTfsi9H5+ww0qLUwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MTExOTE1MzAyMFoXDTQ2MTEx
+NDE1MzAyMFowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAw/u1swtMx04OZ1SXqfyjNa/ZkyMbhOQzKgDN+4OuZMFK
+LTODTm//DGN1RhHQA5+dsKCknDOU6rb9wDKm7jZ8hJI0Wwjyc2e6vhnKXEjhR22v
+KbIxJVYJ9cb5Q4mbvKzGt+I9djdmdhv408gecjD/vrFBwlMR1gK/uuSI/rJr6+gl
+PPCt64ywF2/k0tQB3SghTV/oX4TIWc973fXq6Mt7UA2LJbTZ7C34RPvGhSpFGLap
+CS4qaJTGfNsn/OikUZtZ8ZKWbDur4boJrlawKM1+N8PqVwFFlufwuHfPlv8J0Gqc
+0PiEiOoTcZ+AjLVh/iuCqfpHwABt6HqULx81nAOzywIDAQABo28wbTAdBgNVHQ4E
+FgQUv5kFMb4l+Iz6s+h10leNvqvMJsEwHwYDVR0jBBgwFoAUv5kFMb4l+Iz6s+h1
+0leNvqvMJsEwDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SH
+BH8AAAEwDQYJKoZIhvcNAQELBQADggEBAJrH1JVLnsUGN1vdg1ZtwkZsHV4iq9+V
+iDf6OYi/mkHl4lJgniLd1reNIlOYF2jYm4KANfxFgm+6YnN5iPfY4uI56EV1D8sw
+9HTIjGFKw9+zk7YriwVu3hSeeigMkxUGXuqujMH/fgCjr7Ed71L/9gQi1fFiM0wg
+1YEejKYVOCSUj6qtNJhLE97QxBxpzPzLInB5J7isfybR443PsdDue+PfJ2TraJyA
+5zxSI92sU0VBsvAfROeRh+lc4HDIcG1gbamt8+XvXKh529VwY7R0jttnCPTBzN3q
+A6tI98KExy60btxIL7RZCisMOtq6LrfL+hCDG135L55fHPLU7qEu6NA=
+-----END CERTIFICATE-----
+"""
+# This public test key has no use outside the matching disposable loopback TLS server.
+_DOH_TEST_PRIVATE_KEY = """-----BEGIN PRIVATE KEY-----
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDD+7WzC0zHTg5n
+VJep/KM1r9mTIxuE5DMqAM37g65kwUotM4NOb/8MY3VGEdADn52woKScM5Tqtv3A
+MqbuNnyEkjRbCPJzZ7q+GcpcSOFHba8psjElVgn1xvlDiZu8rMa34j12N2Z2G/jT
+yB5yMP++sUHCUxHWAr+65Ij+smvr6CU88K3rjLAXb+TS1AHdKCFNX+hfhMhZz3vd
+9eroy3tQDYsltNnsLfhE+8aFKkUYtqkJLipolMZ82yf86KRRm1nxkpZsO6vhugmu
+VrAozX43w+pXAUWW5/C4d8+W/wnQapzQ+ISI6hNxn4CMtWH+K4Kp+kfAAG3oepQv
+HzWcA7PLAgMBAAECggEBALDFEJZ10sLR/NvmyQViAjQicLTuLZwn2J5CK4h4tYvb
+a/RpSj4tdnbOHrEcz+r0xV7TBqZ9QAyVETuSdE7YhmdtGBwkbcr5/M4KpSOn+Mpc
+fGm3d+ydNk6hMaNhMz9y96pUPeuq/Jf7kuwyzINi/soZR57nHmdSA22nRIm2lPEp
+1RbW/Kpm1PVz/6t4PNTp8xjG9FL/ozBd5kvLlGlh1CS8y62To9CcYvTX41p9NwAO
+pjJTnP6jzEm3VjlXm0CrqGQzK4+mSUyM4yqDMs29HD10SZEtdlZWSljBA7fRR5QC
+CrrCijJPMbyYP8HNKQFm+TawPRItctbgmFJi2JdBesECgYEA9EGLKgUrBfeO7YSJ
+fr6IMfSxC7dXTEFGp/zabCAYk21YNsBVct6efj18ypEwR9xg+GCfYJXll+eJQez1
+glGkowsSc6btrXbTqleBLJfBcbMqpCn851YLizqakLtXFUEYoH2OC5NmYd5roTzK
+qqId0s8ukUqRp3Fk+aKXeLE63g8CgYEAzWf+kQZYPltK7R9G1qEJtZ09IaD9IGwY
+nV+pVeFOIYr6924kHfdIOpZCoT1AJB7TkSBSTJosT5ydUtA+te//IPzDNjHphBrF
+dbkh0PY/qbsYQZ0RFdx4nNw5xBGUEjGqMzgXiv0YjOctGPRTcHH8Cm4AL26zUXJS
+sDCZtNXiSoUCgYB9yyO4yGCX+h8KBDArrkTGNZbYyduT0ippabez5/PAOZgs2nEn
+b6+ApHoYeR28ZKssP9bVD13nFb+CzF7EdverYJBoL5hIteHc4KQOKzndLMDROy6c
+lZvsYIop79GxiIz+WqtFGuynir0zlPNrXYKuhzUcbqME8Ulnp20LI3uF0QKBgQCc
+CHugvykZdVAdgLzXHc26YI+nlBu1HWg1ZA3GZzhq0qCChPB6svXzS2GiCl1HEwO0
+ItFhz1wJvfbkibyZiI5OCLRh3th8ubl2DARcMDN8Q9vRO/dWm/wjbEeVYaURjRi1
+f86ijlCv+IyRgEhCCtRjN9x8K6OcIzQdE04vyKn14QKBgQCE4E6KmI7eLvG1428X
+aW8aQKPoxfIxFltWomngy97Xi4W/tzNJ2KSDyxgSZUkaOOrvuHOeg8X7ErVNlAAX
+9LSgY9eU6QxTi/VdoWviI2f0DmGARJtrHBYGtgCDhOTToQXqz0bKOoRXhtzhGAB3
+2SMhzl95tmRt6gt6RcVwqvE06g==
+-----END PRIVATE KEY-----
+"""
+
+
+@pytest.fixture
+async def tls_doh_provider(tmp_path, dns_message):
+  """Serve real ALPN-negotiated DoH with controllable HTTP/2 body failures.
+
+  tmp_path owns the static test identity files; dns_message builds contract-faithful
+  DNS responses. Teardown closes this fixture's accepted sockets, including peers
+  still negotiating TLS, and joins its handler tasks before checking cleanup.
+  The yielded control state exposes the loopback URL and selected fault behavior.
+  """
+  # certificate and private_key are test-owned paths; context negotiates the configured server protocols.
+  certificate, private_key = tmp_path / 'doh-cert.pem', tmp_path / 'doh-key.pem'
+  certificate.write_text(_DOH_TEST_CERTIFICATE, encoding='ascii')
+  private_key.write_text(_DOH_TEST_PRIVATE_KEY, encoding='ascii')
+  context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+  context.load_cert_chain(certificate, private_key)
+  context.set_alpn_protocols(['h2', 'http/1.1'])
+  # state exposes provider controls and wire evidence for each test's isolated endpoint.
+  state = SimpleNamespace(
+    context=context,
+    certificate=certificate,
+    requests=[],
+    protocols=[],
+    errors=[],
+    h2_failure=None,
+    failure_remaining=None,
+    delay=0.0,
+    h1_hold=False,
+    h1_hold_before_headers=False,
+    h1_failure=None,
+    h1_entered=asyncio.Event(),
+    kind='positive',
+    status=200,
+    media_type='application/dns-message',
+    statuses=[],
+    entered=asyncio.Event(),
+    release=asyncio.Event(),
+    active=0,
+  )
+  # handlers retains accepted tasks; connections tracks writers whose TLS handshake has completed.
+  handlers, connections = set(), set()
+
+  def response(method, target, protocol):
+    """Return the selected status/body for method and the DoH query in target.
+
+    protocol identifies the negotiated wire protocol recorded with the request.
+    HEAD is rejected, and a missing DNS query returns a synthetic client error.
+    """
+    # url/params decode the original GET; query preserves DNS identity; status selects one scheduled response.
+    url = urlsplit(target)
+    params = parse_qs(url.query)
+    query = dns.message.from_wire(urlsafe_b64decode(params['dns'][0] + '===')) if 'dns' in params else None
+    state.requests.append((protocol, method, url.path, query.question[0].rdtype if query else None))
+    status = state.statuses.pop(0) if state.statuses else state.status
+    if method == 'HEAD':
+      return 405, b''
+    if query is None:
+      return 400, b''
+    return status, b'invalid DNS' if state.kind == 'malformed' else dns_message(state.kind, query=query).to_wire()
+
+  async def serve(reader, writer):
+    """Read HTTP requests from reader and send selected responses through writer.
+
+    The handler records negotiated protocols and closes writer on peer close,
+    transport failure or cancellation, retiring its active-connection count.
+    """
+    # protocol is actual TLS ALPN; connection handles HTTP/2 framing; data/event are received wire input.
+    protocol = writer.get_extra_info('ssl_object').selected_alpn_protocol()
+    state.protocols.append(protocol)
+    connections.add(writer)
+    state.active += 1
+    try:
+      if protocol == 'h2':
+        connection = H2Connection(config=H2Configuration(client_side=False, header_encoding='utf-8'))
+        connection.initiate_connection()
+        writer.write(connection.data_to_send())
+        await writer.drain()
+        while data := await reader.read(65536):
+          for event in connection.receive_data(data):
+            if isinstance(event, RequestReceived):
+              # headers preserve method/path; status/body hold the response selected by the fake provider.
+              headers = dict(event.headers)
+              status, body = response(headers[':method'], headers[':path'], protocol)
+              # failure applies only to the selected number of H2 requests when a finite count is configured.
+              failure = state.h2_failure if state.failure_remaining is None or state.failure_remaining > 0 else None
+              if state.failure_remaining is not None and state.failure_remaining > 0:
+                state.failure_remaining -= 1
+              if failure == 'disconnect':
+                return
+              if state.delay:
+                await asyncio.sleep(state.delay)
+              connection.send_headers(
+                event.stream_id,
+                [(':status', str(status)), ('content-type', state.media_type), ('content-length', str(len(body)))],
+              )
+              writer.write(connection.data_to_send())
+              await writer.drain()
+              state.entered.set()
+              if failure == 'stall':
+                await state.release.wait()
+              if failure == 'reset':
+                connection.reset_stream(event.stream_id, error_code=2)
+              else:
+                connection.send_data(event.stream_id, body, end_stream=True)
+            elif isinstance(event, DataReceived):
+              connection.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+          writer.write(connection.data_to_send())
+          await writer.drain()
+      else:
+        while True:
+          # head is the bounded header; method/target select its DoH operation, and _ discards the HTTP version.
+          head = await reader.readuntil(b'\r\n\r\n')
+          method, target, _ = head.split(b'\r\n', 1)[0].decode('ascii').split(' ')
+          status, body = response(method, target, 'http/1.1')
+          if state.h1_failure == 'disconnect':
+            return
+          if state.delay:
+            await asyncio.sleep(state.delay)
+          if state.h1_hold_before_headers:
+            state.h1_entered.set()
+            await state.release.wait()
+          writer.write(
+            (
+              f'HTTP/1.1 {status} Test\r\nContent-Type: {state.media_type}\r\nContent-Length: {len(body)}\r\n\r\n'
+            ).encode('ascii')
+          )
+          await writer.drain()
+          if state.h1_hold:
+            state.entered.set()
+            state.h1_entered.set()
+            await state.release.wait()
+          writer.write(body)
+          await writer.drain()
+    except ConnectionError, asyncio.IncompleteReadError, ssl.SSLError:
+      pass
+    except Exception as error:
+      # error retains unexpected fake-server defects for teardown assertions.
+      state.errors.append(repr(error))
+      logging.getLogger(__name__).exception('Local TLS provider failed')
+    finally:
+      state.active -= 1
+      writer.close()
+      try:
+        await writer.wait_closed()
+      except ConnectionError, ssl.SSLError:
+        pass
+      finally:
+        connections.discard(writer)
+
+  def connected(reader, writer):
+    """Retain the handler for accepted reader/writer streams until it finishes."""
+    # task is the handler for this accepted connection; discard removes completed tasks from ownership tracking.
+    task = asyncio.create_task(serve(reader, writer))
+    handlers.add(task)
+    task.add_done_callback(handlers.discard)
+
+  # server binds an ephemeral loopback port; state.url is the only provider endpoint permitted by these tests.
+  server = await asyncio.start_server(connected, '127.0.0.1', 0, ssl=context)
+  state.url = f'https://127.0.0.1:{server.sockets[0].getsockname()[1]}/dns-query'
+  try:
+    yield state
+  finally:
+    state.release.set()
+    server.close()
+    # Pending TLS peers have no writer in connections yet; close all accepted sockets.
+    server.abort_clients()
+    # task traverses a snapshot because completed handlers remove themselves from the set.
+    for task in tuple(handlers):
+      task.cancel()
+    if handlers:
+      async with asyncio.timeout(5):
+        await asyncio.gather(*tuple(handlers), return_exceptions=True)
+    async with asyncio.timeout(5):
+      await server.wait_closed()
+    assert not connections
+    assert state.active == 0
+    assert state.errors == []

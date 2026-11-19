@@ -19,13 +19,18 @@ Load references when needed:
 ## Workflow
 
 1. Read `CODEX_PROJECT.md`.
-2. Confirm that the target is a non-browser Python project.
-3. Identify the public E2E boundary: HTTP API, CLI command, worker, queue consumer, scheduled job, filesystem flow, database-backed flow, or mixed service.
-4. Inspect `pyproject.toml`, lock files, pytest config, service entrypoint, composition root, config loader, migrations, seeds, env loading, CI, and existing E2E tests.
-5. Confirm project-declared E2E command, setup, teardown, dependency policy, environment policy, data isolation policy, port policy, and artifact policy.
-6. Decide which dependencies should be real, containerized, project-declared, or stubbed.
-7. Add the smallest E2E scenario that validates a critical user/system flow.
-8. Run or report the project-declared E2E command.
+1. Confirm that the target is a non-browser Python project.
+1. Identify the public E2E boundary: HTTP API, CLI command, worker, queue consumer, scheduled job, filesystem flow,
+   database-backed flow, or mixed service.
+1. Inspect `pyproject.toml`, lock files, pytest config, service entrypoint, composition root, config loader, migrations,
+   seeds, env loading, CI, and existing E2E tests.
+1. Confirm project-declared E2E command, setup, teardown, dependency policy, environment policy, data isolation policy,
+   port policy, and artifact policy.
+1. Decide which dependencies should be real, containerized, project-declared, or stubbed.
+1. Add the smallest E2E scenario that validates a critical user/system flow.
+1. Run or report the project-declared E2E command.
+1. Check that task-owned subprocesses, test servers, and containers finished, and report any cleanup that remained
+   unresolved.
 
 ## Baseline
 
@@ -68,6 +73,8 @@ Choose the narrowest public boundary that proves the user/system flow:
 - Keep scenario data isolated and cleaned up.
 - Prefer readiness checks, health probes, observable events, explicit completion signals, or bounded polling over fixed sleeps.
 - Clean up app instances, containers, connections, temp files, queues, cache keys, child processes, environment variables, and ports.
+- Use fixture/`finally` teardown for owned runtime resources on failure/timeout, and preserve pre-existing or shared
+  Compose/services.
 - Preserve fixture, mock, async, xdist, and coverage policy from `python-testing`.
 - Keep E2E scenarios small, critical, and behavior-oriented.
 - Treat E2E coverage as additional confidence, not a replacement for unit/integration coverage of business logic.
@@ -82,6 +89,7 @@ Choose the narrowest public boundary that proves the user/system flow:
 - [ ] No real paid, production, or shared uncontrolled external system is called.
 - [ ] Migrations/seeds/test data are deterministic and isolated.
 - [ ] Setup and teardown clean up app instances, containers, connections, env, ports, queues, cache keys, child processes, and temp files.
+- [ ] Task-owned runtime cleanup was checked where observable, with unverified termination reported.
 - [ ] Assertions target externally visible behavior.
 - [ ] E2E command comes from project configuration.
 - [ ] Unit/integration coverage was not duplicated unnecessarily.

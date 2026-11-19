@@ -121,6 +121,14 @@ When `CODEX_PROJECT.md` declares the SQLite single-writer queue pattern, one bac
 - Do not rely only on a pre-check before insert/update; repository write methods must flush and translate any expected constraint violation before returning.
 - Keep transaction ownership clear: service/unit-of-work code should own multi-repository commits; repositories should not surprise callers with commits.
 - Caller-owned transactions control commit and rollback, while repositories remain responsible for persistence exception translation.
+- SQLite does not implement server-side SQL stored procedures. Compare bounded SQL statements, constraints,
+  application-owned units of work, triggers and application-registered functions according to actual needs; their
+  semantics differ, so assess the guarantees each can provide. A Saga alone is insufficient evidence that procedure-like
+  infrastructure is needed.
+- If the approved architecture uses Saga across independent transactional boundaries, each SQLite participant handles
+  only its own committed local step and authorized local compensation. Verify replay/idempotency and event-publication
+  coupling (such as a project-approved outbox when necessary); a process-local writer queue or SQLite transaction cannot
+  guarantee distributed rollback or exactly-once delivery.
 - Perform cache invalidation only after a successful commit. If the transaction rolls back, cache state must remain unchanged.
 - Reference the active cache policy declared by `CODEX_PROJECT.md`; use the active cache and FastAPI skills for cache keys, TTLs, tags, and invalidation. Do not duplicate or fork those rules here.
 

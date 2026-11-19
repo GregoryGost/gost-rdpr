@@ -225,13 +225,21 @@ Environment certificate configuration is supported; environment proxy settings a
 | `DOH_TIMEOUT_READ` | float | `5.0` | DoH timeout for an individual response read |
 | `DOH_TIMEOUT_WRITE` | float | `3.0` | DoH write timeout |
 | `DOH_TIMEOUT_POOL` | float | `2.0` | DoH connection-pool acquisition timeout |
-| `DOH_CONNECTION_RETRIES` | int | `1` | Maximum additional DoH HTTP attempts within the operation budget |
+| `DOH_CONNECTION_RETRIES` | int | `1` | Maximum additional DoH HTTP attempts, including HTTP/1.1 fallback, within the operation budget |
 | `DOH_RETRY_TOTAL_TIMEOUT` | float | `1.0` | Maximum cumulative DoH retry sleep |
 | `DOH_OPERATION_TIMEOUT` | float | `10.0` | Total budget for one DoH A or CNAME operation, including semaphore, pool, retry and response-body waits |
 
 DNS and DoH operation budgets apply to each A or CNAME query, including semaphore admission.
 They are not deadlines for an entire domain or job. Duration settings must be positive and finite.
 DoH uses its own retry count and sleep budget instead of the general HTTP values.
+For HTTPS endpoints, DoH enables HTTP/2 and HTTP/1.1 through TLS ALPN without a preliminary HEAD request.
+An eligible network/protocol failure or phase timeout permits the next available attempt through an HTTP/1.1-only pool;
+HTTP/2 response-body failures are included. The fallback shares the attempt, sleep and operation budgets.
+The default allows at most two HTTP attempts per query; `DOH_CONNECTION_RETRIES=0` disables retries and fallback.
+Pool exhaustion and external cancellation do not trigger fallback.
+HTTP error statuses retain their existing retry policy.
+DNS content, including NXDOMAIN/NODATA, is classified without switching protocol for another answer.
+Each query starts with ALPN again, and both transport pools close during application shutdown.
 
 ### RIPEstat
 

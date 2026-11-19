@@ -2,7 +2,7 @@
 
 ## Execution Contract
 
-This repository consumes `agent-projects-tools` v1.19.2 in target project mode.
+This repository consumes `agent-projects-tools` v1.21.0 in target project mode.
 `AGENTS.md` defines bootstrap order; `.codex/rules/request_routing.md` is mandatory for every request.
 This profile declares capabilities and constraints; it grants no permission for side effects.
 Only exact active entries below and enabled specialized sections activate materials.
@@ -315,6 +315,12 @@ scenarios before appointed architects complete their approval.
   file/test/fixture/branch and background-command ownership; prefer separately authorized worktrees or explicit
   single-writer coordination. Never create a worktree automatically. If safe independence cannot be established, prevent
   overlapping writes.
+- Task-scoped runtime resources: identify ownership and the supported shutdown path before starting an operation that
+  may outlive its tool call. Recheck ownership before cleanup; release only exclusively task-owned temporary resources
+  on success, failure, timeout, interruption or pause, and verify completion where observable. Preserve shared,
+  user-owned, client-managed and intentionally persistent resources. Report released, retained and unresolved resources
+  through the existing result/handoff; the primary checks cleanup separately from functional test and Architecture Gate
+  status.
 - After compaction/resumption revalidate the current authorized task, explicit gate state, applicable handoff only for
   APPROVED, scope, active threads, stable snapshot (if any) and permissions. A stale subagent response is not
   authoritative; when verification fails, continue only authorized read-only inspection until reconciled.
@@ -473,6 +479,10 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
   routers, shared databases or uncontrolled providers. Bound startup, requests, jobs and shutdown with timeouts.
 - Data isolation policy: unique temporary database/files, cache state, test IDs and ports; run required migrations and
   minimal seeds against disposable data only. Fixtures own cleanup of processes, tasks, clients and persistent state.
+- Runtime cleanup policy: arrange fixture/`finally` teardown for exclusively test-owned subprocesses, fake servers and
+  containers on success, assertion failure, timeout and early interruption. Preserve borrowed/shared services and
+  recheck ownership before shutdown. Verify process termination, container shutdown and port release where observable;
+  report unresolved or unverified cleanup separately from test assertions.
 - Parallel E2E policy: serial by default; xdist requires independently verified per-worker resource isolation.
 - Load E2E policy: active for relevant performance/resilience work, with explicit workload bounds and measurements;
   the registered `e2e_load` marker remains a separately selected run rather than an automatic load test on every task.
@@ -666,15 +676,22 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
 - Retry owner: `RetryTransport` wraps a base `AsyncHTTPTransport` with native retries disabled and configured pool
   limits. Ordinary profiles allow `GET`/`HEAD`; RouterOS allows `GET`/`POST`/`PATCH`/`DELETE`, never `PUT`.
   RouterOS currently uses `POST` only for `/print` reads and `PUT` for creation; preserve this operation boundary.
-  Only explicitly selected statuses/exceptions retry; `PoolTimeout`, cancellation and returned response-body failures
-  do not. Backoff, jitter and `Retry-After` are bounded; `req_retry_total_timeout` limits cumulative sleep, not full
-  request duration. DoH and RIPEstat select their own retry counts and sleep budgets through the same transport owner.
+  Only explicitly selected statuses/exceptions retry; `PoolTimeout`, cancellation and ordinary returned response-body
+  failures do not. DoH buffers successful HTTP/2 response bodies inside its retry boundary so a body transport failure
+  can consume the next available attempt through HTTP/1.1. Backoff, jitter and `Retry-After` are bounded;
+  `req_retry_total_timeout` limits cumulative sleep, not full request duration. DoH and RIPEstat select their own
+  retry counts and sleep budgets through the same transport owner.
   Their client/resolver operation budgets remain outside the retry transport and cover body consumption plus relevant
   semaphore/cache-lock waits. DNS query budgets cover A/CNAME and bulk/stored/one-shot entrypoints. Expiry is failed
   evidence, while external cancellation propagates. Budgets are per query/lookup, not per whole domain/job.
   Independent eligible RIPEstat lookups use bounded workers and the existing shared semaphore; timeout/error handling
   retains the stored-CIDR/host policy and never caches failures as successful empty results.
-- Named client profiles are immutable: reuse matching effective configuration and reject conflicting configuration.
+- DoH prefers HTTP/2 through TLS ALPN with HTTP/1.1 allowed and no preliminary HEAD request. Eligible transport
+  failures switch the next available retry to an HTTP/1.1-only pool. The same attempt/sleep/operation budgets apply;
+  the default allows two HTTP attempts and zero retries disables fallback. DNS validation and HTTP status outcomes
+  do not cause protocol fallback. Per-query state resets before each exchange, including reuse of a Request object.
+- Named client profiles are immutable, including HTTP protocol preference: reuse matching effective configuration
+  and reject conflicting configuration.
   Limits apply independently to each pool; HTTPcore caps idle connections by the open-connection limit.
 - `ObservedAsyncTransport` stays outside the retry layer, preserving one measured exchange across its attempts.
   Environment certificate configuration remains supported, while environment proxy mounts remain disabled.

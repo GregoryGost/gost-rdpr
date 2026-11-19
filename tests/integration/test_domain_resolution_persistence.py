@@ -14331,3 +14331,472 @@ async def test_unprocessed_openapi_describes_optional_filter_and_global_integer_
     assert parameters['unprocessed']['schema']['default'] is False
   assert schema['components']['schemas']['StatsDomainsData']['properties']['unprocessed']['type'] == 'integer'
   assert schema['components']['schemas']['StatsDomainsData']['properties']['unprocessed']['default'] == 0
+
+
+@pytest.fixture
+async def doh_wire_client(app, monkeypatch, tls_doh_provider):
+  """Use production HTTP pools against only the fixture-owned loopback TLS server.
+
+  app suppresses import side effects; monkeypatch restores the real wire method
+  and temporary no-delay retry settings. tls_doh_provider owns server cleanup.
+  """
+  # factory owns all clients; client keeps a short read budget for body faults and allows bounded TLS setup.
+  factory = importlib.import_module('client.http_base_client').HttpClient
+  await factory.close()
+  monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', app.real_http_send)
+  monkeypatch.setattr(app.settings, 'req_ssl_verify', False)
+  monkeypatch.setattr(app.settings, 'req_retry_backoff_factor', 0)
+  monkeypatch.setattr(app.settings, 'req_retry_backoff_jitter', 0)
+  client = factory.get_client(
+    'doh-wire',
+    prefer_http2=True,
+    connection_retries=1,
+    timeout=httpx.Timeout(connect=3, read=0.2, write=0.2, pool=0.2),
+  )
+  try:
+    yield client
+  finally:
+    await factory.close()
+
+
+def doh_wire_params():
+  """Return a complete DNS A query as the standard DoH GET parameter."""
+  # query is an independently constructed wire message whose ID must be echoed by the provider.
+  query = dns.message.make_query('www.example.test.', 'A')
+  return {'dns': urlsafe_b64encode(query.to_wire()).decode('ascii').rstrip('=')}
+
+
+async def test_tls_doh_provider_closes_connections_before_tls_handshake(tmp_path, dns_message, monkeypatch):
+  """Provider teardown releases accepted peers that have not started TLS.
+
+  tmp_path and dns_message supply the normal provider inputs. monkeypatch captures
+  the real listening server so failure cleanup can release this test's sockets.
+  """
+  # servers retains only listeners created by this test; start_server keeps the unmodified factory.
+  servers = []
+  start_server = asyncio.start_server
+
+  async def capture_server(*args, **kwargs):
+    """Forward args/kwargs unchanged and retain the resulting test-owned listener."""
+    # server is the actual TLS listener, including transports accepted before its stream callback runs.
+    server = await start_server(*args, **kwargs)
+    servers.append(server)
+    return server
+
+  monkeypatch.setattr(asyncio, 'start_server', capture_server)
+  # provider drives the existing fixture directly so teardown can be asserted before the peer closes.
+  provider = importlib.import_module('tests.conftest').tls_doh_provider.__wrapped__(tmp_path, dns_message)
+  # state exposes the provider's post-handshake observations; server is its exclusively owned listener.
+  state = await anext(provider)
+  server = servers[0]
+  # writer remains unset until this test creates its TCP-only peer, which never sends a TLS ClientHello.
+  writer = None
+  try:
+    # reader observes peer closure after provider teardown; writer retains the test-owned TCP connection.
+    reader, writer = await asyncio.wait_for(
+      asyncio.open_connection('127.0.0.1', server.sockets[0].getsockname()[1]), timeout=2
+    )
+    async with asyncio.timeout(2):
+      # asyncio tracks accepted transports before the TLS stream callback becomes eligible to run.
+      while not server._clients:
+        await asyncio.sleep(0)
+    assert state.active == 0
+    assert state.protocols == []
+    await provider.aclose()
+    assert not server.is_serving()
+    assert await asyncio.wait_for(reader.read(1), timeout=2) == b''
+    assert not server._clients
+  finally:
+    # Release the deliberately unfinished handshake even when the fixture's own teardown fails.
+    server.close()
+    server.abort_clients()
+    if writer is not None:
+      writer.close()
+      try:
+        await asyncio.wait_for(writer.wait_closed(), timeout=2)
+      except ConnectionError:
+        pass
+    await provider.aclose()
+    await asyncio.wait_for(server.wait_closed(), timeout=2)
+
+
+async def test_doh_tls_setup_can_outlast_body_timeout_without_protocol_fallback(
+  tls_doh_provider, doh_wire_client, monkeypatch
+):
+  """A bounded slow TLS handshake still reaches the healthy provider once over H2.
+
+  tls_doh_provider and doh_wire_client retain the real TLS/HTTP stack. monkeypatch
+  delays only its first TLS wrap within HTTPcore's actual connect-timeout scope;
+  the short body-read budget must not force an otherwise healthy H1 retry.
+  """
+  # tls_stream supplies the public handshake boundary; wrap preserves the real TLS implementation.
+  tls_stream = importlib.import_module('anyio.streams.tls').TLSStream
+  wrap = tls_stream.wrap
+  # first_handshake limits latency injection to the initial pool, leaving an erroneous H1 retry observable.
+  first_handshake = True
+
+  async def delayed_wrap(*args, **kwargs):
+    """Delay the first handshake, then pass args/kwargs to the real TLS wrapper."""
+    nonlocal first_handshake
+    if first_handshake:
+      first_handshake = False
+      # ready/release simulate 300 ms TLS setup latency, longer than the 200 ms body-read fault budget.
+      ready = asyncio.Event()
+      release = asyncio.get_running_loop().call_later(0.3, ready.set)
+      try:
+        await ready.wait()
+      finally:
+        release.cancel()
+    return await wrap(*args, **kwargs)
+
+  monkeypatch.setattr(tls_stream, 'wrap', delayed_wrap)
+  # response contains real DNS bytes and negotiated ALPN evidence after the injected handshake latency.
+  response = await doh_wire_client.get(tls_doh_provider.url, params=doh_wire_params())
+  assert response.http_version == 'HTTP/2'
+  assert dns.message.from_wire(response.content).answer[0][0].address == '8.8.8.8'
+  assert tls_doh_provider.requests == [('h2', 'GET', '/dns-query', dns.rdatatype.A)]
+
+
+@pytest.mark.parametrize('protocols', [('h2',), ('http/1.1',), ('h2', 'http/1.1')])
+async def test_doh_tls_negotiates_supported_protocol_without_head(tls_doh_provider, doh_wire_client, protocols):
+  """Real ALPN selects HTTP/2 when offered and accepts an HTTP/1.1-only server.
+
+  The local provider rejects HEAD; protocols controls the TLS server offer, and
+  doh_wire_client sends the full DoH exchange through production retry/pool code.
+  """
+  # provider records negotiated wire protocols; response contains actual DNS wire bytes.
+  provider = tls_doh_provider
+  provider.context.set_alpn_protocols(list(protocols))
+  response = await doh_wire_client.get(provider.url, params=doh_wire_params())
+  assert response.status_code == 200
+  assert dns.message.from_wire(response.content).answer[0][0].address == '8.8.8.8'
+  assert response.http_version == ('HTTP/2' if 'h2' in protocols else 'HTTP/1.1')
+  assert provider.requests == [('h2' if 'h2' in protocols else 'http/1.1', 'GET', '/dns-query', dns.rdatatype.A)]
+
+
+@pytest.mark.parametrize('failure', ['reset', 'disconnect', 'stall'])
+async def test_doh_real_http2_failure_falls_back_to_same_endpoint(tls_doh_provider, doh_wire_client, failure):
+  """A real H2 stream/body failure spends the sole retry on same-endpoint HTTP/1.1.
+
+  failure injects reset after headers, disconnect, or body read timeout; the
+  provider's H1 response remains healthy and records the exact DNS query path.
+  """
+  # provider is the fault-controlled wire endpoint; response is the recovered HTTP/1.1 DNS result.
+  provider = tls_doh_provider
+  provider.h2_failure = failure
+  response = await doh_wire_client.get(provider.url, params=doh_wire_params())
+  assert response.http_version == 'HTTP/1.1'
+  assert dns.message.from_wire(response.content).answer[0][0].address == '8.8.8.8'
+  assert provider.requests == [
+    ('h2', 'GET', '/dns-query', dns.rdatatype.A),
+    ('http/1.1', 'GET', '/dns-query', dns.rdatatype.A),
+  ]
+
+
+async def test_doh_status_retry_keeps_http2_and_next_query_has_no_sticky_downgrade(tls_doh_provider, doh_wire_client):
+  """A transient HTTP status retries H2; a prior H2 failure cannot downgrade the next query.
+
+  Fixtures expose real production pools and one local endpoint, with no internal
+  application mocks beyond the separately documented import safety fixture.
+  """
+  # provider supplies scheduled statuses; params is reused so only transport behavior changes.
+  provider = tls_doh_provider
+  params = doh_wire_params()
+  provider.statuses = [503, 200]
+  assert (await doh_wire_client.get(provider.url, params=params)).http_version == 'HTTP/2'
+  assert [request[0] for request in provider.requests] == ['h2', 'h2']  # request is one observed wire attempt.
+  provider.requests.clear()
+  provider.h2_failure = 'reset'
+  assert (await doh_wire_client.get(provider.url, params=params)).http_version == 'HTTP/1.1'
+  provider.h2_failure = None
+  assert (await doh_wire_client.get(provider.url, params=params)).http_version == 'HTTP/2'
+  assert [request[0] for request in provider.requests] == ['h2', 'http/1.1', 'h2']
+
+
+@pytest.mark.parametrize('failure', ['reset', 'disconnect'])
+async def test_zero_retry_budget_disables_protocol_fallback(
+  app, monkeypatch, tls_doh_provider, doh_wire_client, failure
+):
+  """A zero extra-attempt budget permits exactly one H2 request despite wire failure.
+
+  The fixtures retain isolated imports and the real wire; failure selects a
+  stream reset or abrupt disconnect at the loopback provider.
+  """
+  # factory creates a distinct immutable zero-budget client; client is explicitly closed by fixture teardown.
+  factory = importlib.import_module('client.http_base_client').HttpClient
+  client = factory.get_client(
+    'doh-no-retry', prefer_http2=True, connection_retries=0, timeout=httpx.Timeout(doh_wire_client.timeout)
+  )
+  tls_doh_provider.h2_failure = failure
+  with pytest.raises((httpx.RemoteProtocolError, httpx.ReadError)):
+    await client.get(tls_doh_provider.url, params=doh_wire_params())
+  assert len(tls_doh_provider.requests) == 1
+  assert tls_doh_provider.requests[0][0] == 'h2'
+
+
+@pytest.mark.parametrize('kind', ['positive', 'nxdomain', 'nodata', 'servfail', 'malformed', 'wrong-name'])
+async def test_dns_content_never_triggers_http_protocol_fallback(app, tls_doh_provider, doh_wire_client, kind):
+  """Existing DNS trust classification receives H2 evidence without a second protocol query.
+
+  kind covers success, authoritative absence, DNS failure, malformed wire and a
+  mismatched question. HTTP succeeds in every case, so fallback is unwarranted.
+  """
+  # resolver uses the actual HTTP stack; domain/server define one isolated private query boundary.
+  resolver = app.resolver.DomainsResolver()
+  resolver._DomainsResolver__http_client = doh_wire_client
+  tls_doh_provider.kind = kind
+  domain = app.dto.DomainResult(id=1, name='www.example.test')
+  server = app.Server(server=tls_doh_provider.url)
+  # outcome is the normal DNS classifier's result, not a transport-level success assertion.
+  outcome = await resolver._DomainsResolver__doh_resolver(domain, server, dns.rdatatype.A)
+  assert outcome.status.value == (
+    'ADDRESSES' if kind == 'positive' else 'ABSENT' if kind in {'nxdomain', 'nodata'} else 'FAILURE'
+  )
+  assert len(tls_doh_provider.requests) == 1
+  assert tls_doh_provider.requests[0][0] == 'h2'
+
+
+@pytest.mark.parametrize('terminal', ['deadline', 'cancel'])
+@pytest.mark.parametrize('phase', ['h2', 'fallback'])
+async def test_doh_h2_body_wait_respects_one_operation_deadline_and_external_cancel(
+  app, monkeypatch, tls_doh_provider, doh_wire_client, terminal, phase
+):
+  """The resolver deadline and caller cancellation interrupt a stalled real H2 body.
+
+  terminal selects operation expiry or external cancellation; phase holds either
+  the initial H2 body or the H1 body after H2 reset. The wait shares one operation budget.
+  """
+  # resolver retains the production DNS operation timeout; server/domain identify one A query.
+  resolver = app.resolver.DomainsResolver()
+  resolver._DomainsResolver__http_client = doh_wire_client
+  doh_wire_client.timeout = httpx.Timeout(5)
+  monkeypatch.setattr(app.settings, 'doh_operation_timeout', 0.1 if terminal == 'deadline' else 5)
+  tls_doh_provider.h2_failure = 'stall' if phase == 'h2' else 'reset'
+  tls_doh_provider.h1_hold = phase == 'fallback'
+  server = app.Server(server=tls_doh_provider.url)
+  domain = app.dto.DomainResult(id=1, name='www.example.test')
+  # task is exclusively test-owned; the final gather joins cancellation on every exit.
+  task = asyncio.create_task(resolver._DomainsResolver__doh_resolver(domain, server, dns.rdatatype.A))
+  try:
+    await asyncio.wait_for(
+      (tls_doh_provider.entered if phase == 'h2' else tls_doh_provider.h1_entered).wait(), timeout=2
+    )
+    if terminal == 'cancel':
+      task.cancel()
+      with pytest.raises(asyncio.CancelledError):
+        await task
+    else:
+      assert (await asyncio.wait_for(task, timeout=2)).status.value == 'FAILURE'
+    assert len(tls_doh_provider.requests) == (1 if phase == 'h2' else 2)
+  finally:
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('e2e_service', [False], indirect=True)
+async def test_public_resolution_persists_dns_addresses_after_real_http2_body_fallback(e2e_service, tls_doh_provider):
+  """A real H2 body reset recovers over H1 and commits trusted addresses through the API.
+
+  e2e_service runs unmodified main.py, migrations, router, coordinator and writer
+  with disposable SQLite. Only the external DoH provider is replaced by TLS/H2.
+  """
+  # service owns the real process; provider owns only its synthetic TLS endpoint.
+  service, provider = e2e_service, tls_doh_provider
+  provider.h2_failure = 'reset'
+  service.doh_url = provider.url
+  service.environment.update(
+    {'SSL_CERT_FILE': str(provider.certificate), 'DOH_CONNECTION_RETRIES': '1', 'REQ_RETRY_BACKOFF_FACTOR': '0'}
+  )
+  await service.start()
+  # domain_id is created through the public API; before retains unrelated IPv6 metadata for regression checks.
+  domain_id = await configure_public_domain(service)
+  before = public_flow_snapshot(service, domain_id)
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    # client is the bounded public API connection; response acknowledges the saving operation.
+    response = await client.post(f'/domains/{domain_id}/resolve')
+    assert response.status_code == 202
+    # samples/fields are settled public metrics that prove the writer confirmed this run.
+    samples, fields = await completed_metrics(client, mode='stored', selected=1)
+    assert fields['success'] == fields['confirmed'] == 1
+    assert fields['failure'] == fields['pending'] == fields['unknown'] == 0
+    assert sample_total(samples, 'httpx_exchanges_started_total', integration='domains_resolver') == 1
+    assert sample_total(samples, 'httpx_exchanges_in_flight') == 0
+  # after reads committed SQLite independently after the public completion metrics have settled.
+  after = public_flow_snapshot(service, domain_id)
+  assert after[0][0] == 1
+  assert after[0][1] != before[0][1]
+  assert set(after[1]) == {'8.8.8.8', '2001:4860:4860::8888'}
+  assert after[1]['2001:4860:4860::8888'] == before[1]['2001:4860:4860::8888']
+  assert provider.requests == [
+    ('h2', 'GET', '/dns-query', dns.rdatatype.A),
+    ('http/1.1', 'GET', '/dns-query', dns.rdatatype.A),
+  ]
+
+
+async def test_reused_request_and_concurrent_queries_have_independent_fallback_state(tls_doh_provider, doh_wire_client):
+  """Reusing a Request and overlapping exchanges cannot retain another attempt's H1 selection.
+
+  The provider resets only one H2 exchange in each phase. The independent query
+  must still use H2 even while its neighbor consumes the H1 retry.
+  """
+  # provider configures one reset; request is reused intact after the first fallback completes.
+  provider = tls_doh_provider
+  provider.h2_failure, provider.failure_remaining = 'reset', 1
+  request = doh_wire_client.build_request('GET', provider.url, params=doh_wire_params())
+  assert (await doh_wire_client.send(request)).http_version == 'HTTP/1.1'
+  assert (await doh_wire_client.send(request)).http_version == 'HTTP/2'
+  provider.requests.clear()
+  provider.failure_remaining = 1
+  provider.h1_hold_before_headers = True
+  # fallback stays inside H1 routing until headers are sent; a new call begins while that routing is active.
+  fallback = asyncio.create_task(doh_wire_client.get(provider.url, params=doh_wire_params()))
+  try:
+    await asyncio.wait_for(provider.h1_entered.wait(), timeout=2)
+    assert not fallback.done()
+    # independent starts only after its neighbor selected H1; it must still negotiate H2.
+    independent = await doh_wire_client.get(provider.url, params=doh_wire_params())
+    assert independent.http_version == 'HTTP/2'
+    assert not fallback.done()
+    provider.release.set()
+    assert (await fallback).http_version == 'HTTP/1.1'
+  finally:
+    provider.release.set()
+    fallback.cancel()
+    await asyncio.gather(fallback, return_exceptions=True)
+  assert [request[0] for request in provider.requests] == ['h2', 'http/1.1', 'h2']  # request is one wire attempt.
+
+
+async def test_http_status_retry_then_http2_body_failure_cannot_exceed_shared_budget(tls_doh_provider, doh_wire_client):
+  """A status retry already spends the only extra attempt, leaving no third H1 request.
+
+  Both provider responses are real H2 frames: first 503, then 200 with a reset
+  body. The second wire failure remains visible after the shared budget expires.
+  """
+  # provider emits the two scheduled statuses; every H2 body is reset after its headers.
+  provider = tls_doh_provider
+  provider.statuses = [503, 200]
+  provider.h2_failure = 'reset'
+  with pytest.raises(httpx.RemoteProtocolError):
+    await doh_wire_client.get(provider.url, params=doh_wire_params())
+  assert [request[0] for request in provider.requests] == ['h2', 'h2']  # request is one wire attempt.
+
+
+async def test_preferred_client_keeps_negotiated_http1_body_streaming(tls_doh_provider, doh_wire_client):
+  """An H1-only server returns headers before its held body despite H2 preference.
+
+  The provider release event makes eager consumption observable without sleeps;
+  entering stream mode must finish while that body remains unavailable.
+  """
+  # provider offers H1 only; response must remain unconsumed until the caller releases and reads its body.
+  provider = tls_doh_provider
+  provider.context.set_alpn_protocols(['http/1.1'])
+  provider.h1_hold = True
+  async with asyncio.timeout(2), doh_wire_client.stream('GET', provider.url, params=doh_wire_params()) as response:
+    assert response.http_version == 'HTTP/1.1'
+    assert not response.is_stream_consumed
+    assert provider.entered.is_set()
+    assert not provider.release.is_set()
+    provider.release.set()
+    assert dns.message.from_wire(await response.aread()).answer[0][0].address == '8.8.8.8'
+  assert len(provider.requests) == 1
+
+
+async def test_both_http_protocols_unavailable_stop_at_two_attempts(tls_doh_provider, doh_wire_client):
+  """An unavailable H2 and H1 endpoint cannot multiply the default retry budget.
+
+  Fixtures configure real disconnects in each protocol; the caller receives the
+  final transport error after exactly one attempt through each owned pool.
+  """
+  tls_doh_provider.h2_failure = tls_doh_provider.h1_failure = 'disconnect'
+  with pytest.raises((httpx.RemoteProtocolError, httpx.ReadError)):
+    await doh_wire_client.get(tls_doh_provider.url, params=doh_wire_params())
+  assert [request[0] for request in tls_doh_provider.requests] == ['h2', 'http/1.1']  # request is one wire attempt.
+
+
+@pytest.mark.parametrize('invalid', ['status', 'media_type'])
+async def test_doh_http_validation_failure_never_switches_protocol(app, tls_doh_provider, doh_wire_client, invalid):
+  """A permanent HTTP status or unsupported media type stays a single failed H2 query.
+
+  invalid selects the response contract violation; app provides the existing DNS
+  classifier while the HTTP request still crosses the real local TLS/H2 boundary.
+  """
+  # resolver consumes real wire evidence; domain/server identify one A query, not the separate alias-discovery flow.
+  resolver = app.resolver.DomainsResolver()
+  resolver._DomainsResolver__http_client = doh_wire_client
+  domain = app.dto.DomainResult(id=1, name='www.example.test')
+  server = app.Server(server=tls_doh_provider.url)
+  if invalid == 'status':
+    tls_doh_provider.status = 400
+  else:
+    tls_doh_provider.media_type = 'text/plain'
+  assert (await resolver._DomainsResolver__doh_resolver(domain, server, dns.rdatatype.A)).status.value == 'FAILURE'
+  assert len(tls_doh_provider.requests) == 1
+
+
+@pytest.mark.e2e_load
+async def test_doh_protocol_policy_bounded_local_comparison(
+  app, monkeypatch, tls_doh_provider, doh_wire_client, tmp_path
+):
+  """Measure H1 policy and H2 preference against identical bounded local provider faults.
+
+  This opt-in transport experiment sends 24 queries per policy/scenario in ABBA
+  order. It records elapsed/p95, process CPU and peak Python allocations without
+  asserting that loopback H2 is faster or claiming production throughput evidence.
+  """
+  import time
+  import tracemalloc
+
+  # factory owns both immutable policy clients; artifact contains synthetic timing and outcome evidence only.
+  factory = importlib.import_module('client.http_base_client').HttpClient
+  artifact = {
+    'queries_per_policy_scenario': 24,
+    'scope': 'local TLS transport; same source, H1 policy versus H2 preference',
+    'rows': [],
+  }
+  # scenario selects identical server behavior for both clients; preferred alternates ABBA to reduce order bias.
+  for scenario in ('healthy', 'slow', 'h2-reset', 'both-unavailable'):
+    tls_doh_provider.h2_failure = (
+      None if scenario in {'healthy', 'slow'} else 'reset' if scenario == 'h2-reset' else 'disconnect'
+    )
+    tls_doh_provider.h1_failure = 'disconnect' if scenario == 'both-unavailable' else None
+    tls_doh_provider.delay = 0.01 if scenario == 'slow' else 0
+    for preferred in (False, True, True, False):
+      # client represents one transport policy; durations/successes count this bounded twelve-query batch.
+      client = factory.get_client(
+        f'comparison-{preferred}', prefer_http2=preferred, connection_retries=1, timeout=httpx.Timeout(0.2)
+      )
+      durations, successes = [], 0
+      tracemalloc.start()
+      # wall_started/cpu_started anchor seconds; _index bounds the deterministic synthetic workload.
+      wall_started, cpu_started = time.perf_counter(), time.process_time()
+      try:
+        for _index in range(12):
+          # started anchors one caller-visible query, including retries and body reads.
+          started = time.perf_counter()
+          try:
+            # response is complete wire evidence; retry failures are counted separately from successful DNS.
+            response = await client.get(tls_doh_provider.url, params=doh_wire_params())
+            assert dns.message.from_wire(response.content).answer[0][0].address == '8.8.8.8'
+            successes += 1
+          except httpx.TransportError:
+            assert scenario == 'both-unavailable'
+          durations.append(time.perf_counter() - started)
+        # peak_bytes measures peak Python allocations; _ discards current live bytes. Neither value measures RSS.
+        _, peak_bytes = tracemalloc.get_traced_memory()
+        artifact['rows'].append(
+          {
+            'scenario': scenario,
+            'prefer_http2': preferred,
+            'queries': len(durations),
+            'successes': successes,
+            'elapsed_seconds': time.perf_counter() - wall_started,
+            'p95_seconds': sorted(durations)[math.ceil(len(durations) * 0.95) - 1],
+            'cpu_seconds': time.process_time() - cpu_started,
+            'peak_python_allocated_bytes': peak_bytes,
+          }
+        )
+      finally:
+        tracemalloc.stop()
+      assert successes == (0 if scenario == 'both-unavailable' else 12)
+  (tmp_path / 'doh-protocol-comparison.json').write_text(json.dumps(artifact, indent=2), encoding='utf-8')
