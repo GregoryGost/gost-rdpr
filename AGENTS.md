@@ -37,6 +37,13 @@ Use this mode in a project that consumes rules, skills, and the project profile 
 - Validate declared hard dependencies before applying the dependent artifact.
 - An active rule or skill may narrow the selected request mode, allowed surfaces, side effects, or output format, but cannot broaden authorization from the current user message.
 - Before a mutation, the candidate action must satisfy both request routing and every applicable active material. A prohibition from either boundary wins.
+- When an agent starts an operation that may leave a task-scoped process, browser, test server, container, watcher,
+  debugger, or other runtime resource behind, identify whether it is exclusively controlled, borrowed/shared,
+  client-managed, or intentionally persistent; recheck ownership before shutdown. Use the active tool-specific shutdown
+  path for exclusively owned temporary resources on success, failure, timeout, or interruption, then verify completion
+  when observable. Do not stop unrelated or client-managed processes by name/port alone; report unresolved resources
+  through the existing result/handoff. This does not require tracking every short-lived command, installing monitors, or
+  altering tool configuration.
 
 ## Subagents For Code Changes And Read-Only Assessments
 

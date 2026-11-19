@@ -87,6 +87,12 @@ Use the real public boundary of the application:
 - Use timeouts for subprocesses, HTTP calls, async jobs, queue waits, container startup, and polling loops.
 - Control clocks, random IDs, UUIDs, ports, environment variables, files, queues, cache namespaces, and external calls when they affect observable behavior.
 - Ensure app instances, containers, database connections, files, queues, cache keys, child processes, environment variables, and ports are cleaned up after tests.
+- Determine ownership of subprocesses, test HTTP servers, Testcontainers instances, and Docker Compose dependencies
+  before execution. Arrange `finally`/fixture teardown for test-owned resources on success, assertion failure, timeout,
+  and early interruption; a borrowed or shared service must not be stopped.
+- Confirm observable child-process termination, container shutdown, and port release after the run where practical.
+  Avoid broad process-name kills or `docker compose down` against shared environments; report unverifiable or
+  unsuccessful cleanup separately from test assertions.
 - Capture stdout, stderr, logs, and generated artifacts needed to diagnose failures.
 - Report known setup gaps, unavailable dependencies, or non-reproducible environment assumptions.
 

@@ -41,7 +41,12 @@ Use this skill when creating, changing, or reviewing:
 - DB integration tests;
 - migration-policy coordination.
 
-Do not use this skill alone for backend-specific decisions. Apply the active database-specific skill when the task depends on driver behavior, pooling behavior, isolation behavior, migration syntax, lock behavior, or database-specific SQL.
+Backend-specific guarantees require evidence from the selected engine, version, dialect, driver and configuration. Apply
+matching active backend-specific skills when available. When none exists (for example for PostgreSQL or Microsoft SQL
+Server), use official version-matched documentation and authorized real-backend tests, distinguishing verified support
+from unknown behavior. Techniques described for other backends may be considered as alternatives; compare their
+equivalent implementations, transaction/locking/error semantics and operational trade-offs in the target backend before
+deciding. Skill activation remains governed by the project profile rather than by similarity between engines.
 
 ## Repository-First Database Access
 
@@ -81,6 +86,15 @@ Do not use this skill alone for backend-specific decisions. Apply the active dat
 - Do not perform external HTTP calls, slow computations, sleeps, cache calls, filesystem scans, or network operations while holding a write transaction.
 - Perform cache invalidation or external side effects only after a successful commit.
 - If the transaction rolls back, cache state and external side effects must remain unchanged unless a project-specific compensation flow exists.
+- A SQLAlchemy unit of work is local to its actual transactional boundary. When a verified business operation spans
+  independent services or commits, surface its consistency and recovery requirements for architecture review; neither
+  Saga nor a stored procedure follows automatically from multiple repositories or messages.
+- When an approved design uses a stored routine, keep the invocation and SQL parameters within the
+  repository/data-access boundary. Verify the backend's procedure/function invocation syntax, driver result sets and OUT
+  parameters, transaction ownership, handled-error/status semantics, effective privileges, versioned deployment and
+  real-backend tests. Compare `CALL`, `EXEC` and driver APIs by their actual contracts; establish transaction ownership
+  and local versus distributed guarantees for the selected engine. Use the matching active backend-specific skill when
+  available; otherwise verify from official version-matched sources.
 
 ## Query Correctness And Performance
 
@@ -92,7 +106,8 @@ Do not use this skill alone for backend-specific decisions. Apply the active dat
 - Avoid N+1 queries. Use explicit eager loading, aggregate queries, projection queries, or repository methods that return pre-shaped read models.
 - Use pagination for list endpoints and repository list methods.
 - Avoid returning unbounded result sets from repositories used by API handlers.
-- Keep backend-specific query-plan inspection in the active database-specific skill.
+- For backend-specific query-plan inspection, use the matching active skill when available; otherwise verify the target
+  engine's plan tools, interpretation and limits from version-matched documentation and authorized query-plan evidence.
 
 ## Error Mapping
 
@@ -116,7 +131,9 @@ Do not use this skill alone for backend-specific decisions. Apply the active dat
 - Follow the migration policy declared in `CODEX_PROJECT.md`.
 - Do not introduce Alembic, raw SQL migrations, migration runners, or replacement tooling unless the user explicitly approves or the repository already standardizes on it.
 - Migration changes must be deterministic, reviewable, and covered by tests appropriate to the active database backend.
-- Database-specific migration syntax, lock behavior, online/offline migration behavior, and rollback policy belong to the active database-specific skill.
+- For database-specific migration syntax, locking, online/offline execution and rollback, use the matching active skill
+  when available. Otherwise verify the actual database version and migration runner against version-matched
+  documentation and authorized isolated tests.
 
 ## Testing Requirements
 
@@ -128,14 +145,17 @@ Do not use this skill alone for backend-specific decisions. Apply the active dat
 - Test constraint violations through repository methods and assert the typed repository/domain errors they expose.
 - Verify that raw SQLAlchemy or driver exceptions do not escape repository public methods.
 - Test pagination, ordering, filtering, and permission/tenant predicates when they affect behavior.
-- Use the active database-specific skill for backend-specific test database setup and isolation rules.
+- For backend-specific test setup and isolation, apply the matching active skill when available; otherwise derive and
+  validate the setup from the actual backend, driver, runner and project-authorized test environment.
 
 ## Review Workflow
 
 When reviewing common SQLAlchemy code:
 
 - Load `references/patterns-and-review.md` for concrete anti-patterns and the final review checklist.
-- Confirm the required `python-core` dependency; apply `python-testing` and the active database-specific skill when tests or backend-specific behavior are in scope.
+- Confirm the required `python-core` dependency; apply `python-testing` when independently active and relevant, and the
+  matching database-specific skill when independently active and relevant. Without a matching skill, use version-matched
+  backend/driver documentation and authorized integration evidence.
 - Inspect models, repositories, engine/session setup, transaction owners, settings, tests, and existing DB conventions.
 - Verify that SQL/ORM details stay inside repositories and do not leak into routers or unrelated services.
 - Verify that sessions are scoped to one unit of work, request, task, or explicit batch and are not shared across concurrent tasks.
@@ -146,4 +166,5 @@ When reviewing common SQLAlchemy code:
 - Verify that query code is parameterized and does not use f-strings or string concatenation with user-controlled input.
 - Verify that dynamic sorting/filtering inputs are allowlisted.
 - Verify that repository integration tests use real SQLAlchemy behavior instead of mocking SQLAlchemy.
-- Verify that backend-specific mechanics are delegated to the active database-specific skill.
+- Verify that backend-specific mechanics were evaluated against the matching active skill where available, or against
+  version-matched backend/driver evidence when no matching skill exists.

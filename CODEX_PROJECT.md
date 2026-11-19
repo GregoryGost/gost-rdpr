@@ -2,7 +2,7 @@
 
 ## Execution Contract
 
-This repository consumes `agent-projects-tools` v1.19.2 in target project mode.
+This repository consumes `agent-projects-tools` v1.21.0 in target project mode.
 `AGENTS.md` defines bootstrap order; `.codex/rules/request_routing.md` is mandatory for every request.
 This profile declares capabilities and constraints; it grants no permission for side effects.
 Only exact active entries below and enabled specialized sections activate materials.
@@ -315,6 +315,12 @@ scenarios before appointed architects complete their approval.
   file/test/fixture/branch and background-command ownership; prefer separately authorized worktrees or explicit
   single-writer coordination. Never create a worktree automatically. If safe independence cannot be established, prevent
   overlapping writes.
+- Task-scoped runtime resources: identify ownership and the supported shutdown path before starting an operation that
+  may outlive its tool call. Recheck ownership before cleanup; release only exclusively task-owned temporary resources
+  on success, failure, timeout, interruption or pause, and verify completion where observable. Preserve shared,
+  user-owned, client-managed and intentionally persistent resources. Report released, retained and unresolved resources
+  through the existing result/handoff; the primary checks cleanup separately from functional test and Architecture Gate
+  status.
 - After compaction/resumption revalidate the current authorized task, explicit gate state, applicable handoff only for
   APPROVED, scope, active threads, stable snapshot (if any) and permissions. A stale subagent response is not
   authoritative; when verification fails, continue only authorized read-only inspection until reconciled.
@@ -473,6 +479,10 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
   routers, shared databases or uncontrolled providers. Bound startup, requests, jobs and shutdown with timeouts.
 - Data isolation policy: unique temporary database/files, cache state, test IDs and ports; run required migrations and
   minimal seeds against disposable data only. Fixtures own cleanup of processes, tasks, clients and persistent state.
+- Runtime cleanup policy: arrange fixture/`finally` teardown for exclusively test-owned subprocesses, fake servers and
+  containers on success, assertion failure, timeout and early interruption. Preserve borrowed/shared services and
+  recheck ownership before shutdown. Verify process termination, container shutdown and port release where observable;
+  report unresolved or unverified cleanup separately from test assertions.
 - Parallel E2E policy: serial by default; xdist requires independently verified per-worker resource isolation.
 - Load E2E policy: active for relevant performance/resilience work, with explicit workload bounds and measurements;
   the registered `e2e_load` marker remains a separately selected run rather than an automatic load test on every task.

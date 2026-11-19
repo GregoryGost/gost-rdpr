@@ -24,6 +24,24 @@
 4. Confirm the spawn returned a distinct new thread for the expected role. Before accepting its result or allowing dependent work, verify that its response identifies the assigned `task_scope_id`, stage and relevant baseline/decision version; an unrelated/generic response or mismatched scope is NOT a valid handoff. If it may already have performed writes, inspect and quarantine affected partial changes, verify quiescence and resolve the mismatch before any further dependent mutation.
 5. Respect the client thread limit by waiting/closing completed threads when supported. Nested delegation obeys the same rules. This is a behavioral policy, not a new sandbox; optional tool hooks are additional non-exhaustive guardrails.
 
+## Task-scoped runtime resources and handoff
+
+- Before starting an operation that may outlive its tool call, the executing agent identifies resources it will create,
+  their owner (task, shared service, user, or tool client), whether the task has exclusive control, and the supported
+  completion/cleanup mechanism. Recheck ownership before shutting down a resource that other sessions may now use.
+  Long-lived resources requested by the user are not temporary leaks.
+- On completion, error, timeout, cancellation, or requested pause, clean up **only** verified exclusively task-owned
+  temporary resources using the active tool/stack procedure, preserving diagnostic evidence and other agents' work.
+  Check for termination/release when observable. Do not infer that stopping a subagent thread stops its child commands
+  or an MCP server, and do not kill a process merely because its name or port matches.
+- In the role's existing REQUIRED REPORT, distinguish released resources, intentionally retained resources
+  (owner/reason), and unresolved or unverified cleanup (identifying evidence and the safe next action). No new handoff
+  file or per-PID inventory is required. The PRIMARY checks these outcomes before declaring the task fully settled. A
+  missing or interrupted handoff is **not** evidence of cleanup: inspect any observable in-flight commands/processes and
+  mark unresolved status explicitly when verification is unavailable. Coordinate authorized cleanup without interrupting
+  shared/user/client-managed resources. A cleanup problem is reported separately from functional test assertions and
+  Architecture Gate status.
+
 ## Bounded assignment packet
 
 The primary provides each new agent a self-contained, CURRENT packet, not a transcript dump:

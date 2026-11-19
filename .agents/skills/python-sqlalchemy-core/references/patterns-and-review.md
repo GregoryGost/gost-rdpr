@@ -283,4 +283,6 @@ async def test_user_repository_rejects_duplicate_email(db_session: AsyncSession)
 - [ ] Repository integration tests assert typed errors and verify that raw SQLAlchemy exceptions do not escape.
 - [ ] Unit tests with mocked repositories are not counted as repository SQL coverage.
 - [ ] Migration behavior follows the policy declared in `CODEX_PROJECT.md`.
-- [ ] Backend-specific mechanics are handled by the active database-specific skill.
+- [ ] Backend-specific mechanics are verified through the matching active database-specific skill when available;
+      otherwise use version-matched official backend/driver documentation and authorized real-backend evidence, with
+      unknown guarantees reported explicitly.
