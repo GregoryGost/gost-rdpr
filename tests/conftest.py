@@ -1439,7 +1439,9 @@ async def tls_doh_provider(tmp_path, dns_message):
   """Serve real ALPN-negotiated DoH with controllable HTTP/2 body failures.
 
   tmp_path owns the static test identity files; dns_message builds contract-faithful
-  DNS responses. Teardown closes only this fixture's sockets and handler tasks.
+  DNS responses. Teardown closes this fixture's accepted sockets, including peers
+  still negotiating TLS, and joins its handler tasks before checking cleanup.
+  The yielded control state exposes the loopback URL and selected fault behavior.
   """
   # certificate and private_key are test-owned paths; context negotiates the configured server protocols.
   certificate, private_key = tmp_path / 'doh-cert.pem', tmp_path / 'doh-key.pem'
@@ -1448,7 +1450,7 @@ async def tls_doh_provider(tmp_path, dns_message):
   context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
   context.load_cert_chain(certificate, private_key)
   context.set_alpn_protocols(['h2', 'http/1.1'])
-  # state exposes provider controls and wire evidence; handlers/connections retain exclusively owned resources.
+  # state exposes provider controls and wire evidence for each test's isolated endpoint.
   state = SimpleNamespace(
     context=context,
     certificate=certificate,
@@ -1470,10 +1472,15 @@ async def tls_doh_provider(tmp_path, dns_message):
     release=asyncio.Event(),
     active=0,
   )
+  # handlers retains accepted tasks; connections tracks writers whose TLS handshake has completed.
   handlers, connections = set(), set()
 
   def response(method, target, protocol):
-    """Record a bodyless DoH request and return its selected HTTP/DNS response bytes."""
+    """Return the selected status/body for method and the DoH query in target.
+
+    protocol identifies the negotiated wire protocol recorded with the request.
+    HEAD is rejected, and a missing DNS query returns a synthetic client error.
+    """
     # url/params decode the original GET; query preserves DNS identity; status selects one scheduled response.
     url = urlsplit(target)
     params = parse_qs(url.query)
@@ -1487,7 +1494,11 @@ async def tls_doh_provider(tmp_path, dns_message):
     return status, b'invalid DNS' if state.kind == 'malformed' else dns_message(state.kind, query=query).to_wire()
 
   async def serve(reader, writer):
-    """Process one TLS connection until peer close, reset or fixture cancellation."""
+    """Read HTTP requests from reader and send selected responses through writer.
+
+    The handler records negotiated protocols and closes writer on peer close,
+    transport failure or cancellation, retiring its active-connection count.
+    """
     # protocol is actual TLS ALPN; connection handles HTTP/2 framing; data/event are received wire input.
     protocol = writer.get_extra_info('ssl_object').selected_alpn_protocol()
     state.protocols.append(protocol)
@@ -1572,7 +1583,7 @@ async def tls_doh_provider(tmp_path, dns_message):
         connections.discard(writer)
 
   def connected(reader, writer):
-    """Retain every exclusively owned handler so teardown can cancel and join it."""
+    """Retain the handler for accepted reader/writer streams until it finishes."""
     # task is the handler for this accepted connection; discard removes completed tasks from ownership tracking.
     task = asyncio.create_task(serve(reader, writer))
     handlers.add(task)
@@ -1586,9 +1597,9 @@ async def tls_doh_provider(tmp_path, dns_message):
   finally:
     state.release.set()
     server.close()
-    # writer/task traverse snapshots because their finally callbacks remove completed resources.
-    for writer in tuple(connections):
-      writer.transport.abort()
+    # Pending TLS peers have no writer in connections yet; close all accepted sockets.
+    server.abort_clients()
+    # task traverses a snapshot because completed handlers remove themselves from the set.
     for task in tuple(handlers):
       task.cancel()
     if handlers:

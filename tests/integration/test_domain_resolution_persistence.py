@@ -14340,14 +14340,19 @@ async def doh_wire_client(app, monkeypatch, tls_doh_provider):
   app suppresses import side effects; monkeypatch restores the real wire method
   and temporary no-delay retry settings. tls_doh_provider owns server cleanup.
   """
-  # factory owns all clients; client selects one extra attempt and short phase timeouts for fault tests.
+  # factory owns all clients; client keeps a short read budget for body faults and allows bounded TLS setup.
   factory = importlib.import_module('client.http_base_client').HttpClient
   await factory.close()
   monkeypatch.setattr(httpx.AsyncHTTPTransport, 'handle_async_request', app.real_http_send)
   monkeypatch.setattr(app.settings, 'req_ssl_verify', False)
   monkeypatch.setattr(app.settings, 'req_retry_backoff_factor', 0)
   monkeypatch.setattr(app.settings, 'req_retry_backoff_jitter', 0)
-  client = factory.get_client('doh-wire', prefer_http2=True, connection_retries=1, timeout=httpx.Timeout(0.2))
+  client = factory.get_client(
+    'doh-wire',
+    prefer_http2=True,
+    connection_retries=1,
+    timeout=httpx.Timeout(connect=3, read=0.2, write=0.2, pool=0.2),
+  )
   try:
     yield client
   finally:
@@ -14359,6 +14364,97 @@ def doh_wire_params():
   # query is an independently constructed wire message whose ID must be echoed by the provider.
   query = dns.message.make_query('www.example.test.', 'A')
   return {'dns': urlsafe_b64encode(query.to_wire()).decode('ascii').rstrip('=')}
+
+
+async def test_tls_doh_provider_closes_connections_before_tls_handshake(tmp_path, dns_message, monkeypatch):
+  """Provider teardown releases accepted peers that have not started TLS.
+
+  tmp_path and dns_message supply the normal provider inputs. monkeypatch captures
+  the real listening server so failure cleanup can release this test's sockets.
+  """
+  # servers retains only listeners created by this test; start_server keeps the unmodified factory.
+  servers = []
+  start_server = asyncio.start_server
+
+  async def capture_server(*args, **kwargs):
+    """Forward args/kwargs unchanged and retain the resulting test-owned listener."""
+    # server is the actual TLS listener, including transports accepted before its stream callback runs.
+    server = await start_server(*args, **kwargs)
+    servers.append(server)
+    return server
+
+  monkeypatch.setattr(asyncio, 'start_server', capture_server)
+  # provider drives the existing fixture directly so teardown can be asserted before the peer closes.
+  provider = importlib.import_module('tests.conftest').tls_doh_provider.__wrapped__(tmp_path, dns_message)
+  # state exposes the provider's post-handshake observations; server is its exclusively owned listener.
+  state = await anext(provider)
+  server = servers[0]
+  # writer remains unset until this test creates its TCP-only peer, which never sends a TLS ClientHello.
+  writer = None
+  try:
+    # reader observes peer closure after provider teardown; writer retains the test-owned TCP connection.
+    reader, writer = await asyncio.wait_for(
+      asyncio.open_connection('127.0.0.1', server.sockets[0].getsockname()[1]), timeout=2
+    )
+    async with asyncio.timeout(2):
+      # asyncio tracks accepted transports before the TLS stream callback becomes eligible to run.
+      while not server._clients:
+        await asyncio.sleep(0)
+    assert state.active == 0
+    assert state.protocols == []
+    await provider.aclose()
+    assert not server.is_serving()
+    assert await asyncio.wait_for(reader.read(1), timeout=2) == b''
+    assert not server._clients
+  finally:
+    # Release the deliberately unfinished handshake even when the fixture's own teardown fails.
+    server.close()
+    server.abort_clients()
+    if writer is not None:
+      writer.close()
+      try:
+        await asyncio.wait_for(writer.wait_closed(), timeout=2)
+      except ConnectionError:
+        pass
+    await provider.aclose()
+    await asyncio.wait_for(server.wait_closed(), timeout=2)
+
+
+async def test_doh_tls_setup_can_outlast_body_timeout_without_protocol_fallback(
+  tls_doh_provider, doh_wire_client, monkeypatch
+):
+  """A bounded slow TLS handshake still reaches the healthy provider once over H2.
+
+  tls_doh_provider and doh_wire_client retain the real TLS/HTTP stack. monkeypatch
+  delays only its first TLS wrap within HTTPcore's actual connect-timeout scope;
+  the short body-read budget must not force an otherwise healthy H1 retry.
+  """
+  # tls_stream supplies the public handshake boundary; wrap preserves the real TLS implementation.
+  tls_stream = importlib.import_module('anyio.streams.tls').TLSStream
+  wrap = tls_stream.wrap
+  # first_handshake limits latency injection to the initial pool, leaving an erroneous H1 retry observable.
+  first_handshake = True
+
+  async def delayed_wrap(*args, **kwargs):
+    """Delay the first handshake, then pass args/kwargs to the real TLS wrapper."""
+    nonlocal first_handshake
+    if first_handshake:
+      first_handshake = False
+      # ready/release simulate 300 ms TLS setup latency, longer than the 200 ms body-read fault budget.
+      ready = asyncio.Event()
+      release = asyncio.get_running_loop().call_later(0.3, ready.set)
+      try:
+        await ready.wait()
+      finally:
+        release.cancel()
+    return await wrap(*args, **kwargs)
+
+  monkeypatch.setattr(tls_stream, 'wrap', delayed_wrap)
+  # response contains real DNS bytes and negotiated ALPN evidence after the injected handshake latency.
+  response = await doh_wire_client.get(tls_doh_provider.url, params=doh_wire_params())
+  assert response.http_version == 'HTTP/2'
+  assert dns.message.from_wire(response.content).answer[0][0].address == '8.8.8.8'
+  assert tls_doh_provider.requests == [('h2', 'GET', '/dns-query', dns.rdatatype.A)]
 
 
 @pytest.mark.parametrize('protocols', [('h2',), ('http/1.1',), ('h2', 'http/1.1')])
@@ -14428,7 +14524,9 @@ async def test_zero_retry_budget_disables_protocol_fallback(
   """
   # factory creates a distinct immutable zero-budget client; client is explicitly closed by fixture teardown.
   factory = importlib.import_module('client.http_base_client').HttpClient
-  client = factory.get_client('doh-no-retry', prefer_http2=True, connection_retries=0, timeout=httpx.Timeout(0.2))
+  client = factory.get_client(
+    'doh-no-retry', prefer_http2=True, connection_retries=0, timeout=httpx.Timeout(doh_wire_client.timeout)
+  )
   tls_doh_provider.h2_failure = failure
   with pytest.raises((httpx.RemoteProtocolError, httpx.ReadError)):
     await client.get(tls_doh_provider.url, params=doh_wire_params())
