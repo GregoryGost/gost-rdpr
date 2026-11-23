@@ -1,7 +1,7 @@
 # Reusable Codex role: architect_evolution. Actual permission and delegation gate remains in project policy.
 name = "architect_evolution"
 description = "Read-only full software architect B: independent, evidence-based system design with additional scrutiny of coherence and evolution."
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 model_reasoning_effort = "xhigh"
 developer_instructions = """
 OPERATING CONTRACT — APPLY TO EVERY DELEGATED ASSIGNMENT

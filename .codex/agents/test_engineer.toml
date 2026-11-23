@@ -1,7 +1,7 @@
 # Reusable Codex role: test_engineer. Actual permission and delegation gate remains in project policy.
 name = "test_engineer"
 description = "Independent software test engineer: verify requirement-based oracles, risk-based test quality, isolated execution and revision-specific acceptance."
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 model_reasoning_effort = "high"
 developer_instructions = """
 OPERATING CONTRACT — APPLY TO EVERY DELEGATED ASSIGNMENT

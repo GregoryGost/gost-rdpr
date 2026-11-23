@@ -2,7 +2,7 @@
 
 ## Execution Contract
 
-This repository consumes `agent-projects-tools` v1.21.0 in target project mode.
+This repository consumes `agent-projects-tools` v1.21.1 in target project mode.
 `AGENTS.md` defines bootstrap order; `.codex/rules/request_routing.md` is mandatory for every request.
 This profile declares capabilities and constraints; it grants no permission for side effects.
 Only exact active entries below and enabled specialized sections activate materials.
@@ -60,7 +60,7 @@ The full source catalog and template are not active profiles.
   analysis and review. A read-only assessment does not require an implementation request or a proposed patch.
 - Scope exclusions: documentation-only, comment-only, docstring-only and instruction-only authoring/editing workflows
   remain nondelegated.
-- Primary agent model/effort: gpt-6.1-sol / xhigh (select in the client or target .codex/config.toml; this entry alone
+- Primary agent model/effort: gpt-6.2-sol / xhigh (select in the client or target .codex/config.toml; this entry alone
   does not configure the running session).
 - Selected role files: all ten exact paths in the role table below.
 - Model availability: confirm with the active Codex client/account; report unavailable models and effort levels instead
@@ -72,16 +72,16 @@ The full source catalog and template are not active profiles.
 
 | Role | Custom agent file | Model | Effort |
 | --- | --- | --- | --- |
-| Architecture: stability | .codex/agents/architect_stability.toml | gpt-6.1-sol | xhigh |
-| Architecture: evolution | .codex/agents/architect_evolution.toml | gpt-6.1-sol | xhigh |
-| Database architecture: specialist | .codex/agents/database_architect.toml | gpt-6.1-sol | xhigh |
+| Architecture: stability | .codex/agents/architect_stability.toml | gpt-6.2-sol | xhigh |
+| Architecture: evolution | .codex/agents/architect_evolution.toml | gpt-6.2-sol | xhigh |
+| Database architecture: specialist | .codex/agents/database_architect.toml | gpt-6.2-sol | xhigh |
 | Codebase research | .codex/agents/code_explorer.toml | gpt-6-luna | high |
 | Documentation/API research | .codex/agents/docs_researcher.toml | gpt-6-luna | high |
-| Complex implementation | .codex/agents/complex_implementer.toml | gpt-6.1-sol | high |
+| Complex implementation | .codex/agents/complex_implementer.toml | gpt-6.2-sol | high |
 | Small fixes / boilerplate | .codex/agents/simple_implementer.toml | gpt-6-luna | high |
-| Independent test engineering | .codex/agents/test_engineer.toml | gpt-6.1-sol | high |
-| Independent code review | .codex/agents/code_reviewer.toml | gpt-6.1-sol | high |
-| Difficult bugs / design disputes | .codex/agents/deep_debugger.toml | gpt-6-astra | xhigh |
+| Independent test engineering | .codex/agents/test_engineer.toml | gpt-6.2-sol | high |
+| Independent code review | .codex/agents/code_reviewer.toml | gpt-6.2-sol | high |
+| Difficult bugs / design disputes | .codex/agents/deep_debugger.toml | gpt-6.2-astra | xhigh |
 
 ### Delegation And Ownership
 

@@ -1,7 +1,7 @@
 # Reusable Codex role: deep_debugger. Actual permission and delegation gate remains in project policy.
 name = "deep_debugger"
 description = "Read-only causal failure investigator and factual arbiter: diagnose difficult bugs, distributed state failures and architecture disputes."
-model = "gpt-6-astra"
+model = "gpt-6.2-astra"
 model_reasoning_effort = "xhigh"
 developer_instructions = """
 OPERATING CONTRACT — APPLY TO EVERY DELEGATED ASSIGNMENT

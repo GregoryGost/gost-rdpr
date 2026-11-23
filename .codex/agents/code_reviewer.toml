@@ -1,7 +1,7 @@
 # Reusable Codex role: code_reviewer. Actual permission and delegation gate remains in project policy.
 name = "code_reviewer"
 description = "Independent read-only software reviewer: assess change impact, code/test contracts and evidence-ranked defects or risks."
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 model_reasoning_effort = "high"
 developer_instructions = """
 OPERATING CONTRACT — APPLY TO EVERY DELEGATED ASSIGNMENT

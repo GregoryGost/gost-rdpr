@@ -1,7 +1,7 @@
 # Reusable Codex role: architect_stability. Actual permission and delegation gate remains in project policy.
 name = "architect_stability"
 description = "Read-only full software architect A: independent, evidence-based system design with additional scrutiny of stability and compatibility."
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 model_reasoning_effort = "xhigh"
 developer_instructions = """
 OPERATING CONTRACT — APPLY TO EVERY DELEGATED ASSIGNMENT
