@@ -1,5 +1,4 @@
-from asyncio import Queue, Task, create_task, sleep, wait_for
-from threading import Event
+from asyncio import sleep
 from typing import ClassVar, Self
 
 from httpx import AsyncClient, BasicAuth, RemoteProtocolError, Response, Timeout
@@ -7,7 +6,6 @@ from httpx._types import HeaderTypes
 
 from config.config import settings
 from database.db import db
-from jobs.job_registry import Jobs, job_registry
 from logger.logger import logger
 from models.dto.ip_record_dto import IpRecordDto
 from models.dto.ros_config_dto import RosAction, RosConfigDto
@@ -29,11 +27,8 @@ class RosClient:
   """
 
   ros_update_sleep_timeout: float = 0.1
-  update_ros_queue: Queue[RosConfigDto] = Queue(maxsize=settings.queue_max_size)
-
-  __stop_update_ros_event: Event = Event()
-  __queue_sleep_timeout: float = settings.queue_sleep_timeout
-  __queue_get_timeout: float = settings.queue_get_timeout
+  # __protocol_error_delay preserves the short pause before moving past a protocol failure.
+  __protocol_error_delay: float = settings.queue_sleep_timeout
   __task_exception_error_timeout: float = 10.0
   __headers: ClassVar[HeaderTypes] = {
     'Accept': '*/*',
@@ -59,155 +54,152 @@ class RosClient:
     'ros', timeout=__timeout, retry_methods=frozenset({'GET', 'POST', 'PATCH', 'DELETE'})
   )
   __fw_strict_addr_list_postfix: str = 'strict'
-  __update_tasks: ClassVar[set[Task[None]]] = set()
 
   def __init__(self: Self) -> None:
     logger.debug(f'{self.__class__.__name__} init ...')
 
-  async def __task_process_update_ros_from_queue(self: Self) -> None:
-    logger.info('STARTING A FLOW - Update ROS configs')
-    while not self.__stop_update_ros_event.is_set():
-      try:
-        config: RosConfigDto = await wait_for(self.update_ros_queue.get(), timeout=self.__queue_get_timeout)
-      except TimeoutError:
-        await sleep(self.__queue_sleep_timeout)
+  async def __sync_config(self: Self, config: RosConfigDto) -> None:
+    """Reconcile one device's managed entries after checking it and reading its committed IPs.
+
+    The caller owns cancellation and continues with later devices after a failure.
+    A failed IP read exits before any mutation of this device.
+    """
+    logger.debug('Start RouterOS sync for config_id=%s', config.id)
+    # check connection
+    await self.__check(config=config)
+    #
+    # DATABASE
+    #
+    # get all addresses from database
+    # stored_ip_address is the committed snapshot filtered by the device's address family when one is set.
+    stored_ip_address: list[IpRecordDto] = await db.get_all_ips_for_update(addr_type=config.addr_type)
+    # stored_addresses_set supports membership checks against current routes. ip is a row in the snapshot.
+    stored_addresses_set: set[str] = {ip.ip_address for ip in stored_ip_address}
+    logger.info(f'IP address count for ros update: {len(stored_ip_address)}')
+    # get default gateway
+    # default_ipv4_gateway is the device gateway to use when reconciling managed IPv4 routes.
+    default_ipv4_gateway: RosIpRouteDefaultGatewayResp = await self.__get_ipv4_default_gateway(config=config)
+    # get rdpr routing table
+    # routing_table is the existing managed table, if the device already has it.
+    routing_table: RosRoutingTableResp | None = await self.__get_routing_table(config=config)
+    #
+    # FIREWALL ADDRESS LIST
+    #
+    # get all ips from firewall list
+    # all_ips_from_firewall_list contains the device's current managed firewall entries.
+    all_ips_from_firewall_list: list[RosFirewallIpResp] = await self.__get_all_ips_from_firewall_list(config=config)
+    # all_ips_from_firewall_set keys each entry ip by address and list to find missing memberships.
+    all_ips_from_firewall_set: set[tuple[str, str]] = {(ip.address, ip.list_name) for ip in all_ips_from_firewall_list}
+    # firewall_address_list_name and firewall_strict_address_list_name identify the normal and strict managed lists.
+    firewall_address_list_name: str = config.bgp_list_name
+    firewall_strict_address_list_name: str = f'{config.bgp_list_name}-{self.__fw_strict_addr_list_postfix}'
+    # stored_firewall_addresses_set holds desired (address, list) pairs. firewall_address_add holds absent pairs.
+    stored_firewall_addresses_set: set[tuple[str, str]] = set()
+    firewall_address_add: list[RosFirewallIpAddDto] = []
+    #
+    # address is the next stored IP and its routing policy.
+    for address in stored_ip_address:
+      stored_firewall_addresses_set.add((address.ip_address, firewall_address_list_name))
+      #
+      if address.use_default_gw:
+        stored_firewall_addresses_set.add((address.ip_address, firewall_strict_address_list_name))
+      if address.addr_type == 6:
         continue
-      try:
-        logger.debug(f'START update ros config {config=}')
-        # check connection
-        await self.__check(config=config)
-        #
-        # DATABASE
-        #
-        # get all addresses from database
-        stored_ip_address: list[IpRecordDto] = await db.get_all_ips_for_update(addr_type=config.addr_type)
-        stored_addresses_set: set[str] = {ip.ip_address for ip in stored_ip_address}
-        logger.info(f'IP address count for ros update: {len(stored_ip_address)}')
-        # get default gateway
-        default_ipv4_gateway: RosIpRouteDefaultGatewayResp = await self.__get_ipv4_default_gateway(config=config)
-        # get rdpr routing table
-        routing_table: RosRoutingTableResp | None = await self.__get_routing_table(config=config)
-        #
-        # FIREWALL ADDRESS LIST
-        #
-        # get all ips from firewall list
-        all_ips_from_firewall_list: list[RosFirewallIpResp] = await self.__get_all_ips_from_firewall_list(config=config)
-        all_ips_from_firewall_set: set[tuple[str, str]] = {
-          (ip.address, ip.list_name) for ip in all_ips_from_firewall_list
-        }
-        firewall_address_list_name: str = config.bgp_list_name
-        firewall_strict_address_list_name: str = f'{config.bgp_list_name}-{self.__fw_strict_addr_list_postfix}'
-        stored_firewall_addresses_set: set[tuple[str, str]] = set()
-        firewall_address_add: list[RosFirewallIpAddDto] = []
-        #
-        for address in stored_ip_address:
-          stored_firewall_addresses_set.add((address.ip_address, firewall_address_list_name))
-          #
-          if address.use_default_gw:
-            stored_firewall_addresses_set.add((address.ip_address, firewall_strict_address_list_name))
-          if address.addr_type == 6:
-            continue
-          #
-          if (address.ip_address, firewall_address_list_name) not in all_ips_from_firewall_set:
-            firewall_address_add.append(
-              RosFirewallIpAddDto(
-                ip_address=address.ip_address,
-                list_name=firewall_address_list_name,
-                comment=address.comment,
-                addr_type=address.addr_type,
-              )
+      #
+      if (address.ip_address, firewall_address_list_name) not in all_ips_from_firewall_set:
+        firewall_address_add.append(
+          RosFirewallIpAddDto(
+            ip_address=address.ip_address,
+            list_name=firewall_address_list_name,
+            comment=address.comment,
+            addr_type=address.addr_type,
+          )
+        )
+      if address.use_default_gw:
+        if (address.ip_address, firewall_strict_address_list_name) not in all_ips_from_firewall_set:
+          firewall_address_add.append(
+            RosFirewallIpAddDto(
+              ip_address=address.ip_address,
+              list_name=firewall_strict_address_list_name,
+              comment=address.comment,
+              addr_type=address.addr_type,
             )
-          if address.use_default_gw:
-            if (address.ip_address, firewall_strict_address_list_name) not in all_ips_from_firewall_set:
-              firewall_address_add.append(
-                RosFirewallIpAddDto(
-                  ip_address=address.ip_address,
-                  list_name=firewall_strict_address_list_name,
-                  comment=address.comment,
-                  addr_type=address.addr_type,
-                )
-              )
-        # duplicate protection in firewall list
-        duplicate_firewall_ips, unique_firewall_ips = RosFirewallIpResp.separate_duplicates(
-          addresses=all_ips_from_firewall_list
-        )
-        # prepared firewall
-        firewall_address_delete: list[RosFirewallIpResp] = [
-          address
-          for address in unique_firewall_ips
-          if (address.address, address.list_name) not in stored_firewall_addresses_set
-        ]
-        firewall_address_delete.extend(duplicate_firewall_ips)
-        #
-        logger.info(
-          f'Update RoS config [{config.host}] : firewall-address-list DELETE count={len(firewall_address_delete)}'
-        )
-        logger.info(f'Update RoS config [{config.host}] : firewall-address-list ADD count={len(firewall_address_add)}')
-        #
-        # ROUTING
-        #
-        all_ips_from_routing: list[RosRoutingIpResp] = await self.__get_all_ips_from_routing(config=config)
-        all_ips_from_routing_set: set[str] = {ip.address for ip in all_ips_from_routing}
-        routing_ipv4_address_wrong_gateway_update: list[RosRoutingIpResp] = [
-          address
-          for address in all_ips_from_routing
-          if address.gateway != default_ipv4_gateway.gateway and address.type == 4
-        ]
-        logger.info(
-          f'Update RoS config [{config.host}] : ipv4-routing wrong gateway UPDATE '
-          f'count={len(routing_ipv4_address_wrong_gateway_update)}'
-        )
-        # duplicate protection in route
-        duplicate_routing_ips, unique_routing_ips = RosRoutingIpResp.separate_duplicates(addresses=all_ips_from_routing)
-        routing_address_delete: list[RosRoutingIpResp] = [
-          address for address in unique_routing_ips if address.address not in stored_addresses_set
-        ]
-        routing_address_delete.extend(duplicate_routing_ips)
-        logger.info(f'Update RoS config [{config.host}] : ip-routing DELETE count={len(routing_address_delete)}')
-        routing_address_add: list[IpRecordDto] = [
-          address for address in stored_ip_address if address.ip_address not in all_ips_from_routing_set
-        ]
-        logger.info(f'Update RoS config [{config.host}] : ip-routing ADD count={len(routing_address_add)}')
-        #
-        # ROUTING TABLE
-        #
-        if routing_table is None:
-          await self.__add_routing_table(config=config)
-        # CHANGE WRONG GATEWAY
-        if len(routing_ipv4_address_wrong_gateway_update) > 0:
-          await self.__update_wrong_route_gateway(
-            config=config, default_gateway=default_ipv4_gateway, address_list=routing_ipv4_address_wrong_gateway_update
           )
-        # DELETE FROM FIREWALL AND ROUTING
-        if len(firewall_address_delete) > 0:
-          await self.__delete_from_ros(
-            config=config, action=RosAction.FIREWALL_DELETE, address_list=firewall_address_delete
-          )
-        if len(routing_address_delete) > 0:
-          await self.__delete_from_ros(
-            config=config, action=RosAction.ROUTING_DELETE, address_list=routing_address_delete
-          )
-        # ADD NEW TO FIREWALL AND ROUTING
-        if len(firewall_address_add) > 0:
-          await self.__add_to_ros(config=config, action=RosAction.FIREWALL_ADD, address_list=firewall_address_add)
-        if len(routing_address_add) > 0:
-          await self.__add_to_ros(
-            config=config,
-            action=RosAction.ROUTING_ADD,
-            address_list=routing_address_add,
-            route_gateway=default_ipv4_gateway,
-          )
-        #
-        logger.debug(f'END update ros config element {config=}')
-      except RemoteProtocolError as err:
-        logger.error(f'ERROR Update ROS configs : [{err.__class__.__name__}] {err}')
-        await sleep(self.__queue_sleep_timeout)
-      except Exception as err:
-        logger.error(f'Unexpected error in flow - Update ROS configs : [{err.__class__.__name__}] {err}', exc_info=True)
-        await sleep(self.__task_exception_error_timeout)
-      finally:
-        self.update_ros_queue.task_done()
-    logger.info('STOP FLOW - Update ROS configs')
+    # duplicate protection in firewall list
+    # duplicate_firewall_ips marks extra rows. unique_firewall_ips keeps one candidate per membership.
+    duplicate_firewall_ips, unique_firewall_ips = RosFirewallIpResp.separate_duplicates(
+      addresses=all_ips_from_firewall_list
+    )
+    # prepared firewall
+    # firewall_address_delete contains duplicate and obsolete managed entries. address is the row being compared.
+    firewall_address_delete: list[RosFirewallIpResp] = [
+      address
+      for address in unique_firewall_ips
+      if (address.address, address.list_name) not in stored_firewall_addresses_set
+    ]
+    firewall_address_delete.extend(duplicate_firewall_ips)
+    #
+    logger.info(f'Update RoS config [{config.id}] : firewall-address-list DELETE count={len(firewall_address_delete)}')
+    logger.info(f'Update RoS config [{config.id}] : firewall-address-list ADD count={len(firewall_address_add)}')
+    #
+    # ROUTING
+    #
+    # all_ips_from_routing contains the device's current managed routes.
+    all_ips_from_routing: list[RosRoutingIpResp] = await self.__get_all_ips_from_routing(config=config)
+    # all_ips_from_routing_set supports presence checks. ip is a row from the device.
+    all_ips_from_routing_set: set[str] = {ip.address for ip in all_ips_from_routing}
+    # routing_ipv4_address_wrong_gateway_update selects IPv4 routes whose gateway differs. address is a route row.
+    routing_ipv4_address_wrong_gateway_update: list[RosRoutingIpResp] = [
+      address
+      for address in all_ips_from_routing
+      if address.gateway != default_ipv4_gateway.gateway and address.type == 4
+    ]
+    logger.info(
+      f'Update RoS config [{config.id}] : ipv4-routing wrong gateway UPDATE '
+      f'count={len(routing_ipv4_address_wrong_gateway_update)}'
+    )
+    # duplicate protection in route
+    # duplicate_routing_ips holds extra rows. unique_routing_ips keeps one route row per normalized address.
+    duplicate_routing_ips, unique_routing_ips = RosRoutingIpResp.separate_duplicates(addresses=all_ips_from_routing)
+    # routing_address_delete includes duplicate routes and routes with no stored address. address is a device row.
+    routing_address_delete: list[RosRoutingIpResp] = [
+      address for address in unique_routing_ips if address.address not in stored_addresses_set
+    ]
+    routing_address_delete.extend(duplicate_routing_ips)
+    logger.info(f'Update RoS config [{config.id}] : ip-routing DELETE count={len(routing_address_delete)}')
+    # routing_address_add contains absent stored routes. address is an IP record from the committed snapshot.
+    routing_address_add: list[IpRecordDto] = [
+      address for address in stored_ip_address if address.ip_address not in all_ips_from_routing_set
+    ]
+    logger.info(f'Update RoS config [{config.id}] : ip-routing ADD count={len(routing_address_add)}')
+    #
+    # ROUTING TABLE
+    #
+    if routing_table is None:
+      await self.__add_routing_table(config=config)
+    # CHANGE WRONG GATEWAY
+    if len(routing_ipv4_address_wrong_gateway_update) > 0:
+      await self.__update_wrong_route_gateway(
+        config=config, default_gateway=default_ipv4_gateway, address_list=routing_ipv4_address_wrong_gateway_update
+      )
+    # DELETE FROM FIREWALL AND ROUTING
+    if len(firewall_address_delete) > 0:
+      await self.__delete_from_ros(
+        config=config, action=RosAction.FIREWALL_DELETE, address_list=firewall_address_delete
+      )
+    if len(routing_address_delete) > 0:
+      await self.__delete_from_ros(config=config, action=RosAction.ROUTING_DELETE, address_list=routing_address_delete)
+    # ADD NEW TO FIREWALL AND ROUTING
+    if len(firewall_address_add) > 0:
+      await self.__add_to_ros(config=config, action=RosAction.FIREWALL_ADD, address_list=firewall_address_add)
+    if len(routing_address_add) > 0:
+      await self.__add_to_ros(
+        config=config,
+        action=RosAction.ROUTING_ADD,
+        address_list=routing_address_add,
+        route_gateway=default_ipv4_gateway,
+      )
+    logger.debug('Finish RouterOS sync for config_id=%s', config.id)
 
   async def __check(self: Self, config: RosConfigDto) -> None:
     logger.debug(f'Try check RouterOS {config.host=} ...')
@@ -530,28 +522,31 @@ class RosClient:
       raise err
 
   async def update(self: Self, addr_type: int | None = None) -> None:
+    """Synchronize devices serially in the caller's task.
+
+    addr_type overrides the family on each loaded configuration. Cancellation
+    unwinds the current device before returning and leaves later devices untouched.
+    """
     logger.info(f'Run update ROS configs {addr_type=}')
     try:
-      # get all RoS configs from DB
-      configs: list[RosConfigDto] = await db.get_all_configs_for_ros_update()
-      logger.info(f'Configs for update: {len(configs)}')
-      if len(configs) > 0:
-        #
-        logger.debug('Start task ...')
-        self.__stop_update_ros_event.clear()
-        update_task = create_task(
-          coro=self.__task_process_update_ros_from_queue(), name='__task_process_update_ros_from_queue'
-        )
-        self.__update_tasks.add(update_task)
-        update_task.add_done_callback(self.__update_tasks.discard)
-        for config in configs:
-          if addr_type is not None:
-            config.addr_type = addr_type
-          await self.update_ros_queue.put(item=config)
-        await self.update_ros_queue.join()
-        self.__stop_update_ros_event.set()
-        logger.info('Update ROS configs DONE')
-    except Exception as err:
-      logger.error(f'Update ROS configs failed: [{err.__class__.__name__}] : {err}', exc_info=True)
-    finally:
-      await job_registry.finish(Jobs.ROS_UPDATE)
+      # configs contains the committed device settings in their existing processing order.
+      configs = await db.get_all_configs_for_ros_update()
+    # error is the configuration read failure. Avoid logging device credentials or database details.
+    except Exception as error:  # noqa: BLE001 - The update boundary records failures before any device work.
+      logger.error('Update ROS configs failed [%s]', type(error).__name__)
+      return
+    logger.info(f'Configs for update: {len(configs)}')
+    # config is the next device to reconcile before moving on to later devices.
+    for config in configs:
+      if addr_type is not None:
+        config.addr_type = addr_type
+      try:
+        await self.__sync_config(config)
+      # error is the current device's transport or reconciliation failure.
+      except RemoteProtocolError as error:
+        logger.error('ERROR Update ROS configs [%s]', type(error).__name__)
+        await sleep(self.__protocol_error_delay)
+      except Exception as error:  # noqa: BLE001 - One failed device must not skip later configurations.
+        logger.error('Unexpected error in flow - Update ROS configs [%s]', type(error).__name__)
+        await sleep(self.__task_exception_error_timeout)
+    logger.info('Update ROS configs DONE')

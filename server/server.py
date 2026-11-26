@@ -17,7 +17,7 @@ from client.domains_resolving_client import _await_owned, saving_coordinator
 from client.http_base_client import HttpClient
 from config.config import settings
 from database.db import db
-from jobs.job_registry import job_registry
+from jobs.job_registry import job_registry, update_jobs
 from logger.logger import logger
 from metrics.metrics import PrometheusMiddleware
 from models.http.base import ErrorResp
@@ -64,20 +64,36 @@ class AppServer:
 
   @asynccontextmanager
   async def __lifespan(self: Self, app: FastAPI) -> AsyncGenerator[None, Any]:
+    """Enable update admission once storage and saving workers are ready.
+
+    FastAPI passes app to this callback. The application dependencies have
+    module-level owners and need no additional state on app.
+    """
     try:
       await job_registry.reset()
       await db.setup()
       await saving_coordinator.start()
+      update_jobs.start()
       yield
     finally:
       await _await_owned(self.__close_resources(), cancel_on_cancel=False)
 
   @staticmethod
   async def __close_resources() -> None:
+    """Seal update dispatch before draining storage and closing outbound HTTP clients."""
+    # failure retains the first cleanup error while all owners get their cleanup turn.
     failure: BaseException | None = None
-    for cleanup in (saving_coordinator.stop, db.close, saving_coordinator.finish_close, HttpClient.close):
+    # cleanup is the next lifecycle step in resource dependency order.
+    for cleanup in (
+      update_jobs.stop,
+      saving_coordinator.stop,
+      db.close,
+      saving_coordinator.finish_close,
+      HttpClient.close,
+    ):
       try:
         await cleanup()
+      # err retains a failed step for the final lifespan result.
       except (Exception, CancelledError) as err:
         if failure is None:
           failure = err

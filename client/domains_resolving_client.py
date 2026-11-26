@@ -13,8 +13,8 @@ from asyncio import (
 )
 from base64 import urlsafe_b64encode
 from collections import deque
-from collections.abc import AsyncGenerator, Coroutine, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator, Callable, Coroutine, Sequence
+from contextlib import asynccontextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -61,7 +61,7 @@ from models.dto.domains_dto import (
   ProcessingOutcome,
 )
 from models.dto.ip_record_dto import IpRecordDto
-from models.dto.queue_dto import WriteOutcome, WriteReceipt, notify_observation
+from models.dto.queue_dto import WriteOutcome, WriteReceipt, WriteScope, notify_observation
 from models.http.dns_servers_resp import DnsElementResp
 from models.http.domains_req import DomainsPostElementReq
 from utils.utils import check_ip_allow, get_ip_network_address, get_ip_version
@@ -859,21 +859,51 @@ class DomainsResolver:
     await saving_coordinator.resolve_stored(domain_id, self)
 
 
+@dataclass(slots=True)
+class _StaleRun:
+  """Track actual STALE producers and their queue admissions through the RouterOS handoff."""
+
+  # writes accounts for commands already admitted by these producers, including aliases.
+  writes: WriteScope = field(default_factory=WriteScope)
+  # producers counts actual attempts until they exit, even when their pass interest is removed.
+  producers: int = 0
+  # processing_finished records the scan's adoption/processing endpoint independently of early failure.
+  processing_finished: bool = False
+  # producers_finished wakes the STALE owner once neither capture nor a producer can add work.
+  producers_finished: Event = field(default_factory=Event)
+
+  def update_producer_boundary(self) -> None:
+    """Wake the job owner when both capture/processing and the producer bodies have ended."""
+    if self.processing_finished and not self.producers:
+      self.producers_finished.set()
+
+
 @dataclass(eq=False, slots=True)
 class _SavingPass:
+  """Hold one finite scan's demand, immutable DNS configuration and processing progress."""
+
+  # mode selects membership; resolver owns DNS processing; detached retains demand without a direct waiter.
   mode: Jobs
   resolver: DomainsResolver
   detached: bool
+  # run tracks selection and processing metrics; done wakes existing waiters, including on early failure.
   run: ResolutionRun
   done: Event = field(default_factory=Event)
+  # callers counts direct waiters whose cancellation can withdraw their own demand.
   callers: int = 0
+  # servers and context retain the selected DNS configuration and reusable classic resolvers for this pass.
   servers: _DnsServersSnapshot | None = None
   context: _DefaultDnsContext | None = None
+  # remaining counts operations that must finish processing before this pass completes.
   remaining: int = 0
+  # adopted marks the end of membership capture; finished marks processing completion and metric finalization.
   adopted: bool = False
   finished: bool = False
+  # cancelled stops adoption; error retains the outcome reported to pass waiters.
   cancelled: bool = False
   error: BaseException | None = None
+  # stale tracks the separate physical producer and writer boundary for the scheduled STALE command.
+  stale: _StaleRun | None = None
 
 
 @dataclass(slots=True)
@@ -1016,18 +1046,26 @@ class SavingCoordinator:
     self._ready.set()
     self._idle.clear()
 
-  def _register_scan(self, mode: Jobs, resolver: DomainsResolver, detached: bool) -> _SavingPass | None:
+  def _register_scan(
+    self, mode: Jobs, resolver: DomainsResolver, detached: bool, *, stale: _StaleRun | None = None
+  ) -> _SavingPass | None:
+    """Register or coalesce a scan using its mode, DNS resolver and waiting-caller ownership.
+
+    The scheduled STALE caller supplies stale to observe physical write completion.
+    """
     self._check_open()
     if mode not in {Jobs.DOMAINS_RESOLVE_NEW, Jobs.DOMAINS_RESOLVE_STALE}:
       raise ValueError(f'Unknown domains resolve mode: {mode}')
+    # item is a registered scan that can already satisfy a duplicate STALE trigger.
     if mode == Jobs.DOMAINS_RESOLVE_STALE and any(item.mode == mode for item in self._passes):
       return None
     if mode == Jobs.DOMAINS_RESOLVE_NEW and self._new_request is not None:
       self._new_request.detached |= detached
       self._new_request.callers += int(not detached)
       return self._new_request
+    # operation is the new scan published to the capture loop.
     operation = _SavingPass(
-      mode, resolver, detached, ResolutionRun('new' if mode == Jobs.DOMAINS_RESOLVE_NEW else 'stale')
+      mode, resolver, detached, ResolutionRun('new' if mode == Jobs.DOMAINS_RESOLVE_NEW else 'stale'), stale=stale
     )
     operation.callers = int(not detached)
     self._passes.add(operation)
@@ -1046,6 +1084,58 @@ class SavingCoordinator:
     if accepted:
       await job_registry.try_start(Jobs.DOMAINS_RESOLVE)
     return accepted
+
+  def check_stale_acceptance(self) -> None:
+    """Check the coordinator's failure or shutdown state before the job owner accepts STALE."""
+    self._check_open()
+
+  async def run_stale(self, resolver: DomainsResolver, *, shutting_down: Callable[[], bool] | None = None) -> None:
+    """Run one scheduled STALE scan and wait for its database work before yielding to RouterOS.
+
+    Recheck admission when dispatched with resolver. On cancellation, withdraw
+    the scan's demand and finish its cleanup. Keep waiting for scoped producers
+    and admitted writes while the owner can dispatch pending work. The optional
+    shutting_down callback returns true after the owner seals admission and
+    discards pending work, allowing shutdown to interrupt that wait. The
+    database retains ownership of admitted writes throughout.
+    """
+    await self.start()
+    # stale tracks only this run; scan is its finite membership and existing processing outcome.
+    stale = _StaleRun()
+    scan = self._register_scan(Jobs.DOMAINS_RESOLVE_STALE, resolver, False, stale=stale)
+    if scan is None:
+      return
+    # cancelled records the first cancellation so activity cleanup can preserve it.
+    cancelled = False
+    try:
+      await job_registry.try_start(Jobs.DOMAINS_RESOLVE)
+      await stale.producers_finished.wait()
+      await db.wait_for_write_scope(stale.writes)
+    except CancelledError:
+      cancelled = True
+      if not scan.finished:
+        # _await_owned settles pass cleanup before propagating a repeated cancellation.
+        with suppress(CancelledError):
+          await _await_owned(self._cancel_pass(scan), cancel_on_cancel=False)
+      while shutting_down is None or not shutting_down():
+        # A later cancel wakes either wait so the next iteration can check for shutdown.
+        with suppress(CancelledError):
+          await stale.producers_finished.wait()
+          await db.wait_for_write_scope(stale.writes)
+          break
+      raise
+    finally:
+      scan.stale = None
+      if not self._passes:
+        try:
+          await _await_owned(self._finish_activity(), cancel_on_cancel=False)
+        except CancelledError:
+          if not cancelled:
+            raise
+    if isinstance(scan.error, CancelledError):
+      raise DatabaseWriteError('Stale domain processing was cancelled') from scan.error
+    if scan.error is not None:
+      raise scan.error
 
   async def resolve_scan(self, mode: Jobs, resolver: DomainsResolver) -> None:
     """Wait for a caller-owned pass; cancellation removes only that pass's interest."""
@@ -1201,6 +1291,8 @@ class SavingCoordinator:
     # domain holds the prepared result; run receives only this physical operation's origin metrics.
     domain: DomainResult | None = None
     run: ResolutionRun | None = None
+    # stale retains the scope and producer count from the instant this actual attempt begins.
+    stale: _StaleRun | None = None
     try:
       self._check_open()
       if operation.stored:
@@ -1233,6 +1325,10 @@ class SavingCoordinator:
       operation.receipt.add_wakeup(self._outcomes)
       self._receipts[operation.token] = operation
       # This transition precedes real resolution with no await between them.
+      # interest is a pass attached before this attempt, including a STALE pass whose member was promoted.
+      stale = next((interest.stale for interest in operation.interests if interest.stale is not None), None)
+      if stale is not None:
+        stale.producers += 1
       operation.attempted = True
       self._release_capacity(operation)
       if operation.priority:
@@ -1245,7 +1341,8 @@ class SavingCoordinator:
       for interest in operation.interests:
         interest.run.cover()
       notify_observation(domain.observation, 'processing_started', perf_counter())
-      await operation.resolver.process_saving_domain(domain, servers, context)
+      with db.bind_write_scope(stale.writes) if stale is not None else nullcontext():
+        await operation.resolver.process_saving_domain(domain, servers, context)
     except CancelledError:
       operation.error = operation.error or CancelledError()
       raise
@@ -1258,9 +1355,14 @@ class SavingCoordinator:
         'Saving domain operation failed [%s]', type(err).__name__, exc_info=RuntimeError('Saving operation failed')
       )
     finally:
-      if run is not None and operation.stored:
-        run.finish(operation.error is None)
-      self._finish_operation(operation)
+      try:
+        if run is not None and operation.stored:
+          run.finish(operation.error is None)
+        self._finish_operation(operation)
+      finally:
+        if stale is not None:
+          stale.producers -= 1
+          stale.update_producer_boundary()
 
   def _finish_operation(self, operation: _SavingOperation) -> None:
     """Finalize operation once, observing only attempted work as completed membership.
@@ -1337,12 +1439,13 @@ class SavingCoordinator:
     self._ready.set()
 
   async def _scan_loop(self) -> None:
+    """Dispatch finite captures in priority order and finish a tracked capture cancelled before entry."""
     while not self._stopping and self._failure is None:
       if not self._scans or (self._new_request is not None and self._current_new is not None):
         self._scan_ready.clear()
         await self._scan_ready.wait()
         continue
-      # A pending NEW capture precedes any not-yet-started STALE capture.
+      # item is a queued pass checked for NEW. operation is the next capture, giving queued NEW priority over STALE.
       operation = next((item for item in self._scans if item.mode == Jobs.DOMAINS_RESOLVE_NEW), self._scans[0])
       self._scans.remove(operation)
       if operation.cancelled:
@@ -1352,9 +1455,15 @@ class SavingCoordinator:
         self._current_new = operation
       self._capturing = operation
       self._capture_task = create_task(self._capture_scan(operation))
-      await gather(self._capture_task, return_exceptions=True)
-      self._capture_task = None
-      self._capturing = None
+      try:
+        await gather(self._capture_task, return_exceptions=True)
+      finally:
+        if operation.stale is not None and not operation.adopted:
+          operation.error = operation.error or CancelledError()
+          operation.adopted = True
+          self._finish_pass(operation)
+        self._capture_task = None
+        self._capturing = None
 
   async def _capture_scan(self, operation: _SavingPass) -> None:
     """Select operation's finite membership once, then adopt it without waiting for commits.
@@ -1362,13 +1471,13 @@ class SavingCoordinator:
     The ticket retains lightweight attempt completions across the selection await, so
     progress can distinguish still-running work from a completion already released.
     """
-    await job_registry.try_start(Jobs.DOMAINS_RESOLVE)
-    # domain_id is each owned record key; owners holds its ordered physical reservations.
-    self._ticket = _SelectionTicket(
-      self._generation,
-      {domain_id: owners[0].completion for domain_id, owners in self._owners.items() if owners[0].attempted},
-    )
     try:
+      await job_registry.try_start(Jobs.DOMAINS_RESOLVE)
+      # domain_id is each owned record key; owners holds its ordered physical reservations.
+      self._ticket = _SelectionTicket(
+        self._generation,
+        {domain_id: owners[0].completion for domain_id, owners in self._owners.items() if owners[0].attempted},
+      )
       # candidates is the complete selected membership, fixed before any DNS configuration read.
       candidates = await (
         db.get_new_domains_for_resolve()
@@ -1465,6 +1574,9 @@ class SavingCoordinator:
     scan.finished = True
     scan.run.finish(scan.error is None and not scan.cancelled)
     scan.done.set()
+    if scan.stale is not None:
+      scan.stale.processing_finished = True
+      scan.stale.update_producer_boundary()
     self._passes.discard(scan)
     if self._current_new is scan:
       self._current_new = None

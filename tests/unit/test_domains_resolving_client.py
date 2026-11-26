@@ -540,26 +540,32 @@ async def test_date_query_rejects_invalid_calendar_format_and_nonincreasing_rang
 
 
 @pytest.mark.parametrize('configured', [False, True])
-async def test_router_update_completes_reads_and_releases_job_after_worker_exit(app, monkeypatch, configured):
-  from threading import Event
+async def test_router_update_waits_for_device_io_and_checks_before_reading_ips(app, monkeypatch, configured):
+  """Wait for device I/O in update and avoid touching devices when no configs exist.
 
+  app owns isolated clients, monkeypatch replaces boundary I/O, and configured
+  selects whether there is a device to update.
+  """
+  # module and dto supply the updater and the config type used by the test.
+  # config is the sole synthetic device; boundary provides controlled repository results.
   module = importlib.import_module('client.ros_updater_client')
   dto = importlib.import_module('models.dto.ros_config_dto')
-  jobs = importlib.import_module('jobs.job_registry')
   config = dto.RosConfigDto(1, 'router.example.test', 'test-user', 'test-password', 'test-routes')
   boundary = SimpleNamespace(
     get_all_configs_for_ros_update=AsyncMock(return_value=[config] if configured else []),
     get_all_ips_for_update=AsyncMock(return_value=[]),
   )
-  registry = jobs.JobRegistry()
+  # entered and release control the device check; requests records the device protocol sequence.
   entered, release = asyncio.Event(), asyncio.Event()
   requests = []
 
   async def upstream(request):
+    """Hold the initial check and answer the remaining reads for this request's endpoint."""
     requests.append((request.method, request.url.path))
     if request.url.path == '/rest/system/resource':
       entered.set()
       await release.wait()
+      # payload is the response body expected by each RouterOS resource.
       payload = {}
     elif request.url.path == '/rest/routing/table/print':
       payload = [{'.id': '*1', 'name': 'test-routes'}]
@@ -569,30 +575,18 @@ async def test_router_update_completes_reads_and_releases_job_after_worker_exit(
       payload = []
     return httpx.Response(200, json=payload)
 
+  # instance is the updater under test; operation retains its sole test-owned task.
   instance = module.RosClient()
   monkeypatch.setattr(module, 'db', boundary)
-  monkeypatch.setattr(module, 'job_registry', registry)
   monkeypatch.setattr(instance, '_RosClient__client', app.make_http(upstream))
-  monkeypatch.setattr(instance, 'update_ros_queue', asyncio.Queue(maxsize=1))
-  monkeypatch.setattr(instance, '_RosClient__stop_update_ros_event', Event())
-  monkeypatch.setattr(instance, '_RosClient__queue_get_timeout', 0.01)
-  monkeypatch.setattr(instance, '_RosClient__queue_sleep_timeout', 0)
-  before = asyncio.all_tasks()
-  assert await registry.try_start(jobs.Jobs.ROS_UPDATE)
   operation = asyncio.create_task(instance.update(addr_type=4))
   try:
     if configured:
       await asyncio.wait_for(entered.wait(), timeout=1)
-      gc.collect()
-      assert await registry.is_active(jobs.Jobs.ROS_UPDATE)
       assert not operation.done()
+      boundary.get_all_ips_for_update.assert_not_awaited()
       release.set()
     await asyncio.wait_for(operation, timeout=1)
-    workers = [task for task in asyncio.all_tasks() - before if task is not asyncio.current_task()]
-    if workers:
-      await asyncio.wait_for(asyncio.gather(*workers), timeout=1)
-    assert not await registry.is_active(jobs.Jobs.ROS_UPDATE)
-    assert instance.update_ros_queue.empty()
     if configured:
       assert requests == [
         ('GET', '/rest/system/resource'),
@@ -608,10 +602,73 @@ async def test_router_update_completes_reads_and_releases_job_after_worker_exit(
       boundary.get_all_ips_for_update.assert_not_awaited()
   finally:
     release.set()
-    owned = asyncio.all_tasks() - before
-    for task in owned:
-      task.cancel()
-    await asyncio.gather(*owned, return_exceptions=True)
+    operation.cancel()
+    await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.mark.parametrize('terminal', ['error', 'cancel', 'shutdown'])
+async def test_update_jobs_hold_slot_through_cleanup(app, terminal):
+  """Keep the next job waiting until cleanup and discard it during shutdown.
+
+  app isolates project imports. terminal chooses whether work fails, cancels
+  itself, or receives cancellation from shutdown.
+  """
+  # jobs exposes the owner and valid kinds. owner contains only this scenario's two callbacks.
+  jobs = importlib.import_module('jobs.job_registry')
+  owner = jobs.UpdateJobs()
+  # started marks active work; unwind initiates failure; cleaning and cleaned delimit its cleanup.
+  # finish_cleanup releases cleanup; successor records entry of the deferred callback.
+  started, unwind, cleaning = asyncio.Event(), asyncio.Event(), asyncio.Event()
+  finish_cleanup, cleaned, successor = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+  async def active():
+    """Fail or cancel as directed, then retain the slot until cleanup is released."""
+    try:
+      started.set()
+      await unwind.wait()
+      if terminal == 'cancel':
+        raise asyncio.CancelledError
+      raise RuntimeError('Synthetic workload failure')
+    finally:
+      cleaning.set()
+      await finish_cleanup.wait()
+      cleaned.set()
+
+  async def deferred():
+    """Observe whether the deferred callback starts after the active cleanup."""
+    assert cleaned.is_set()
+    successor.set()
+
+  # shutdown tracks the optional owner stop while active cleanup is held.
+  shutdown = None
+  owner.start()
+  try:
+    assert owner.submit(jobs.Jobs.DOMAINS_RESOLVE_STALE, active)
+    async with asyncio.timeout(3):
+      await started.wait()
+      assert owner.submit(jobs.Jobs.ROS_UPDATE, deferred)
+      if terminal == 'shutdown':
+        shutdown = asyncio.create_task(owner.stop())
+      else:
+        unwind.set()
+      await cleaning.wait()
+      assert not successor.is_set()
+      if shutdown is not None:
+        assert not shutdown.done()
+        with pytest.raises(RuntimeError):
+          owner.submit(jobs.Jobs.ROS_UPDATE, deferred)
+      finish_cleanup.set()
+      if shutdown is None:
+        await successor.wait()
+      else:
+        await shutdown
+        assert cleaned.is_set()
+        assert not successor.is_set()
+  finally:
+    finish_cleanup.set()
+    if shutdown is not None:
+      await asyncio.gather(shutdown, return_exceptions=True)
+    await owner.stop()
 
 
 async def scheduling_turn():
@@ -4712,59 +4769,106 @@ async def test_statistics_query_preserves_supported_granularity_and_domain_check
 
 @pytest.fixture
 def router_sync(app, monkeypatch):
-  from threading import Event
+  """Run the real serial updater against fixture-owned repository and HTTP boundaries.
 
+  app owns outbound clients and monkeypatch restores the device transport,
+  repository, and clock after the test.
+  """
+  # module, dto and models expose RouterOS behavior and protocol types.
+  # instance runs the updater; config is its default synthetic device.
   module = importlib.import_module('client.ros_updater_client')
   dto = importlib.import_module('models.dto.ros_config_dto')
   models = importlib.import_module('models.http.ros_rest_api_resp')
-  jobs = importlib.import_module('jobs.job_registry')
   instance = module.RosClient()
   config = dto.RosConfigDto(1, 'router.example.test', 'test-user', 'test-password', 'managed')
-  registry = jobs.JobRegistry()
-  monkeypatch.setattr(instance, 'update_ros_queue', asyncio.Queue(maxsize=2))
-  monkeypatch.setattr(instance, '_RosClient__stop_update_ros_event', Event())
-  monkeypatch.setattr(instance, '_RosClient__queue_get_timeout', 0.01)
-  monkeypatch.setattr(instance, '_RosClient__update_tasks', set())
-  monkeypatch.setattr(module, 'job_registry', registry)
 
-  # Pacing is an external clock boundary; each call still yields to the queue owner.
   async def no_pause(delay):
+    """Replace the device pacing delay with one scheduling turn."""
     await scheduling_turn()
 
   monkeypatch.setattr(module, 'sleep', no_pause)
+  # requests records every device exchange, including skipped or failed mutations.
   requests = []
 
   def install(handler):
+    """Install a response handler for the updater's fixture-owned HTTP client."""
+
     def upstream(request):
+      """Capture each actual updater request before passing it to the test's handler."""
       requests.append(request)
       return handler(request)
 
     monkeypatch.setattr(instance, '_RosClient__client', app.make_http(upstream))
 
-  async def run(records, configs=None):
+  async def run(records, configs=None, *, failed_read=None):
+    """Return the repository observations after syncing the supplied records and devices.
+
+    failed_read can identify a repository method whose read raises a typed failure.
+    """
+    # repository supplies the fixture records or one controlled storage read failure.
     repository = SimpleNamespace(
       get_all_configs_for_ros_update=AsyncMock(return_value=configs if configs is not None else [config]),
       get_all_ips_for_update=AsyncMock(return_value=records),
     )
+    if failed_read is not None:
+      getattr(repository, failed_read).side_effect = app.database.DatabaseReadError('Synthetic read failure')
     monkeypatch.setattr(module, 'db', repository)
-    assert await registry.try_start(jobs.Jobs.ROS_UPDATE)
-    try:
-      await asyncio.wait_for(instance.update(addr_type=4), timeout=2)
-      tasks = tuple(instance._RosClient__update_tasks)
-      if tasks:
-        await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
-      assert not await registry.is_active(jobs.Jobs.ROS_UPDATE)
-      assert instance.update_ros_queue.empty()
-      return repository
-    finally:
-      tasks = tuple(instance._RosClient__update_tasks)
-      for task in tasks:
-        task.cancel()
-      await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.wait_for(instance.update(addr_type=4), timeout=2)
+    return repository
 
   return SimpleNamespace(
     instance=instance, config=config, dto=dto, models=models, install=install, run=run, requests=requests
   )
+
+
+@pytest.mark.parametrize('read', ['configs', 'ips', 'empty'])
+async def test_router_sync_distinguishes_failed_read_from_authoritative_empty(router_sync, read, caplog):
+  """Preserve device state on storage failure, but delete obsolete entries on a successful empty read.
+
+  router_sync supplies the real updater with controlled storage and device I/O.
+  read selects a failed configuration/IP query or a successful empty IP query;
+  caplog captures the failure classification for the background caller.
+  """
+
+  def upstream(request):
+    """Return one obsolete entry in each managed resource and accept its deletion."""
+    if request.method == 'GET':
+      return httpx.Response(200, json={})
+    if request.method == 'DELETE':
+      return httpx.Response(204)
+    if request.url.path == '/rest/ip/route/print' and b'active=true' in request.content:
+      return httpx.Response(
+        200, json=[{'gateway': '192.0.2.1', 'routing-table': 'main', 'immediate-gw': '192.0.2.1%WAN'}]
+      )
+    # existing maps managed reads to their current RouterOS state before synchronization.
+    existing = {
+      '/rest/routing/table/print': [{'.id': '*table', 'name': 'managed'}],
+      '/rest/ip/firewall/address-list/print': [{'.id': '*fw', 'address': '8.8.8.8', 'list': 'managed'}],
+      '/rest/ip/route/print': [{'.id': '*route', 'dst-address': '8.8.8.8/32', 'gateway': '192.0.2.1'}],
+      '/rest/ipv6/route/print': [],
+    }
+    return httpx.Response(200, json=existing[request.url.path])
+
+  router_sync.install(upstream)
+  if read == 'configs':
+    await router_sync.run([], failed_read='get_all_configs_for_ros_update')
+    assert router_sync.requests == []
+  elif read == 'ips':
+    await router_sync.run([], failed_read='get_all_ips_for_update')
+    # request identifies the sole allowed device health check before the IP read failed.
+    assert [(request.method, request.url.path) for request in router_sync.requests] == [
+      ('GET', '/rest/system/resource')
+    ]
+  else:
+    await router_sync.run([])
+    # request is each captured exchange; compare the exact route/firewall deletions.
+    assert {(request.method, request.url.path) for request in router_sync.requests if request.method == 'DELETE'} == {
+      ('DELETE', '/rest/ip/firewall/address-list/*fw'),
+      ('DELETE', '/rest/ip/route/*route'),
+    }
+  if read != 'empty':
+    assert 'DatabaseReadError' in caplog.text
+    assert 'Synthetic read failure' not in caplog.text
 
 
 @pytest.mark.parametrize('already_synchronized', [False, True])
