@@ -12,8 +12,9 @@ from asyncio import (
   to_thread,
   wait_for,
 )
-from collections.abc import Sequence
-from contextlib import suppress
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from enum import StrEnum
 from importlib.machinery import ModuleSpec
@@ -28,10 +29,12 @@ from time import monotonic, perf_counter
 from types import ModuleType
 from typing import Any, Self, cast
 
+from aiosqlite import Connection as AioSQLiteConnection
 from aiosqlite import __version__ as aiosqlite_version
 from sqlalchemy import Result, Row, delete, event, exists, func, insert, select, text, update
 from sqlalchemy import __version__ as sqlalchemy_version
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import Session
 from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool
 from sqlalchemy.schema import CreateIndex, CreateTable
 
@@ -70,6 +73,7 @@ from models.dto.queue_dto import (
   TargetAction,
   WriteOutcome,
   WriteReceipt,
+  WriteScope,
   notify_observation,
 )
 from models.dto.ros_config_dto import RosConfigDto
@@ -133,7 +137,7 @@ LEGACY_BUSINESS_COLUMNS = {
 
 
 class DatabaseReadError(RuntimeError):
-  """A detached resolution selection could not be read safely."""
+  """A database snapshot required for resolution or RouterOS synchronization could not be read."""
 
 
 class DomainIpReadError(RuntimeError):
@@ -207,20 +211,34 @@ class DataBase:
   __migrations_path: Path = Path('migrations')
 
   def __init__(self: Self) -> None:
+    """Configure pooled reads, single-connection write batches and their event-loop bookkeeping."""
+    # __connection_pragmas supplies the validated settings for each physical connection.
     self.__connection_pragmas = self.__validated_connection_pragmas()
+    # __state gates storage access; __initialization_failed records an incomplete startup migration.
     self.__state = False
     self.__initialization_failed = False
+    # db_save_queue limits admitted commands waiting for the writer; __pending_batch collects its next transaction.
     self.db_save_queue: Queue[QueueElementDto] = Queue(maxsize=settings.queue_max_size)
     self.__pending_batch: list[QueueElementDto] = []
+    # __observations retains optional metrics; __commands owns receipts until their outcome is known.
     self.__observations: dict[int, QueueElementDto] = {}
     self.__commands: dict[int, QueueElementDto] = {}
+    # __write_scope carries the producing pass through DNS helpers to the actual admission point.
+    self.__write_scope: ContextVar[WriteScope | None] = ContextVar('resolution_write_scope', default=None)
+    # __batch_quiescence_unproven remembers attempts without native completion evidence in this batch.
+    self.__batch_quiescence_unproven = False
+    # __writer_failure_wakeups notifies lifecycle listeners; __failure_summaries retains metrics during failure.
     self.__writer_failure_wakeups: set[Event] = set()
     self.__failure_summaries: dict[str, dict] = {}
+    # __writer_state gates admission; __writer_failure retains the first terminal failure.
     self.__writer_state = WriterState.NEW
+    # __writer_task owns the queue loop; __batch_task owns its shielded transaction and cleanup.
     self.__writer_task: Task[None] | None = None
     self.__batch_task: Task[None] | None = None
+    # __close_task retains shutdown and engine disposal across caller cancellation.
     self.__close_task: Task[None] | None = None
     self.__writer_failure: WriterFailedError | None = None
+    # __unknown_count measures uncertain writer outcomes; __session_cleanup_failed suppresses engine disposal.
     self.__unknown_count = 0
     self.__session_cleanup_failed = False
     logging.getLogger('sqlalchemy.engine').setLevel(Logger.LOGGER_LEVEL[settings.db_log_level])
@@ -230,6 +248,7 @@ class DataBase:
     logger.debug(f'aiosqlite version="{aiosqlite_version}"')
     logger.debug(f'db_connection="{settings.db_connection}"')
     self.__migrations_path.mkdir(exist_ok=True)
+    # __read_engine pools short snapshot connections; __write_engine creates a connection per write session.
     self.__read_engine: AsyncEngine = create_async_engine(
       url=settings.db_connection,
       connect_args={'timeout': settings.db_timeout},
@@ -252,12 +271,14 @@ class DataBase:
     self.__read_engine.dialect.identifier_preparer.final_quote = ''
     self.__write_engine.dialect.identifier_preparer.initial_quote = ''
     self.__write_engine.dialect.identifier_preparer.final_quote = ''
+    # __read_session_factory and __write_session_factory open sessions on their matching engines.
     self.__read_session_factory = async_sessionmaker(
       bind=self.__read_engine, expire_on_commit=False, autocommit=False, autoflush=True
     )
     self.__write_session_factory = async_sessionmaker(
       bind=self.__write_engine, expire_on_commit=False, autocommit=False, autoflush=True
     )
+    # file_loader_client retrieves list contents for the existing refresh workflow.
     self.file_loader_client: FileLoaderClient = FileLoaderClient()
     logger.debug(f'{self.__class__.__name__} INIT OK')
 
@@ -293,6 +314,24 @@ class DataBase:
 
   def unregister_writer_failure_wakeup(self, wakeup: Event) -> None:
     self.__writer_failure_wakeups.discard(wakeup)
+
+  @contextmanager
+  def bind_write_scope(self, scope: WriteScope) -> Generator[None]:
+    """Attribute writes admitted in this producer context to scope until the producer exits."""
+    # token restores the producer's previous context even when DNS or admission is cancelled.
+    token = self.__write_scope.set(scope)
+    try:
+      yield
+    finally:
+      self.__write_scope.reset(token)
+
+  async def wait_for_write_scope(self, scope: WriteScope) -> None:
+    """After scope's producers exit, wait until its admitted queue items cannot write again.
+
+    Cancelling this wait leaves the writer and the admitted items under database ownership.
+    """
+    if scope.outstanding:
+      await scope.settled.wait()
 
   @property
   def pending_count(self) -> int:
@@ -760,12 +799,30 @@ class DataBase:
       self.__notify_item(item, event, final=final)
 
   def __admitted(self, item: QueueElementDto) -> None:
+    """Record queue admission and attribute the item before the writer can dequeue it."""
     item.admitted_at = perf_counter()
     self.__commands[id(item)] = item
+    # scope is the pass identity captured by this admission, including CNAME helper writes.
+    scope = self.__write_scope.get()
+    if scope is not None:
+      item.write_scope = scope
+      scope.outstanding += 1
+      scope.settled.clear()
     item.receipt.mark_admitted()
     if item.observations:
       self.__observations[id(item)] = item
     self.__notify_item(item, 'admitted')
+
+  @staticmethod
+  def __retire_scope(item: QueueElementDto) -> None:
+    """Release this item's scope contribution once its physical write work has ended."""
+    # scope is detached once so repeated writer-failure notifications cannot retire an item twice.
+    scope = item.write_scope
+    if scope is not None:
+      item.write_scope = None
+      scope.outstanding -= 1
+      if not scope.outstanding:
+        scope.settled.set()
 
   async def __put_write(self, item: QueueElementDto) -> None:
     started = perf_counter()
@@ -807,17 +864,33 @@ class DataBase:
       observe_duration(queue_duration, started, queue='writer', phase='admission', outcome=outcome)
 
   def __fail_writer(self, failure: WriterFailedError) -> None:
+    """Stop future writes and release scopes whose remaining items cannot reach SQLite.
+
+    A batch already on its way to SQLite remains fenced until its task finishes
+    with native completion evidence. Queue entries outside that batch cannot run.
+    """
     self.__writer_state = WriterState.FAILED
     if self.__writer_failure is None:
       self.__writer_failure = failure
     self.db_save_queue.shutdown(immediate=False)
+    # active contains command identities still owned by the shielded batch task.
+    # item is the command examined in each pending or admitted collection below.
     active = (
       {id(item) for item in self.__pending_batch}
       if self.__batch_task is not None and not self.__batch_task.done()
       else set()
     )
+    # fenced also retains a finished batch when an attempt lacked native completion evidence.
+    fenced = {id(item) for item in self.__pending_batch} if self.__batch_quiescence_unproven else active
+    if not fenced:
+      for item in self.__pending_batch:
+        self.__retire_scope(item)
+    # observations contains optional listeners from the failed lifecycle; observation is one listener.
     observations = tuple(observation for item in self.__observations.values() for observation in item.observations)
+    # key is the admitted command identity; wakeup notifies a registered lifecycle listener.
     for key, item in tuple(self.__commands.items()):
+      if key not in fenced:
+        self.__retire_scope(item)
       if key in active:
         self.__notify_item(item, 'unknown')
       elif item.receipt.outcome != WriteOutcome.FINAL_UNKNOWN:
@@ -1990,25 +2063,22 @@ class DataBase:
         await db_session.close()
 
   async def get_all_ips_for_update(self: Self, addr_type: int | None = None) -> list[IpRecordDto]:
-    logger.debug('Try get all IP address for update ...')
-    ips: list[IpRecordDto] = []
-    db_session: AsyncSession | None = None
+    """Return committed RouterOS IP records for addr_type, or all types when it is None.
+
+    An empty list is authoritative only after the query and session cleanup succeed.
+    """
     try:
-      db_session = await self.__read_connect()
-      all_ips: Sequence[Row[str, str, bool, int]] = cast(
-        Sequence[Row[str, str, bool, int]],
-        await IpRecordsDbo.get_all_for_update(db_session=db_session, addr_type=addr_type),
-      )
-      ips = [IpRecordDto(ip_address=ip[0], comment=ip[1], use_default_gw=ip[2], addr_type=ip[3]) for ip in all_ips]
-      return ips
+      # db_session owns this snapshot; all_ips contains its rows and ip is one projected record.
+      async with await self.__read_connect() as db_session:
+        all_ips: Sequence[Row[str, str, bool, int]] = cast(
+          Sequence[Row[str, str, bool, int]],
+          await IpRecordsDbo.get_all_for_update(db_session=db_session, addr_type=addr_type),
+        )
+        return [IpRecordDto(ip_address=ip[0], comment=ip[1], use_default_gw=ip[2], addr_type=ip[3]) for ip in all_ips]
+    # err is the underlying read or cleanup failure; the log carries only the operation name.
     except Exception as err:
-      logger.error(f'Try get all IP address for update failed : {err}', exc_info=True)
-      if db_session is not None:
-        await db_session.rollback()
-      return ips
-    finally:
-      if db_session is not None:
-        await db_session.close()
+      logger.error('RouterOS IP snapshot read failed')
+      raise DatabaseReadError('Cannot read IP records for RouterOS update') from err
 
   # Router OS configs
 
@@ -2134,27 +2204,21 @@ class DataBase:
       logger.error(f'Unexpected error - Try send deleted Router OS configs to Queue : {err}', exc_info=True)
 
   async def get_all_configs_for_ros_update(self: Self) -> list[RosConfigDto]:
-    logger.debug('Try get all RoS configs for update ...')
-    configs: list[RosConfigDto] = []
-    db_session: AsyncSession | None = None
+    """Return committed RouterOS device configurations or raise DatabaseReadError on an unsuccessful read."""
     try:
-      db_session = await self.__read_connect()
-      ros_configs: Sequence[Row[int, str, str, str, str]] = cast(
-        Sequence[Row[int, str, str, str, str]], await RosConfigsDbo.get_all_for_update(db_session=db_session)
-      )
-      configs: list[RosConfigDto] = [
-        RosConfigDto(id=config[0], host=config[1], user=config[2], passwd=config[3], bgp_list_name=config[4])
-        for config in ros_configs
-      ]
-      return configs
+      # db_session owns the device read; ros_configs contains its rows and config is one detached device projection.
+      async with await self.__read_connect() as db_session:
+        ros_configs: Sequence[Row[int, str, str, str, str]] = cast(
+          Sequence[Row[int, str, str, str, str]], await RosConfigsDbo.get_all_for_update(db_session=db_session)
+        )
+        return [
+          RosConfigDto(id=config[0], host=config[1], user=config[2], passwd=config[3], bgp_list_name=config[4])
+          for config in ros_configs
+        ]
+    # err retains the cause for database diagnostics; the log avoids device configuration and exception contents.
     except Exception as err:
-      logger.error(f'Try get all RoS configs for update failed : {err}', exc_info=True)
-      if db_session is not None:
-        await db_session.rollback()
-      return configs
-    finally:
-      if db_session is not None:
-        await db_session.close()
+      logger.error('RouterOS configuration snapshot read failed')
+      raise DatabaseReadError('Cannot read configurations for RouterOS update') from err
 
   # Job
 
@@ -2387,10 +2451,15 @@ class DataBase:
   #
 
   def __acknowledge_batch(self) -> None:
+    """Acknowledge committed commands and settle proven scope contributions after cleanup."""
     self.__notify_batch(self.__pending_batch, 'confirmed', final=True)
-    for _ in self.__pending_batch:
+    # item is each command acknowledged against the writer queue and, when proven, its scope.
+    for item in self.__pending_batch:
+      if not self.__batch_quiescence_unproven:
+        self.__retire_scope(item)
       self.db_save_queue.task_done()
     self.__pending_batch.clear()
+    self.__batch_quiescence_unproven = False
     self.__unknown_count = 0
     if self.__writer_failure is not None:
       self.__writer_failure.committed = True
@@ -2752,6 +2821,7 @@ class DataBase:
     complete-only checkpoints remain after deletion. Commit confirms receipts.
     Only known precommit BUSY/LOCKED failures with successful rollback and release
     are retryable; an uncertain commit never becomes an automatic replay.
+    Tagged batches also record physical completion separately from receipt evidence.
     """
     logger.debug(f'Try prepare elements count={len(queue_elements)} ...')
     # attempt_started times this batch attempt; preparation_finished distinguishes preparation failures.
@@ -2762,6 +2832,10 @@ class DataBase:
     transaction_outcome = 'failure'
     # db_session owns the only runtime write transaction for this batch.
     db_session: AsyncSession | None = None
+    # driver is the existing aiosqlite connection when this attempt contains scoped writes.
+    driver: AioSQLiteConnection | None = None
+    # native_write_ended initially reflects the absence of BEGIN and later requires native return evidence.
+    native_write_ended = True
     # commit_started marks ambiguous-outcome territory; committed records a confirmed commit return.
     commit_started = False
     committed = False
@@ -2769,6 +2843,16 @@ class DataBase:
     failure: Exception | CancelledError | None = None
     rollback_ok = True
     release_ok = True
+
+    def record_native_commit(_session: Session) -> None:
+      """Record commit return before SQLAlchemy releases the connection.
+
+      SQLAlchemy passes _session to the listener registered on that same session.
+      No additional inspection is needed to record this event for the attempt.
+      """
+      nonlocal native_write_ended
+      native_write_ended = True
+
     try:
       # queue_element is each admitted category command; item is its category-specific payload.
       # dns_servers_add prepares server rows; dns_servers_delete selects IDs and
@@ -2990,8 +3074,16 @@ class DataBase:
       )
       # parameter_budget bounds every reconciliation statement for this physical connection.
       parameter_budget = await self.__writer_parameter_budget(connection, minimum_budget)
+      if any(queue_element.write_scope is not None for queue_element in queue_elements):
+        # raw_driver is the actual driver checked out by this session, before BEGIN can reach SQLite.
+        raw_driver = (await connection.get_raw_connection()).driver_connection
+        if not isinstance(raw_driver, AioSQLiteConnection):
+          raise DatabaseConfigurationError('Scoped write requires the active SQLite driver')
+        driver = raw_driver
+        event.listen(db_session.sync_session, 'after_commit', record_native_commit)
       # Recording with immediate write lock
       transaction_started = perf_counter()
+      native_write_ended = driver is None
       await db_session.execute(text('BEGIN IMMEDIATE'))
       # DNS SERVERS
       if len(dns_servers_add) > 0:
@@ -3069,6 +3161,7 @@ class DataBase:
       commit_outcome = 'unknown'
       try:
         await db_session.commit()
+        native_write_ended = True
         committed = True
         commit_outcome = 'confirmed'
       finally:
@@ -3094,6 +3187,17 @@ class DataBase:
         )
         observe_duration(writer_duration, transaction_started, phase='transaction', outcome=transaction_outcome)
         transaction_started = None
+      if driver is not None and not native_write_ended:
+        # The same driver's FIFO orders this rollback behind any BEGIN, SQL or COMMIT still in flight.
+        try:
+          await driver.rollback()
+        except Exception, CancelledError:
+          logger.error(
+            'Native rollback did not confirm the end of a scoped write',
+            exc_info=DatabaseWriteError('Scoped write cleanup could not be confirmed'),
+          )
+        else:
+          native_write_ended = True
       if db_session is not None:
         # rollback_started times the attempt to release precommit changes safely.
         rollback_started = perf_counter()
@@ -3110,6 +3214,8 @@ class DataBase:
             writer_duration, rollback_started, phase='rollback', outcome='complete' if rollback_ok else 'failure'
           )
     finally:
+      # Preserve missing evidence from earlier retries. A successful later attempt uses a different connection.
+      self.__batch_quiescence_unproven |= not native_write_ended
       if db_session is not None:
         # cleanup_started times physical session release after commit or rollback.
         cleanup_started = perf_counter()

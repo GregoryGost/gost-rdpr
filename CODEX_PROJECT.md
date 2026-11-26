@@ -527,11 +527,16 @@ MySQL, NATS, Redis, frontend, Obsidian, and Jira overlays are outside the select
 - Dependency injection policy: existing class-owned collaborators and module globals;
   inspect actual callers before changing ownership. No new DI container is selected.
 - Schema/model policy: Pydantic HTTP models in `models/http/`; DTOs in `models/dto/`; ORM mappings in `models/db/`.
-- Lifespan owner: `AppServer.__lifespan` resets job state, sets up the database, starts saving coordination,
-  and closes coordinator/writer resources before HTTP clients on shutdown.
-- Background task policy: domain-resolution requests register directly with the lifespan-owned saving coordinator;
-  list and RouterOS commands retain `BackgroundTasks` and process-local `JobRegistry` reservations.
-  Neither mechanism provides durable job execution. Do not introduce a worker framework implicitly.
+- Lifespan owner: `AppServer.__lifespan` resets job state, sets up the database, and starts saving and update
+  coordination. Shutdown stops update dispatch before draining the writer and closes HTTP clients last.
+- Background task policy: NEW and saved-ID requests register directly with the lifespan-owned saving coordinator.
+  List commands retain `BackgroundTasks` and process-local `JobRegistry` reservations. `UpdateJobs` admits full
+  STALE and RouterOS commands with one active job and one deferred job of the other kind. Repeated requests for an
+  active or deferred kind keep the existing duplicate response. Job admission is process-local and in-memory.
+- The full STALE command holds its slot through the end of writes admitted by the pass, including CNAMEs. Once
+  those writes have stopped, an admitted RouterOS update can use the IPs actually stored in SQLite even if the
+  writer failed. A failed IP read prevents changes on that device. RouterOS retains the slot until its local
+  synchronization work ends. Planned and manual requests use the same command endpoints.
 - DNS configuration: each nonempty new/stale resolution job reads one immutable task-local snapshot before queue work.
   Changes committed after that read apply to the next job; single-domain operations read fresh committed settings.
   Keep explicit DNS selection and default row `0` semantics. Failed configuration reads must not start queue work.

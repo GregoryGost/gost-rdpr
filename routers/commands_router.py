@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Annotated, Self
 
 from fastapi import APIRouter, BackgroundTasks, Query, status
@@ -6,7 +7,7 @@ from fastapi.responses import JSONResponse
 from client.domains_resolving_client import DomainsResolver, saving_coordinator
 from client.ros_updater_client import RosClient
 from database.db import db
-from jobs.job_registry import Jobs, job_registry
+from jobs.job_registry import Jobs, job_registry, update_jobs
 from logger.logger import logger
 
 # base
@@ -88,13 +89,19 @@ class CommandsRouter(BaseRouter):
       },
     )
     async def domains_resolve_stale_command() -> JSONResponse:
+      """Accept full stale resolution and report an existing request as active."""
       logger.debug('Call API route: POST /commands/domains/resolve/stale')
       try:
-        if not await saving_coordinator.submit_scan(Jobs.DOMAINS_RESOLVE_STALE, resolver=self.domains_resolver):
+        saving_coordinator.check_stale_acceptance()
+        if not update_jobs.submit(
+          Jobs.DOMAINS_RESOLVE_STALE,
+          partial(saving_coordinator.run_stale, self.domains_resolver, shutting_down=update_jobs.is_stopping),
+        ):
           return JSONResponse(
             OkResp(result=f'Job [{Jobs.DOMAINS_RESOLVE}] is now active').to_dict(), status.HTTP_200_OK
           )
         return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
+      # err is the synchronous admission failure returned through the existing API response.
       except Exception as err:
         logger.error('Stale-domain resolution request failed', exc_info=True)
         return self.errorResp(err)
@@ -110,9 +117,8 @@ class CommandsRouter(BaseRouter):
         status.HTTP_400_BAD_REQUEST: {'model': ErrorResp},
       },
     )
-    async def ros_update_command(
-      query: Annotated[RosUpdateCommandQueryReq, Query()], background_tasks: BackgroundTasks
-    ) -> JSONResponse:
+    async def ros_update_command(query: Annotated[RosUpdateCommandQueryReq, Query()]) -> JSONResponse:
+      """Validate the IPv4 query and register a RouterOS update for background dispatch."""
       logger.debug('Call API route: POST /commands/ros/update')
       try:
         if query.type != 4:
@@ -127,15 +133,10 @@ class CommandsRouter(BaseRouter):
             ).to_dict(),
             status.HTTP_400_BAD_REQUEST,
           )
-        if await job_registry.try_start(Jobs.ROS_UPDATE):
-          try:
-            background_tasks.add_task(self.__ros_client.update, query.type)
-          except Exception:
-            await job_registry.finish(Jobs.ROS_UPDATE)
-            raise
-        else:
+        if not update_jobs.submit(Jobs.ROS_UPDATE, partial(self.__ros_client.update, query.type)):
           return JSONResponse(OkResp(result=f'Job [{Jobs.ROS_UPDATE}] is now active').to_dict(), status.HTTP_200_OK)
         return JSONResponse(OkResp().to_dict(), status.HTTP_200_OK)
+      # err is the synchronous admission failure returned through the existing API response.
       except Exception as err:
         logger.error('RouterOS update request failed', exc_info=True)
         return self.errorResp(err)

@@ -2152,6 +2152,85 @@ def lock_error(code=sqlite3.SQLITE_BUSY):
   return OperationalError('synthetic private SQL statement', {}, error)
 
 
+@pytest.mark.parametrize('proof', ['commit', 'rollback', 'unproven'])
+async def test_tagged_writer_scope_waits_for_physical_cleanup_proof(app, store, monkeypatch, proof):
+  """Fence a tagged batch through cleanup and distinguish proved rollback from ambiguity.
+
+  app and store provide a real writer and isolated SQLite. monkeypatch holds
+  the relevant cleanup call. proof selects known commit, proved native rollback,
+  or a failed attempt to establish native quiescence.
+  """
+  # scope tracks only the first admission. The next admission belongs to an independent producer.
+  scope = importlib.import_module('models.dto.queue_dto').WriteScope()
+  # entered and release control tagged batch cleanup; later and release_later control the untagged batch.
+  entered, release = asyncio.Event(), asyncio.Event()
+  later, release_later = asyncio.Event(), asyncio.Event()
+  # driver identifies the faulting native connection; rollback is its original implementation.
+  driver = None
+  rollback = aiosqlite.Connection.rollback
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+
+  async def fault(stage, evidence):
+    """Hold the tagged commit cleanup, or fail the batch before its native COMMIT."""
+    nonlocal driver
+    if stage == 'commit' and evidence.commits == 2:
+      later.set()
+      await release_later.wait()
+    elif stage == 'commit' and proof != 'commit':
+      # connection and raw identify the native connection that already issued this batch's SQL.
+      connection = await evidence.sessions[-1].connection()
+      raw = await connection.get_raw_connection()
+      driver = raw.driver_connection
+      raise RuntimeError('Synthetic failure before COMMIT')
+    elif stage == 'close' and evidence.commits == 1 and proof == 'commit':
+      entered.set()
+      await release.wait()
+
+  async def native_rollback(connection):
+    """Gate the first actual rollback attempt on the faulting connection only."""
+    if connection is driver and not entered.is_set():
+      entered.set()
+      await release.wait()
+      if proof == 'unproven':
+        raise RuntimeError('Synthetic loss of native rollback evidence')
+    await rollback(connection)
+
+  instrument_sessions(store, monkeypatch, fault=fault)
+  monkeypatch.setattr(aiosqlite.Connection, 'rollback', native_rollback)
+  with store.bind_write_scope(scope):
+    await enqueue_names(app, store, ['tagged.example.test'])
+  await enqueue_names(app, store, ['unrelated.example.test'])
+  # waiter observes only this scope. The test never cancels the database writer.
+  waiter = asyncio.create_task(store.wait_for_write_scope(scope))
+  try:
+    await store.start_writer()
+    async with asyncio.timeout(3):
+      await entered.wait()
+      assert not waiter.done()
+      release.set()
+      if proof == 'commit':
+        await later.wait()
+        await asyncio.shield(waiter)
+        assert await stored_names(app, store) == ['tagged.example.test']
+        release_later.set()
+        await store.db_save_queue.join()
+        assert await stored_names(app, store) == ['tagged.example.test', 'unrelated.example.test']
+      else:
+        await asyncio.shield(store.writer_task)
+        assert store.writer_failure is not None
+        assert await stored_names(app, store) == []
+        assert not later.is_set()
+        if proof == 'rollback':
+          await asyncio.shield(waiter)
+        else:
+          assert not waiter.done()
+  finally:
+    release.set()
+    release_later.set()
+    waiter.cancel()
+    await asyncio.gather(waiter, return_exceptions=True)
+
+
 @pytest.mark.parametrize(
   ('batch_size', 'count'),
   [
@@ -3301,6 +3380,210 @@ async def test_saving_request_rejection_preserves_error_json(app, store, monkeyp
   assert store._DataBase__read_engine.pool.checkedout() == 0
 
 
+async def test_simultaneous_update_commands_accept_one_at_a_time_and_dispatch_the_empty_pass(app, store, monkeypatch):
+  """Submit both public commands concurrently and observe a deferred empty STALE pass retire.
+
+  app and store isolate real command, saving coordinator and SQLite behavior.
+  monkeypatch holds both dispatch callbacks at entry and replaces device I/O.
+  """
+  # commands exposes its real HTTP routes; registry supplies a fresh process-local owner.
+  commands = importlib.import_module('routers.commands_router')
+  registry = importlib.import_module('jobs.job_registry')
+  # owner serializes this test's updates; coordinator queries the empty database for STALE.
+  owner = registry.UpdateJobs()
+  coordinator = app.resolver.saving_coordinator
+  # run_stale retains the real entry point for the empty pass after relinquishing the hold.
+  run_stale = coordinator.run_stale
+  # arrivals records each callback entry; release unblocks the active operation and its successor.
+  # active_started signals the first dispatch; completed records callbacks until all_done.
+  arrivals, completed = [], []
+  active_started, release, all_done = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+  def mark_completed(kind):
+    """Record a terminal callback for the supplied kind and signal when both have returned."""
+    completed.append(kind)
+    if len(completed) == 2:
+      all_done.set()
+
+  async def stale(resolver, *, shutting_down):
+    """Record dispatch and forward the resolver and shutdown predicate to the real empty pass."""
+    arrivals.append('stale')
+    active_started.set()
+    await release.wait()
+    await run_stale(resolver, shutting_down=shutting_down)
+    mark_completed('stale')
+
+  async def router(_client, addr_type):
+    """Replace external router work and verify the route forwards validated IPv4 input."""
+    assert addr_type == 4
+    arrivals.append('router')
+    active_started.set()
+    await release.wait()
+    mark_completed('router')
+
+  monkeypatch.setattr(commands, 'update_jobs', owner)
+  monkeypatch.setattr(commands, 'saving_coordinator', coordinator)
+  monkeypatch.setattr(coordinator, 'run_stale', stale)
+  monkeypatch.setattr(commands.RosClient, 'update', router)
+  # api mounts the real command router; transport provides raw ASGI results in the isolated event loop.
+  api = FastAPI()
+  api.include_router(commands.CommandsRouter().get_router())
+  transport = httpx.ASGITransport(app=api)
+  # stale_path and router_path are the two publicly scheduled/manual commands.
+  stale_path, router_path = '/commands/domains/resolve/stale', '/commands/ros/update?type=4'
+  await coordinator.start()
+  owner.start()
+  try:
+    # client issues both POSTs before either held callback can finish.
+    async with httpx.AsyncClient(transport=transport, base_url='http://service.test', trust_env=False) as client:
+      async with asyncio.timeout(3):
+        # responses holds the HTTP acknowledgment for each concurrent arrival.
+        responses = await asyncio.gather(client.post(stale_path), client.post(router_path))
+        # response is each awaited acceptance, independent of which callback starts first.
+        assert [(response.status_code, response.json()) for response in responses] == [(200, {'result': 'OK'})] * 2
+        await active_started.wait()
+        assert len(arrivals) == 1
+        assert completed == []
+        assert (await client.post('/commands/ros/update?type=6')).status_code == 400
+        assert (await client.post(stale_path)).json() == {'result': 'Job [domains_resolve] is now active'}
+        assert (await client.post(router_path)).json() == {'result': 'Job [ros_update] is now active'}
+        assert len(arrivals) == 1
+        release.set()
+        await all_done.wait()
+    assert set(arrivals) == {'stale', 'router'}
+    assert completed == arrivals
+    assert store.db_save_queue.empty()
+  finally:
+    release.set()
+    await owner.stop()
+
+
+async def test_cancelled_stale_owner_holds_router_dispatch_until_alias_commit(app, store, monkeypatch, network):
+  """Cancel the live STALE owner after alias admission and before the final DNS result.
+
+  app and store provide the real saving coordinator, writer, and disposable
+  SQLite. network supplies CNAME evidence and monkeypatch controls the two
+  persistence boundaries. The deferred RouterOS callback must see the committed
+  alias while the original domain retains its old checkpoint and no saved attempt.
+  """
+  await seed(app, store, resolved=True, checkpoint=STALE_CHECKPOINT)
+  # connection seeds one classic DNS endpoint before handing SQLite to the runtime writer.
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(insert(app.database.DnsServersDbo).values(id=0, server='192.0.2.53'))
+  network({'192.0.2.53': 'cname-only'})
+  monkeypatch.setattr(app.settings, 'db_save_batch_size', 1)
+  # commands exposes the public routes, registry supplies their isolated owner, and coordinator runs STALE.
+  commands = importlib.import_module('routers.commands_router')
+  registry = importlib.import_module('jobs.job_registry')
+  owner = registry.UpdateJobs()
+  coordinator = app.resolver.saving_coordinator
+  monkeypatch.setattr(commands, 'update_jobs', owner)
+  monkeypatch.setattr(commands, 'saving_coordinator', coordinator)
+  # commit_started and release_commit hold the admitted alias at SQLite's commit boundary.
+  commit_started, release_commit = asyncio.Event(), asyncio.Event()
+  # result_ready and release_result control whether the final resolution result can enter the queue.
+  result_ready, release_result = asyncio.Event(), asyncio.Event()
+  # fence_or_exit wakes on the first proof wait or owner exit. fence_returned records a completed proof wait.
+  fence_or_exit, fence_returned = asyncio.Event(), asyncio.Event()
+  # router_finished signals the synthetic RouterOS callback has read SQLite. router_reads stores its observations.
+  router_finished = asyncio.Event()
+  router_reads = []
+  # admit_result and wait_for_writes are the real admissions and proof operations behind the test instrumentation.
+  admit_result = store.put_domain_after_resolve
+  wait_for_writes = store.wait_for_write_scope
+
+  async def hold_commit():
+    """Pause the real writer immediately before COMMIT."""
+    commit_started.set()
+    await release_commit.wait()
+
+  async def hold_result(*, domain):
+    """Pause final admission for domain so cancelling its producer leaves only the alias queued."""
+    result_ready.set()
+    await release_result.wait()
+    await admit_result(domain=domain)
+
+  async def observe_fence(scope):
+    """Record when the owner starts or completes its real wait for scope."""
+    fence_or_exit.set()
+    await wait_for_writes(scope)
+    fence_returned.set()
+
+  def observe_owner_exit(_task):
+    """Wake the test if the cancelled owner task exits without waiting for writer proof."""
+    fence_or_exit.set()
+
+  async def router(_client, addr_type):
+    """Read committed names at dispatch for addr_type while replacing device I/O owned by _client."""
+    router_reads.append((addr_type, await stored_names(app, store)))
+    router_finished.set()
+
+  instrument_sessions(store, monkeypatch, before_commit=hold_commit)
+  monkeypatch.setattr(store, 'put_domain_after_resolve', hold_result)
+  monkeypatch.setattr(store, 'wait_for_write_scope', observe_fence)
+  monkeypatch.setattr(commands.RosClient, 'update', router)
+  # api mounts the actual command routes. transport dispatches HTTP requests in the test's loop.
+  api = FastAPI()
+  api.include_router(commands.CommandsRouter().get_router())
+  transport = httpx.ASGITransport(app=api)
+  await store.start_writer()
+  await coordinator.start()
+  owner.start()
+  try:
+    # client submits both commands while the alias transaction is held open.
+    async with httpx.AsyncClient(transport=transport, base_url='http://service.test', trust_env=False) as client:
+      async with asyncio.timeout(3):
+        assert (await client.post('/commands/domains/resolve/stale')).json() == {'result': 'OK'}
+        await result_ready.wait()
+        await commit_started.wait()
+        assert await stored_names(app, store) == ['www.example.test']
+        assert (await client.post('/commands/ros/update?type=4')).json() == {'result': 'OK'}
+        # stale_task is the actual application task. task iterates over live tasks on this isolated event loop.
+        stale_task = next(task for task in asyncio.all_tasks() if task.get_name() == 'update:domains_resolve_stale')
+        stale_task.add_done_callback(observe_owner_exit)
+        assert stale_task.cancel()
+        await fence_or_exit.wait()
+        assert not stale_task.done()
+        assert not fence_returned.is_set()
+        assert router_reads == []
+        release_commit.set()
+        await router_finished.wait()
+        assert stale_task.cancelled()
+        assert router_reads == [(4, ['edge.example.test', 'www.example.test'])]
+        assert (await attempt_state(app, store))[:2] == (None, STALE_CHECKPOINT)
+  finally:
+    release_commit.set()
+    release_result.set()
+    await owner.stop()
+
+
+@pytest.mark.parametrize(
+  ('table', 'query'),
+  [
+    ('rdpr_ros_configs', 'get_all_configs_for_ros_update'),
+    ('rdpr_ip_records', 'get_all_ips_for_update'),
+  ],
+)
+async def test_router_storage_reads_report_typed_failure_on_broken_query(app, store, table, query, caplog):
+  """Distinguish an empty real read from a failed query without leaking database internals.
+
+  app and store isolate the repository and its SQLite connection pools. table
+  selects the fixture table removed to break query; caplog captures diagnostics.
+  """
+  # read invokes one of the two RouterOS selection queries against disposable SQLite.
+  read = getattr(store, query)
+  assert await read() == []
+  # connection removes the fixture table after the successful empty-read control.
+  async with store._DataBase__write_engine.begin() as connection:
+    await connection.execute(text(f'DROP TABLE {table}'))
+  # failure retains the public typed exception to check its representation and released session.
+  with pytest.raises(app.database.DatabaseReadError) as failure:
+    await read()
+  assert table not in str(failure.value)
+  assert table not in caplog.text
+  assert store._DataBase__read_engine.pool.checkedout() == 0
+
+
 async def configure_public_domain(service, *, resolved=True):
   """Create the domain and provider settings through the actual writer/API."""
   async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
@@ -3352,6 +3635,220 @@ def public_flow_snapshot(service, domain_id):
       (domain_id,),
     ).fetchall()
   return domain, {row[2]: row for row in rows}
+
+
+@pytest.fixture
+async def local_router_device(e2e_service):
+  """Serve the RouterOS resources used by synchronization on a disposable loopback port.
+
+  e2e_service supplies the application whose committed data the test can read
+  at the first device check. This fixture owns all device sockets and handlers.
+  """
+  # device holds endpoint requests, observed IPs at each check, and the optional mutation hold.
+  device = SimpleNamespace(
+    entered=asyncio.Event(),
+    route_received=asyncio.Event(),
+    release_route=asyncio.Event(),
+    requests=[],
+    at_check=[],
+    errors=[],
+    domain_id=None,
+    hold_route=False,
+  )
+  # handlers retains the test-owned connection tasks until teardown has collected them.
+  handlers = set()
+
+  async def respond(reader, writer):
+    """Answer one bounded HTTP request and record the actual payload before replying."""
+    try:
+      async with asyncio.timeout(5):
+        # header contains the request line and headers; lines splits framing from fields.
+        # method and path identify the RouterOS resource; _ discards the HTTP version.
+        header = await reader.readuntil(b'\r\n\r\n')
+        lines = header.decode('ascii').split('\r\n')
+        method, path, _ = lines[0].split()
+        # fields maps HTTP headers to their trimmed values; name and value split each header.
+        fields = {name.lower(): value.strip() for name, value in (line.split(':', 1) for line in lines[1:-2])}
+        # raw_body carries exactly the request payload, or zero bytes for GET.
+        raw_body = await reader.readexactly(int(fields.get('content-length', '0')))
+        # body holds the actual RouterOS filter or mutation; payload is the JSON reply.
+        body = json.loads(raw_body) if raw_body else {}
+        device.requests.append((method, path, body))
+        if (method, path) == ('GET', '/rest/system/resource'):
+          assert device.domain_id is not None
+          device.at_check.append(public_flow_snapshot(e2e_service, device.domain_id))
+          device.entered.set()
+          payload = {}
+        elif (method, path) == ('POST', '/rest/ip/route/print') and 'active=true' in body['.query']:
+          payload = [{'gateway': '192.0.2.1', 'routing-table': 'main', 'immediate-gw': '192.0.2.1%WAN'}]
+        elif (method, path) == ('POST', '/rest/routing/table/print'):
+          payload = [{'.id': '*managed', 'name': 'managed'}]
+        elif method == 'POST' and path in {
+          '/rest/ip/route/print',
+          '/rest/ipv6/route/print',
+          '/rest/ip/firewall/address-list/print',
+        }:
+          payload = []
+        elif method == 'PUT' and path in {'/rest/ip/firewall/address-list', '/rest/ip/route'}:
+          if path == '/rest/ip/route':
+            device.route_received.set()
+            if device.hold_route:
+              await device.release_route.wait()
+          payload = {}
+        else:
+          raise AssertionError(f'Unexpected RouterOS request: {method} {path}')
+        # response is the wire JSON sent with a known length and no connection reuse.
+        response = json.dumps(payload).encode()
+        writer.write(
+          f'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response)}\r\n'
+          'Connection: close\r\n\r\n'.encode('ascii')
+          + response
+        )
+        await writer.drain()
+    except (AssertionError, TimeoutError, ValueError, ConnectionError, asyncio.IncompleteReadError) as error:
+      # error preserves unexpected local wire failures for fixture teardown.
+      device.errors.append(error)
+    finally:
+      writer.close()
+      try:
+        await writer.wait_closed()
+      except ConnectionError:
+        pass
+
+  def accept(reader, writer):
+    """Retain the request task so fixture cleanup cannot leave it detached."""
+    handlers.add(asyncio.create_task(respond(reader, writer)))
+
+  # server accepts only loopback clients; port is the operating system's ephemeral allocation.
+  server = await asyncio.start_server(accept, '127.0.0.1', 0)
+  port = server.sockets[0].getsockname()[1]
+  device.host = f'127.0.0.1:{port}'
+  try:
+    yield device
+  finally:
+    device.release_route.set()
+    server.close()
+    async with asyncio.timeout(6):
+      try:
+        await asyncio.gather(*handlers)
+      finally:
+        await server.wait_closed()
+    assert device.errors == []
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize('first', ['stale', 'router', 'failed-write', 'shutdown'])
+async def test_public_updates_wait_for_each_other_and_use_committed_ips(e2e_service, local_router_device, first):
+  """Exercise both public update orders and use the last commit after a failed STALE write.
+
+  e2e_service runs the real app, migrations, writer, and DNS providers.
+  local_router_device implements the external RouterOS reads and writes.
+  first selects which command starts, with failed-write injecting an SQLite
+  fault and shutdown interrupting the active DNS before admission.
+  """
+  # service and device own loopback resources. domain_id identifies the seeded STALE fixture.
+  service, device = e2e_service, local_router_device
+  domain_id = device.domain_id = await configure_public_domain(service)
+  # before is the initial committed domain and its IPs, read through a separate SQLite connection.
+  before = public_flow_snapshot(service, domain_id)
+  # expected lists precisely the committed IPv4 data available at RouterOS dispatch, if any.
+  expected = {'8.8.8.8', '8.8.4.4'} if first == 'stale' else {'9.9.9.9'}
+  # dns_entered and release_dns hold one real DoH query to establish the active STALE boundary.
+  service.providers.hold_dns_names.add('www.example.test')
+  dns_entered = service.providers.dns_entered_by_name['www.example.test'] = asyncio.Event()
+  release_dns = service.providers.dns_release_by_name['www.example.test'] = asyncio.Event()
+  # stale_path and router_path are the scheduled/manual command entry points.
+  stale_path, router_path = '/commands/domains/resolve/stale', '/commands/ros/update?type=4'
+  # client sends real loopback HTTP requests with no ambient proxy or credentials.
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    # configured is the public acknowledgment for the synthetic RouterOS device.
+    configured = await client.post(
+      '/ros',
+      json=[
+        {
+          'host': device.host,
+          'user': 'test-user',
+          'user_password': 'test-password',
+          'bgp_list_name': 'managed',
+        }
+      ],
+    )
+    assert configured.status_code == 200, configured.text
+    async with asyncio.timeout(5):
+      while not (await client.get('/ros')).json()['payload']:
+        await asyncio.sleep(0.01)
+    if first == 'failed-write':
+      # connection arms a failure specifically on resolved IP insertion after test setup commits.
+      with closing(sqlite3.connect(service.db_path)) as connection, connection:
+        connection.execute("""
+          CREATE TRIGGER reject_resolution_ip BEFORE INSERT ON rdpr_ip_records
+          WHEN NEW.ip_address = '8.8.8.8'
+          BEGIN SELECT RAISE(ABORT, 'synthetic rejected resolution IP'); END
+        """)
+    try:
+      async with asyncio.timeout(7):
+        if first == 'router':
+          device.hold_route = True
+          assert (await client.post(router_path)).json() == {'result': 'OK'}
+          await device.route_received.wait()
+          assert device.at_check == [before]
+          assert (await client.post(stale_path)).json() == {'result': 'OK'}
+          assert (await client.post(stale_path)).json() == {'result': 'Job [domains_resolve] is now active'}
+          assert not dns_entered.is_set()
+          device.release_route.set()
+          await dns_entered.wait()
+          release_dns.set()
+        else:
+          assert (await client.post(stale_path)).json() == {'result': 'OK'}
+          await dns_entered.wait()
+          assert (await client.post(router_path)).json() == {'result': 'OK'}
+          assert (await client.post(router_path)).json() == {'result': 'Job [ros_update] is now active'}
+          assert not device.entered.is_set()
+          assert public_flow_snapshot(service, domain_id) == before
+          if first == 'shutdown':
+            await service.stop()
+          else:
+            release_dns.set()
+            await device.route_received.wait()
+        if first == 'shutdown':
+          assert public_flow_snapshot(service, domain_id) == before
+          assert device.requests == []
+          return
+        if first == 'failed-write':
+          # after_failure confirms the writer was already failed when RouterOS updated automatically.
+          after_failure = await client.post(stale_path)
+          assert (after_failure.status_code, after_failure.json()) == (
+            500,
+            {'error': 'Saving coordinator stopped after database writer failure'},
+          )
+          assert public_flow_snapshot(service, domain_id) == before
+        else:
+          while public_flow_snapshot(service, domain_id)[0][1] == before[0][1]:
+            await asyncio.sleep(0.01)
+        # method, path and _body identify captured requests; the second route can follow device pacing.
+        while sum((method, path) == ('PUT', '/rest/ip/route') for method, path, _body in device.requests) < len(
+          expected
+        ):
+          await asyncio.sleep(0.01)
+    finally:
+      release_dns.set()
+      device.release_route.set()
+  await service.stop(allow_failure=first == 'failed-write')
+  # after is the final durable checkpoint and address state observed after shutdown.
+  after = public_flow_snapshot(service, domain_id)
+  assert device.at_check == [after if first == 'stale' else before]
+  assert set(after[1]) == (
+    {'9.9.9.9', '2001:4860:4860::8888'} if first == 'failed-write' else {'8.8.8.8', '8.8.4.4', '2001:4860:4860::8888'}
+  )
+  # method, path and body describe each wire exchange; only managed additions carry selected IPs.
+  assert {
+    body['address']
+    for method, path, body in device.requests
+    if (method, path) == ('PUT', '/rest/ip/firewall/address-list') and body['list'] == 'managed'
+  } == expected
+  assert {
+    body['dst-address'] for method, path, body in device.requests if (method, path) == ('PUT', '/rest/ip/route')
+  } == expected
 
 
 @pytest.mark.e2e

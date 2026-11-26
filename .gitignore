@@ -192,6 +192,7 @@ test/
 .old/
 .new/
 /db/
+.dumps/
 
 # LLM
 .codex/config.toml
