@@ -13817,6 +13817,49 @@ async def test_doh_provider_hold_retires_cancelled_client_without_release(e2e_se
 
 
 @pytest.mark.e2e
+async def test_public_ripe_empty_string_returns_null_and_replaces_stored_cidr(e2e_service):
+  """Check that RIPEstat's empty string yields a null prefix and a single stored address.
+
+  The service fixture runs the real app, a disposable SQLite database, and local
+  providers. Both DNS transports return the same address for a complete resolution.
+  """
+  # service is the running app with a configurable loopback RIPEstat endpoint.
+  service = e2e_service
+  service.providers.schedule[('ripe', '8.8.8.0', None, 0)] = [{'prefix': ''}]
+  service.providers.classic_addresses = service.providers.doh_addresses = ('8.8.8.0',)
+  # domain_id identifies the domain with existing IPv4 and IPv6 records.
+  domain_id = await configure_public_domain(service)
+  # connection seeds the related IPv4 record with a prefix the resolver could keep on failure.
+  with closing(sqlite3.connect(service.db_path)) as connection, connection:
+    connection.execute(
+      'UPDATE rdpr_ip_records SET ip_address=? WHERE domain_id=? AND ip_address=?',
+      ('8.8.8.0/24', domain_id, '9.9.9.9'),
+    )
+  # client talks to the real API. response holds the most recent API result.
+  async with httpx.AsyncClient(base_url=service.url, trust_env=False, timeout=5) as client:
+    response = await client.get(f'/domains/{domain_id}')
+    assert response.status_code == 200, response.text
+    assert response.json()['ips_v4'] == ['8.8.8.0/24']
+
+    # first triggers the provider request. cached repeats the same lookup against the populated cache.
+    first = await client.post('/ips/ripe/check', json={'address': '8.8.8.0'})
+    cached = await client.post('/ips/ripe/check', json={'address': '8.8.8.0'})
+    assert (first.status_code, cached.status_code) == (200, 200)
+    assert first.json() == cached.json() == {'address': '8.8.8.0', 'prefix': None}
+
+    response = await client.post(f'/domains/{domain_id}/resolve')
+    assert response.status_code == 202, response.text
+    async with asyncio.timeout(5):
+      await completed_metrics(client, mode='stored', selected=1)
+
+    response = await client.get(f'/domains/{domain_id}')
+    assert response.status_code == 200, response.text
+    assert response.json()['ips_v4'] == ['8.8.8.0']
+
+  assert service.providers.attempts[('ripe', '8.8.8.0', None, 0)] == 1
+
+
+@pytest.mark.e2e
 @pytest.mark.parametrize('e2e_service', [False], indirect=True)
 async def test_public_ripe_deadline_preserves_existing_cidr_and_adds_host_fallback(e2e_service):
   service = e2e_service

@@ -3139,28 +3139,46 @@ async def test_partial_payload_contains_all_matching_representations_and_no_unob
 
 
 @pytest.mark.parametrize(
-  ('payload', 'expected'),
+  ('payload', 'expected', 'log_level'),
   [
-    ({'status': 'ok', 'data': {'prefix': '8.8.8.0/24'}}, '8.8.8.0/24'),
-    ({'status': 'ok', 'data': {'prefix': '8.8.0.0/16'}}, '8.8.8.0'),
-    ({'status': 'ok', 'data': {'prefix': None}}, '8.8.8.0'),
-    ({'status': 'error', 'message': 'Unavailable'}, '8.8.8.0/25'),
+    ({'status': 'ok', 'data': {'prefix': '8.8.8.0/24'}}, '8.8.8.0/24', logging.DEBUG),
+    ({'status': 'ok', 'data': {'prefix': '8.8.0.0/16'}}, '8.8.8.0', logging.DEBUG),
+    ({'status': 'ok', 'data': {'prefix': None}}, '8.8.8.0', logging.DEBUG),
+    ({'status': 'ok', 'data': {'prefix': ''}}, '8.8.8.0', logging.DEBUG),
+    ({'status': 'error', 'message': 'Unavailable'}, '8.8.8.0/25', logging.WARNING),
   ],
 )
-async def test_complete_cycle_keeps_ripe_prefix_and_failure_contract(app, resolver, payload, expected):
+async def test_complete_cycle_keeps_ripe_prefix_and_failure_contract(
+  app, resolver, caplog, payload, expected, log_level
+):
+  """Check which IPv4 route a complete DNS result selects when a CIDR is already stored.
+
+  The app and resolver fixtures isolate the lookup. Each payload has an expected
+  storage value and log level, which caplog captures during IP processing.
+  """
+  # client passes outgoing calls to a callback. The callback ignores request and returns payload with HTTP 200.
   client = app.make_http(lambda request: httpx.Response(200, json=payload))
+  # ripe parses the provider response and checks the real in-memory cache.
   ripe = app.ripe.RipeStatClient()
   ripe._RipeStatClient__client = client
   resolver._DomainsResolver__ripe_stat_client = ripe
+  # domain has complete DNS evidence for the network address of the stored CIDR.
   domain = app.dto.DomainResult(id=1, name='www.example.test', resolution_complete=True)
   domain.result.A = ['8.8.8.0']
+  # current contains the previously stored CIDR that can be kept on lookup failure.
   current = [app.Ip(id=10, ip_address='8.8.8.0/25', addr_type=4)]
-  await resolver._DomainsResolver__ips_processing(domain=domain, current_ips=current)
+  with caplog.at_level(logging.DEBUG):
+    await resolver._DomainsResolver__ips_processing(domain=domain, current_ips=current)
   assert domain.storage_ips == (expected,)
+  # record is a captured log entry. A prefix decision should produce exactly one such entry.
+  assert [record.levelno for record in caplog.records if record.getMessage().startswith('RIPEstat prefix ')] == [
+    log_level
+  ]
   if expected == '8.8.8.0/25':
     assert domain.insert.ips_insert == []
     assert domain.insert.ips_delete == []
   else:
+    # item is a prepared IP insert. Its address must be the only new representation.
     assert [item.ip_address for item in domain.insert.ips_insert] == [expected]
     assert domain.insert.ips_delete == [10]
 
@@ -3503,26 +3521,49 @@ async def test_run_never_fabricates_rate_for_zero_elapsed_or_interruption(app, m
   assert math.isnan(run.snapshot()['saved_rate'])
 
 
-@pytest.mark.parametrize('prefix', ['8.8.8.0/24', None])
-async def test_ripe_direct_cache_hit_never_counts_another_network_lookup(app, prefix):
+@pytest.mark.parametrize(
+  ('prefix', 'expected_prefix', 'expected_ttl'),
+  [('8.8.8.0/24', '8.8.8.0/24', 101), (None, None, 37), ('', None, 37)],
+)
+async def test_ripe_direct_cache_hit_never_counts_another_network_lookup(
+  app, monkeypatch, prefix, expected_prefix, expected_ttl
+):
+  """Use the same prefix and outcome on a cache miss and the following hit.
+
+  The app fixture supplies isolated cache and HTTP state. The provider prefix,
+  expected client prefix and expected TTL select the response and cache contract.
+  Monkeypatch assigns distinct TTLs in seconds and observes the real cache write.
+  """
+  monkeypatch.setattr(app.settings, 'ripe_stat_prefix_cache_ttl_sec', 101)
+  monkeypatch.setattr(app.settings, 'ripe_stat_empty_prefix_cache_ttl_sec', 37)
+  # cache is the in-memory cache used by the client. save_prefix captures the write while forwarding it.
+  cache = importlib.import_module('cache.cache').ripe_stat_cache
+  save_prefix = AsyncMock(wraps=cache.set)
+  monkeypatch.setattr(cache, 'set', save_prefix)
+  # calls records each requested provider URL, so the second lookup can prove it used the cache.
   calls = []
 
   def upstream(request):
+    """Record the outgoing request and return the scenario's successful JSON response."""
     calls.append(str(request.url))
     return httpx.Response(200, json={'status': 'ok', 'data': {'prefix': prefix}})
 
+  # ripe is a real client with a simulated HTTP provider.
   ripe = app.ripe.RipeStatClient()
   ripe._RipeStatClient__client = app.make_http(upstream)
+  # before_network and before_hit are metric baselines for provider requests and cache hits.
   before_network = metric_total('resolution_ripe_duration_seconds_count', phase='network')
   before_hit = metric_total(
     'resolution_ripe_duration_seconds_count',
     phase='lookup',
     source='cache',
-    outcome='empty' if prefix is None else 'prefix',
+    outcome='empty' if expected_prefix is None else 'prefix',
   )
+  # first comes from the provider. second should come from the newly populated cache.
   first = await ripe.get_prefix('8.8.8.8')
   second = await ripe.get_prefix('8.8.8.8')
-  assert first.prefix == second.prefix == prefix
+  assert first.prefix == second.prefix == expected_prefix
+  save_prefix.assert_awaited_once_with(key='prefix:8.8.8.8', value=expected_prefix or '', expire=expected_ttl)
   assert len(calls) == 1
   assert metric_total('resolution_ripe_duration_seconds_count', phase='network') - before_network == 1
   assert (
@@ -3530,7 +3571,7 @@ async def test_ripe_direct_cache_hit_never_counts_another_network_lookup(app, pr
       'resolution_ripe_duration_seconds_count',
       phase='lookup',
       source='cache',
-      outcome='empty' if prefix is None else 'prefix',
+      outcome='empty' if expected_prefix is None else 'prefix',
     )
     - before_hit
     == 1
