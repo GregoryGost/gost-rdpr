@@ -138,29 +138,40 @@ class RipeStatClient:
       observe_duration(ripe_duration, started, phase='network', source='network', outcome=outcome)
 
   async def __request_prefix(self, address: str) -> RipeStatAddressPrefixDto:
+    """Look up a normalized IP address and read its prefix from a successful response.
+
+    An empty string, null or missing prefix is returned as None so callers can
+    treat it as a lookup without a prefix. HTTP status and payload errors raise
+    RipeStatClientError. Transport errors propagate to get_prefix.
+    """
+    # response provides both the HTTP status and the provider's JSON body.
     response: Response = await self.__client.get(
       url=f'{self.__base_url}/data/network-info/data.json',
       params={'resource': address},
       headers={'Accept': 'application/json'},
     )
 
+    # payload is the API envelope containing the lookup status and endpoint data.
     payload: dict[str, Any] = self.__get_payload(response=response)
 
     if not response.is_success or payload.get('status') != 'ok':
+      # message provides the provider's error detail or the HTTP reason if absent.
       message: str = str(payload.get('message', response.reason_phrase))
       raise RipeStatClientError(f'RIPEstat network-info error for {address}: {message} (HTTP {response.status_code})')
 
+    # data contains the endpoint-specific fields when the lookup succeeds.
     data: Any = payload.get('data')
 
     if not isinstance(data, dict):
       raise RipeStatClientError(f'RIPEstat network-info returned invalid data for {address}')
 
+    # prefix is the raw field value. Only strings and None are valid here.
     prefix: Any = data.get('prefix')
 
     if prefix is not None and not isinstance(prefix, str):
       raise RipeStatClientError(f'RIPEstat network-info returned invalid prefix for {address}')
 
-    return RipeStatAddressPrefixDto(address=address, prefix=prefix)
+    return RipeStatAddressPrefixDto(address=address, prefix=prefix or None)
 
   @staticmethod
   async def __get_cached_prefix(
